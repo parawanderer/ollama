@@ -180,7 +180,7 @@ set(LLAMA_SUBPROCESS OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
     llama_cpp
-    GIT_REPOSITORY "https://github.com/ggml-org/llama.cpp.git"
+    GIT_REPOSITORY "https://github.com/parawanderer/llama.cpp.git"
     GIT_TAG ${LLAMA_CPP_GIT_TAG}
     GIT_SHALLOW TRUE
     ${_ollama_compat_patch_cmd}

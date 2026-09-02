@@ -2286,7 +2286,11 @@ func (s *Server) PsHandler(c *gin.Context) {
 
 		gpus := make([]api.ProcessGPU, 0, len(v.gpus))
 		for _, dev := range v.gpus {
-			gpus = append(gpus, api.ProcessGPU{ID: dev.ID, Runner: dev.Library})
+			gpus = append(gpus, api.ProcessGPU{
+				ID:       dev.ID,
+				Runner:   dev.Library,
+				SizeVRAM: int64(v.vramByGPU[dev]),
+			})
 		}
 
 		models = append(models, api.ProcessModelResponse{

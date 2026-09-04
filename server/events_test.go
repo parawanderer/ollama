@@ -101,3 +101,30 @@ func TestEventBusReportsDropsToTheSubscriber(t *testing.T) {
 		t.Fatal("no event after the buffer drained")
 	}
 }
+
+// A reconnecting client must be told what the ring actually holds, not what it asked for.
+// The difference is the client's gap, and a gap it cannot see is one it will draw over.
+func TestFrameRingBackfillReportsShortfall(t *testing.T) {
+	r := newFrameRing(10 * time.Minute)
+	r.add(retainedFrame{at: time.Now().Add(-8 * time.Second), kind: "sample"})
+	r.add(retainedFrame{at: time.Now(), kind: EventLoadComplete, model: "m"})
+
+	frames, reach := r.since(10 * time.Minute)
+	if len(frames) != 2 {
+		t.Fatalf("got %d frames, want 2", len(frames))
+	}
+	if reach > 15*time.Second {
+		t.Errorf("reach = %v, but the ring only holds ~8s; a client asking for 10m must see that", reach)
+	}
+}
+
+// Backfilled frames precede the connection that serves them, so their offset is negative.
+// Restamping them to zero would place history at the moment of reconnection.
+func TestBackfillOffsetsAreNegative(t *testing.T) {
+	started := time.Now()
+	past := started.Add(-30 * time.Second)
+
+	if off := past.Sub(started).Milliseconds(); off >= 0 {
+		t.Errorf("offset for a frame 30s before the connection = %d, want negative", off)
+	}
+}

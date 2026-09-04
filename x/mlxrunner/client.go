@@ -521,3 +521,8 @@ func setEnv(cmd *exec.Cmd, key, value string) {
 	}
 	cmd.Env = append(cmd.Env, entry)
 }
+
+// SetOnWeightsLoaded is a no-op for MLX. The runner does not report a boundary between
+// weights arriving and the context being built, so there is no moment to report -- and
+// inventing one would draw a divider on a chart where nothing was measured.
+func (c *Client) SetOnWeightsLoaded(func()) {}

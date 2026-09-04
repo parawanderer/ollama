@@ -814,7 +814,26 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			loadStartedAt = time.Now().UTC()
 			s.loadsInFlight.Add(1)
 			s.publishEvent(api.ModelEvent{Type: EventLoadStart, Model: req.model.Name, At: loadStartedAt})
+
+			// A load has two halves and they cost quite differently. Reading and
+			// transferring the weights dominates a cold load; the context -- KV cache and
+			// compute buffers -- is built afterwards in one step, and on a long-context
+			// model that step is most of what the model ends up holding. Reporting the
+			// boundary lets a client say which half it is waiting on.
+			onWeights := func() {
+				at := time.Now().UTC()
+				s.publishEvent(api.ModelEvent{
+					Type:       EventLoadWeights,
+					Model:      req.model.Name,
+					At:         at,
+					DurationMs: at.Sub(loadStartedAt).Milliseconds(),
+				})
+			}
+
 			llama, err = s.newServerFn(systemInfo, loadGpus, req.model.ModelPath, f, req.model.AdapterPaths, req.model.ProjectorPaths, launchOpts, numParallel, config)
+			if llama != nil {
+				llama.SetOnWeightsLoaded(onWeights)
+			}
 			if err != nil {
 				// some older models are not compatible with newer versions of llama.cpp
 				// show a generalized compatibility error until there is a better way to

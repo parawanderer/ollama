@@ -69,6 +69,10 @@ type LlamaServer interface {
 	Detokenize(ctx context.Context, tokens []int) (string, error)
 	Close() error
 	MemorySize() (total, vram uint64)
+
+	// SetOnWeightsLoaded registers a callback fired when the model's weights reach device
+	// memory, which happens partway through a load rather than at its end.
+	SetOnWeightsLoaded(func())
 	VRAMByGPU(id ml.DeviceID) uint64
 	Pid() int
 	GetPort() int

@@ -144,6 +144,12 @@ type llamaServerRunner struct {
 	// Keys are device names from llama-server output (e.g., "CUDA0", "ROCm0", "MTL0").
 	vramByDevice map[string]uint64
 
+	// onWeightsLoaded is called once the model's weights are in device memory. That is
+	// partway through a load, not the end of it: the KV cache and compute buffers are
+	// allocated afterwards, at context construction, and on a long-context model they are
+	// most of what the model ends up holding.
+	onWeightsLoaded func()
+
 	// System-reported free VRAM per device at model load time, parsed from
 	// "using device CUDA0 ... - 15221 MiB free" log lines. This reflects
 	// real system state including external VRAM consumers (on platforms where
@@ -3023,4 +3029,12 @@ func (s *llamaServerRunner) VRAMByGPU(id ml.DeviceID) uint64 {
 		}
 	}
 	return 0
+}
+
+// SetOnWeightsLoaded registers a callback fired when the model's weights reach device
+// memory. It must be set before the server starts, and is called at most once.
+func (s *llamaServerRunner) SetOnWeightsLoaded(fn func()) {
+	s.memoryMu.Lock()
+	defer s.memoryMu.Unlock()
+	s.onWeightsLoaded = fn
 }

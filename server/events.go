@@ -14,9 +14,15 @@ import (
 const (
 	EventLoadStart    = "load.start"
 	EventLoadComplete = "load.complete"
-	EventLoadFailed   = "load.failed"
-	EventEvict        = "evict"
-	EventUnload       = "unload"
+
+	// EventLoadWeights divides a load in two. Before it the weights are being read and
+	// transferred, which dominates a cold load; after it the context is constructed -- the
+	// KV cache and compute buffers, allocated in one step near the end rather than spread
+	// across the load, and on a long-context model most of what the model ends up holding.
+	EventLoadWeights = "load.weights"
+	EventLoadFailed  = "load.failed"
+	EventEvict       = "evict"
+	EventUnload      = "unload"
 
 	// EventExpires reports a keep-alive deadline moving. It is emitted when the deadline
 	// is written, which happens only as a request finishes -- so a client that draws a

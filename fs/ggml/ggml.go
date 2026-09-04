@@ -159,6 +159,36 @@ func (kv KV) AttentionLayerCount() (n uint64) {
 	return n
 }
 
+// KVCacheModelIsComplete reports whether KVCacheBytesPerToken can account for everything
+// this architecture will allocate per token.
+//
+// The per-token figure models one cache of the published head dimensions. Some
+// architectures allocate more than that and say so in their metadata without saying how
+// much: a sparse-attention indexer keeps its own cache, and a latent-attention model
+// compresses into dimensions that are not the published ones. Where those markers are
+// present the estimate is a lower bound rather than an estimate, and the difference grows
+// with context -- which is the direction that overcommits a device.
+//
+// This does not try to model those caches. Guessing a second architecture badly is worse
+// than knowing the first is incomplete, because a caller that knows can measure instead.
+func (kv KV) KVCacheModelIsComplete() bool {
+	arch := kv.Architecture()
+	for _, key := range []string{
+		// A sparse-attention indexer keeps a cache of its own, sized independently.
+		"attention.indexer.head_count",
+		"attention.indexer.key_length",
+		// Latent attention compresses K and V into dimensions the published head lengths
+		// do not describe.
+		"attention.key_length_mla",
+		"attention.value_length_mla",
+	} {
+		if _, ok := kv[arch+"."+key]; ok {
+			return false
+		}
+	}
+	return true
+}
+
 // KVCacheBytesPerToken reports how many bytes of attention KV cache one token of context
 // occupies, summed over the blocks that actually run attention.
 //

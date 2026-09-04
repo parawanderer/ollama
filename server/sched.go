@@ -274,6 +274,27 @@ func vramCalibrationKey(req *LlmRequest, gpus []ml.DeviceInfo, numParallel int) 
 	}
 }
 
+// warnIfPredictionIsALowerBound reports a placement being decided from an estimate that
+// cannot account for this architecture, and that has no measurement to fall back on.
+//
+// It is the one case where the prediction is not merely imprecise but known-incomplete in
+// a known direction: too low, by more with more context. Saying so makes a placement that
+// later fails attributable, rather than looking like the model misbehaving.
+func (s *Scheduler) warnIfPredictionIsALowerBound(key llm.CalibrationKey, f *ggml.GGML, modelPath string, numCtx int, predicted uint64) {
+	if f.KV().KVCacheModelIsComplete() {
+		return
+	}
+	if _, calibrated := s.vramCalibration.Predict(key, numCtx, 0, 0); calibrated {
+		return
+	}
+	slog.Warn("placing a model whose memory use cannot be derived from its metadata, and which has not been measured yet",
+		"model", modelPath,
+		"architecture", f.KV().Architecture(),
+		"predicted", format.HumanBytes2(predicted),
+		"num_ctx", numCtx,
+		"note", "this estimate is a lower bound; it is corrected by measurement once this model has loaded once")
+}
+
 // predictLlamaServerVRAM estimates VRAM for a llama-server load, preferring a measurement
 // of an earlier load made from the same inputs over the metadata estimate.
 func predictLlamaServerVRAM(cal *llm.VRAMCalibration, key llm.CalibrationKey, req *LlmRequest, f *ggml.GGML, numCtx int) uint64 {
@@ -745,6 +766,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			predictedCtx = effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
 			calibrationKey = vramCalibrationKey(req, gpus, numParallel)
 			predicted := predictLlamaServerVRAM(s.vramCalibration, calibrationKey, req, f, predictedCtx)
+			s.warnIfPredictionIsALowerBound(calibrationKey, f, req.model.ModelPath, predictedCtx, predicted)
 			loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, predicted, req.opts)
 			availableForBatch, _, _ := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
 			flashAttention := llm.LlamaServerFlashAttention(loadGpus)

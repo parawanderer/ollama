@@ -27,21 +27,22 @@ type nativeProbeDevice struct {
 	Index   int    `json:"index"`
 	// IndexMatchesBackend means Index is in the same visible-device order that
 	// llama-server reports, so it is safe to correlate when PCI ID is missing.
-	IndexMatchesBackend bool   `json:"index_matches_backend,omitempty"`
-	Name                string `json:"name,omitempty"`
-	Description         string `json:"description,omitempty"`
-	DeviceID            string `json:"device_id,omitempty"`
-	Integrated          bool   `json:"integrated,omitempty"`
-	IntegratedKnown     bool   `json:"integrated_known"`
-	TotalMemory         uint64 `json:"total_memory,omitempty"`
-	PhysicalMemory      uint64 `json:"physical_memory,omitempty"`
-	FreeMemory          uint64 `json:"free_memory,omitempty"`
-	ComputeMajor        int    `json:"compute_major,omitempty"`
-	ComputeMinor        int    `json:"compute_minor,omitempty"`
-	CUDADriverMajor     int    `json:"cuda_driver_major,omitempty"`
-	CUDADriverMinor     int    `json:"cuda_driver_minor,omitempty"`
-	NVIDIADriverMajor   int    `json:"nvidia_driver_major,omitempty"`
-	GFXTarget           string `json:"gfx_target,omitempty"`
+	IndexMatchesBackend bool               `json:"index_matches_backend,omitempty"`
+	Name                string             `json:"name,omitempty"`
+	Description         string             `json:"description,omitempty"`
+	DeviceID            string             `json:"device_id,omitempty"`
+	Integrated          bool               `json:"integrated,omitempty"`
+	IntegratedKnown     bool               `json:"integrated_known"`
+	TotalMemory         uint64             `json:"total_memory,omitempty"`
+	PhysicalMemory      uint64             `json:"physical_memory,omitempty"`
+	Processes           []ml.DeviceProcess `json:"processes,omitempty"`
+	FreeMemory          uint64             `json:"free_memory,omitempty"`
+	ComputeMajor        int                `json:"compute_major,omitempty"`
+	ComputeMinor        int                `json:"compute_minor,omitempty"`
+	CUDADriverMajor     int                `json:"cuda_driver_major,omitempty"`
+	CUDADriverMinor     int                `json:"cuda_driver_minor,omitempty"`
+	NVIDIADriverMajor   int                `json:"nvidia_driver_major,omitempty"`
+	GFXTarget           string             `json:"gfx_target,omitempty"`
 }
 
 type nativeProbeResult struct {

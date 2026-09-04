@@ -1434,6 +1434,12 @@ type EventFrame struct {
 	Box        string     `json:"box,omitempty"`
 	RetainedMs int64      `json:"retainedMs,omitempty"`
 
+	// Backfilled is how many retained frames follow this hello. It is always present on a
+	// hello, including as zero, because "the history was replayed and held nothing" and
+	// "no history was replayed" are different facts and a client cannot tell them apart
+	// from an absence of negative offsets alone.
+	Backfilled *int `json:"backfilled"`
+
 	// Model and Reason describe an edge.
 	Model  string `json:"model,omitempty"`
 	Reason string `json:"reason,omitempty"`
@@ -1491,6 +1497,12 @@ type ModelEvent struct {
 	Dropped uint64 `json:"dropped,omitempty"`
 }
 
+// GPUProcess is one process holding memory on a device.
+type GPUProcess struct {
+	PID        int    `json:"pid"`
+	UsedMemory uint64 `json:"used_memory"`
+}
+
 type GPUInfo struct {
 	// ID is the unique identifier to use for selection of this specific GPU by device vendor
 	ID string `json:"gpu_id"`
@@ -1500,6 +1512,12 @@ type GPUInfo struct {
 
 	// TotalMemory is the amount of video memory on the GPU usable for loading models
 	TotalMemory uint64 `json:"total_memory"`
+
+	// Processes are the processes holding memory on this device, where the platform can
+	// report them. The difference between a device's used memory and the sum of the models
+	// loaded on it is otherwise unattributable: a consumer can only name it by size, which
+	// is a guess that happens to hold on the machine it was calibrated on.
+	Processes []GPUProcess `json:"processes,omitempty"`
 
 	// PhysicalMemory is the amount of video memory the device reports having. It is never
 	// smaller than TotalMemory: the driver reserves a portion of the card for itself which

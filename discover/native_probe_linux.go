@@ -125,6 +125,33 @@ static int ollama_call_nvml_device_get_handle_by_pci_bus_id(void * fn, const cha
 	return ((ollama_nvml_device_get_handle_by_pci_bus_id_fn) fn)(pci, device);
 }
 
+// nvmlProcessInfo_t as of NVML v3, which is what nvmlDeviceGetComputeRunningProcesses_v3
+// expects. The trailing instance ids exist for MIG and are read but unused here.
+typedef struct {
+	unsigned int pid;
+	unsigned long long usedGpuMemory;
+	unsigned int gpuInstanceId;
+	unsigned int computeInstanceId;
+} ollama_nvml_process_info_t;
+
+typedef int (*ollama_nvml_device_get_compute_procs_fn)(void *, unsigned int *, ollama_nvml_process_info_t *);
+
+// Returns the number of processes written into pids/used, or a negative NVML status.
+static int ollama_call_nvml_device_get_compute_procs(void * fn, void * device, unsigned int max,
+                                                     unsigned int * pids, unsigned long long * used) {
+	ollama_nvml_process_info_t infos[64];
+	unsigned int count = max > 64 ? 64 : max;
+	int ret = ((ollama_nvml_device_get_compute_procs_fn) fn)(device, &count, infos);
+	if (ret != 0) {
+		return -ret;
+	}
+	for (unsigned int i = 0; i < count; i++) {
+		pids[i] = infos[i].pid;
+		used[i] = infos[i].usedGpuMemory;
+	}
+	return (int) count;
+}
+
 static int ollama_call_nvml_device_get_memory_info(void * fn, void * device, unsigned long long * total) {
 	ollama_nvml_memory_t memory = {0};
 	int ret = ((ollama_nvml_device_get_memory_info_fn) fn)(device, &memory);
@@ -146,6 +173,8 @@ import (
 	"os"
 	"strings"
 	"unsafe"
+
+	"github.com/ollama/ollama/ml"
 )
 
 const (
@@ -467,6 +496,78 @@ func probeNVIDIADriverMajorLinux() (int, error) {
 //
 // A failure here is not an error: NVML may be absent, too old, or refuse a device. Callers
 // fall back to the CUDA figure, which is the one every decision is made from anyway.
+// ComputeProcesses reports which processes hold memory on each device, keyed by PCI ID.
+//
+// It is deliberately not part of discovery. Discovery describes what devices exist and is
+// cached; this changes whenever a process starts or stops, so it is read at the moment it
+// is reported or it describes the past.
+func ComputeProcesses(pciIDs []string) map[string][]ml.DeviceProcess {
+	return nvmlComputeProcessesByPCI(pciIDs)
+}
+
+// nvmlComputeProcessesByPCI reports which processes hold memory on each device.
+//
+// This is what turns the difference between a device's used memory and the sum of what
+// ollama has loaded from a number into an attribution. Without it a reporting client can
+// only name that residual by magnitude -- small means the driver context, large means
+// something else is running -- which is a guess that happens to hold on one machine.
+func nvmlComputeProcessesByPCI(pciIDs []string) map[string][]ml.DeviceProcess {
+	if len(pciIDs) == 0 {
+		return nil
+	}
+
+	nvml, err := dlopenFirst([]string{"libnvidia-ml.so.1", "libnvidia-ml.so"}, false)
+	if err != nil {
+		return nil
+	}
+
+	initFn, initErr := dlsym(nvml, "nvmlInit_v2")
+	shutdownFn, shutdownErr := dlsym(nvml, "nvmlShutdown")
+	handleFn, handleErr := dlsym(nvml, "nvmlDeviceGetHandleByPciBusId_v2")
+	procsFn, procsErr := dlsym(nvml, "nvmlDeviceGetComputeRunningProcesses_v3")
+	if err := cmp.Or(initErr, shutdownErr, handleErr, procsErr); err != nil {
+		slog.Debug("NVML cannot report compute processes", "error", err)
+		return nil
+	}
+
+	if ret := C.ollama_call_nvml_init(initFn); ret != 0 {
+		return nil
+	}
+	defer C.ollama_call_nvml_shutdown(shutdownFn)
+
+	out := make(map[string][]ml.DeviceProcess, len(pciIDs))
+	for _, pci := range pciIDs {
+		if pci == "" {
+			continue
+		}
+
+		cpci := C.CString(pci)
+		var handle unsafe.Pointer
+		ret := C.ollama_call_nvml_device_get_handle_by_pci_bus_id(handleFn, cpci, &handle)
+		C.free(unsafe.Pointer(cpci))
+		if ret != 0 {
+			continue
+		}
+
+		const maxProcs = 64
+		var pids [maxProcs]C.uint
+		var used [maxProcs]C.ulonglong
+		n := C.ollama_call_nvml_device_get_compute_procs(procsFn, handle, maxProcs, &pids[0], &used[0])
+		if n < 0 {
+			slog.Debug("nvmlDeviceGetComputeRunningProcesses failed", "pci_id", pci, "status", -int(n))
+			continue
+		}
+		procs := make([]ml.DeviceProcess, 0, int(n))
+		for i := 0; i < int(n); i++ {
+			procs = append(procs, ml.DeviceProcess{PID: int(pids[i]), UsedMemory: uint64(used[i])})
+		}
+		if len(procs) > 0 {
+			out[pci] = procs
+		}
+	}
+	return out
+}
+
 func nvmlPhysicalMemoryByPCI(pciIDs []string) map[string]uint64 {
 	if len(pciIDs) == 0 {
 		return nil

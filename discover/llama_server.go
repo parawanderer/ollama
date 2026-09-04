@@ -341,6 +341,7 @@ func parseLlamaServerDevicesWithNative(output, nativeOutput string, libDirs []st
 			if nativeDevice.PhysicalMemory > dev.TotalMemory {
 				dev.PhysicalMemory = nativeDevice.PhysicalMemory
 			}
+			dev.Processes = nativeDevice.Processes
 			if nativeDevice.IntegratedKnown {
 				dev.Integrated = nativeDevice.Integrated
 			} else {

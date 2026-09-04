@@ -44,6 +44,7 @@ import (
 	"github.com/ollama/ollama/logutil"
 	"github.com/ollama/ollama/manifest"
 	"github.com/ollama/ollama/middleware"
+	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/model/parsers"
 	"github.com/ollama/ollama/model/renderers"
 	"github.com/ollama/ollama/template"
@@ -2519,10 +2520,12 @@ func (s *Server) EventsHandler(c *gin.Context) {
 	}
 
 	now := started.UTC()
+	backfilled := len(backfill)
 	if !emit(api.EventFrame{
 		Kind:       "hello",
 		ServerTime: &now,
 		Box:        s.boxIdentity(),
+		Backfilled: &backfilled,
 		// How far back the ring actually reaches, which is not always what was asked for.
 		// A client that requested more than this has a gap, and must be able to see that
 		// rather than draw a line across a period nobody measured.
@@ -2598,6 +2601,18 @@ func (s *Server) InfoHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, *s.infoResponse())
 }
 
+// gpuProcesses converts device process attribution for the API.
+func gpuProcesses(procs []ml.DeviceProcess) []api.GPUProcess {
+	if len(procs) == 0 {
+		return nil
+	}
+	out := make([]api.GPUProcess, 0, len(procs))
+	for _, p := range procs {
+		out = append(out, api.GPUProcess{PID: p.PID, UsedMemory: p.UsedMemory})
+	}
+	return out
+}
+
 // infoResponse builds the /api/info body, shared with the event stream so capacity is
 // described one way rather than two.
 func (s *Server) infoResponse() *api.InfoResponse {
@@ -2608,6 +2623,16 @@ func (s *Server) infoResponse() *api.InfoResponse {
 	// to ask, which is not the normal state of a multi-GPU host.
 	devices := s.sched.cachedDevices(context.Background())
 
+	// Read process attribution now rather than taking it from cached discovery: it changes
+	// whenever a process starts or stops, so a cached copy describes the past.
+	pciIDs := make([]string, 0, len(devices))
+	for _, dev := range devices {
+		if dev.PCIID != "" {
+			pciIDs = append(pciIDs, dev.PCIID)
+		}
+	}
+	processes := discover.ComputeProcesses(pciIDs)
+
 	gpus := make([]api.GPUInfo, len(devices))
 	for i, dev := range devices {
 		gpus[i] = api.GPUInfo{
@@ -2615,6 +2640,7 @@ func (s *Server) infoResponse() *api.InfoResponse {
 			Name:           dev.Name,
 			TotalMemory:    dev.TotalMemory,
 			PhysicalMemory: dev.PhysicalMemory,
+			Processes:      gpuProcesses(processes[dev.PCIID]),
 			FreeMemory:     dev.FreeMemory,
 			Runner:         dev.Library,
 		}

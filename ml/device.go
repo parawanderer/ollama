@@ -26,6 +26,12 @@ type DeviceID struct {
 	Library string `json:"backend,omitempty"`
 }
 
+// DeviceProcess is one process holding memory on a device.
+type DeviceProcess struct {
+	PID        int    `json:"pid"`
+	UsedMemory uint64 `json:"used_memory"`
+}
+
 type DeviceInfo struct {
 	DeviceID
 
@@ -49,6 +55,11 @@ type DeviceInfo struct {
 
 	// TotalMemory is the total amount of memory the device can use for loading models
 	TotalMemory uint64 `json:"total_memory"`
+
+	// Processes are the processes holding memory on this device, where the platform can
+	// report them. It is what lets a caller attribute the gap between a device's used
+	// memory and the sum of what it knows about, rather than naming that gap by its size.
+	Processes []DeviceProcess `json:"processes,omitempty"`
 
 	// PhysicalMemory is the memory the device reports having, which is not the same
 	// quantity as TotalMemory and is never smaller. TotalMemory is what a runner can

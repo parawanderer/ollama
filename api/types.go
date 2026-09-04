@@ -1453,6 +1453,9 @@ type EventFrame struct {
 	// ExpiresAt is the new keep-alive deadline, on an expires frame.
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 
+	// DurationMs is how long a transition took, on the frames that conclude one.
+	DurationMs int64 `json:"duration_ms,omitempty"`
+
 	// PS is the /api/ps body, byte-identical to what that endpoint serves, so one piece of
 	// client code reads model placement everywhere. Info is the /api/info body, sent on
 	// the first sample and whenever it changes. Both are pointers: absent means "this

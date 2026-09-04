@@ -2564,11 +2564,12 @@ func (s *Server) EventsHandler(c *gin.Context) {
 				return
 			}
 			f := api.EventFrame{
-				Kind:    ev.Type,
-				Model:   ev.Model,
-				Reason:  ev.Reason,
-				Dropped: ev.Dropped,
-				T:       ev.At.Sub(started).Milliseconds(),
+				Kind:       ev.Type,
+				Model:      ev.Model,
+				Reason:     ev.Reason,
+				DurationMs: ev.DurationMs,
+				Dropped:    ev.Dropped,
+				T:          ev.At.Sub(started).Milliseconds(),
 			}
 			// Bodies come from the event where it carried them -- a sample measured them
 			// at its own instant, and re-reading here would report a later moment under an

@@ -1456,6 +1456,13 @@ type EventFrame struct {
 	// DurationMs is how long a transition took, on the frames that conclude one.
 	DurationMs int64 `json:"duration_ms,omitempty"`
 
+	// WeightsMs and ContextMs split a load into its two halves on the load.complete
+	// frame: reading and transferring the weights, then building the context. They are
+	// repeated here rather than left to be derived from the load.weights frame, so a
+	// client that subscribed mid-load still gets the split.
+	WeightsMs int64 `json:"weights_ms,omitempty"`
+	ContextMs int64 `json:"context_ms,omitempty"`
+
 	// PS is the /api/ps body, byte-identical to what that endpoint serves, so one piece of
 	// client code reads model placement everywhere. Info is the /api/info body, sent on
 	// the first sample and whenever it changes. Both are pointers: absent means "this
@@ -1488,6 +1495,13 @@ type ModelEvent struct {
 	// DurationMs is how long the transition took, on the events that conclude one:
 	// load.complete measures from the matching load.start.
 	DurationMs int64 `json:"duration_ms,omitempty"`
+
+	// WeightsMs and ContextMs split that duration on load.complete. The two halves cost
+	// very differently -- a cold load is dominated by moving the weights, while a
+	// long-context model spends most of its wait allocating the KV cache and compute
+	// buffers -- so which half is running is what a progress display wants to say.
+	WeightsMs int64 `json:"weights_ms,omitempty"`
+	ContextMs int64 `json:"context_ms,omitempty"`
 
 	// SizeVRAM is the model's device memory once loaded, and GPUs how it is distributed,
 	// matching the fields of the same name on /api/ps.

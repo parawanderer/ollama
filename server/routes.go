@@ -2291,6 +2291,32 @@ func (s *Server) PsHandler(c *gin.Context) {
 
 // processResponse builds the /api/ps body. The event stream embeds the same structure, so
 // a client has one way to read model placement rather than two that can drift.
+// eventFrame converts a scheduler event into the frame sent on the wire. It is a separate
+// function so a test can assert that no field is dropped in the conversion: this is a
+// hand-written copy and it has silently lost a field three times, each time producing a
+// client that could not see something the server was already reporting.
+func (s *Server) eventFrame(ev api.ModelEvent, started time.Time) api.EventFrame {
+	f := api.EventFrame{
+		Kind:       ev.Type,
+		Model:      ev.Model,
+		Reason:     ev.Reason,
+		DurationMs: ev.DurationMs,
+		WeightsMs:  ev.WeightsMs,
+		ContextMs:  ev.ContextMs,
+		Dropped:    ev.Dropped,
+		T:          ev.At.Sub(started).Milliseconds(),
+	}
+	// Bodies come from the event where it carried them -- a sample measured them at its
+	// own instant, and re-reading here would report a later moment under an earlier
+	// timestamp. An edge carries none, so its resulting placement is read now, which is
+	// as close to the edge as this can get.
+	f.PS, f.Info, f.ExpiresAt = ev.PS, ev.Info, ev.ExpiresAt
+	if f.PS == nil && ev.Type != EventLoadStart {
+		f.PS = s.processResponse()
+	}
+	return f
+}
+
 func (s *Server) processResponse() *api.ProcessResponse {
 	models := []api.ProcessModelResponse{}
 
@@ -2569,23 +2595,7 @@ func (s *Server) EventsHandler(c *gin.Context) {
 			if !ok {
 				return
 			}
-			f := api.EventFrame{
-				Kind:       ev.Type,
-				Model:      ev.Model,
-				Reason:     ev.Reason,
-				DurationMs: ev.DurationMs,
-				Dropped:    ev.Dropped,
-				T:          ev.At.Sub(started).Milliseconds(),
-			}
-			// Bodies come from the event where it carried them -- a sample measured them
-			// at its own instant, and re-reading here would report a later moment under an
-			// earlier timestamp. An edge carries none, so its resulting placement is read
-			// now, which is as close to the edge as this can get.
-			f.PS, f.Info, f.ExpiresAt = ev.PS, ev.Info, ev.ExpiresAt
-			if f.PS == nil && ev.Type != EventLoadStart {
-				f.PS = s.processResponse()
-			}
-			if !emit(f) {
+			if !emit(s.eventFrame(ev, started)) {
 				return
 			}
 		case <-heartbeat.C:

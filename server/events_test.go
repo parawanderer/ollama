@@ -1,6 +1,8 @@
 package server
 
 import (
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -126,5 +128,73 @@ func TestBackfillOffsetsAreNegative(t *testing.T) {
 
 	if off := past.Sub(started).Milliseconds(); off >= 0 {
 		t.Errorf("offset for a frame 30s before the connection = %d, want negative", off)
+	}
+}
+
+// TestEventFrameCopiesEveryCommonField walks the two structs by JSON name and fails on any
+// field the conversion forgot. The conversion is written by hand and has dropped a field
+// three times -- info, expires_at, then duration_ms -- each time shipping a server that
+// reported something no client could see. A name present on both types is a field the
+// wire is meant to carry, so it must survive.
+func TestEventFrameCopiesEveryCommonField(t *testing.T) {
+	// Values are deliberately non-zero: a field left at its zero value is exactly what a
+	// forgotten copy looks like, so it must be distinguishable from one that was copied.
+	at := time.Now().UTC()
+	expires := at.Add(time.Hour)
+	ev := api.ModelEvent{
+		Type:       EventLoadComplete,
+		Model:      "some-model:latest",
+		Reason:     "because",
+		At:         at,
+		DurationMs: 8000,
+		WeightsMs:  2000,
+		ContextMs:  6000,
+		Dropped:    3,
+		ExpiresAt:  &expires,
+		PS:         &api.ProcessResponse{},
+		Info:       &api.InfoResponse{},
+	}
+
+	frame := (&Server{}).eventFrame(ev, at)
+
+	jsonNames := func(v any) map[string]reflect.Value {
+		out := map[string]reflect.Value{}
+		rv := reflect.ValueOf(v)
+		rt := rv.Type()
+		for i := range rt.NumField() {
+			name, _, _ := strings.Cut(rt.Field(i).Tag.Get("json"), ",")
+			if name != "" && name != "-" {
+				out[name] = rv.Field(i)
+			}
+		}
+		return out
+	}
+
+	// "type" on the event is "kind" on the frame; both are set from the same value and
+	// the assertion below covers it via Kind. Everything else pairs by name.
+	renamed := map[string]string{"type": "kind"}
+	frameFields := jsonNames(frame)
+
+	for name, evField := range jsonNames(ev) {
+		if r, ok := renamed[name]; ok {
+			name = r
+		}
+		frameField, ok := frameFields[name]
+		if !ok {
+			continue // event-only field, not meant for the wire
+		}
+		if evField.IsZero() {
+			t.Fatalf("%s: the fixture left this zero, so the test cannot detect a dropped copy", name)
+		}
+		if frameField.IsZero() {
+			t.Errorf("%s is set on the event but zero on the frame: the conversion dropped it", name)
+		}
+	}
+
+	if frame.Kind != ev.Type {
+		t.Errorf("kind = %q, want %q", frame.Kind, ev.Type)
+	}
+	if frame.T != 0 {
+		t.Errorf("t = %d, want 0 for an event at the stream's start time", frame.T)
 	}
 }

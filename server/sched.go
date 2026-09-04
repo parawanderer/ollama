@@ -738,6 +738,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 	// When the load began, so load.complete can report a duration that covers the whole
 	// thing rather than the sliver after the runner object was created.
 	var loadStartedAt time.Time
+	var weightsLoadedAt time.Time
 
 	// The calibration key as it stood when the prediction was made. It must be captured
 	// here rather than rebuilt later: applyAutomaticGenerationBatch rewrites
@@ -821,6 +822,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			// model that step is most of what the model ends up holding. Reporting the
 			// boundary lets a client say which half it is waiting on.
 			onWeights := func(at time.Time) {
+				weightsLoadedAt = at
 				s.publishEvent(api.ModelEvent{
 					Type:       EventLoadWeights,
 					Model:      req.model.Name,
@@ -975,6 +977,7 @@ iGPUScan:
 	runner.calibrationKey = calibrationKey
 	runner.calibrationCtx = predictedCtx
 	runner.loadStarted = loadStartedAt
+	runner.weightsLoaded = weightsLoadedAt
 	if runner.loadStarted.IsZero() {
 		runner.loadStarted = time.Now()
 	}
@@ -1029,12 +1032,17 @@ iGPUScan:
 			}
 		}
 		s.loadsInFlight.Add(-1)
-		s.publishEvent(api.ModelEvent{
+		complete := api.ModelEvent{
 			Type:       EventLoadComplete,
 			Model:      req.model.Name,
 			DurationMs: time.Since(runner.loadStarted).Milliseconds(),
 			SizeVRAM:   int64(loadedVRAM),
-		})
+		}
+		if !runner.weightsLoaded.IsZero() && !runner.loadStarted.IsZero() {
+			complete.WeightsMs = runner.weightsLoaded.Sub(runner.loadStarted).Milliseconds()
+			complete.ContextMs = complete.DurationMs - complete.WeightsMs
+		}
+		s.publishEvent(complete)
 		go func() {
 			<-req.ctx.Done()
 			slog.Debug("context for request finished")
@@ -1644,6 +1652,10 @@ type runnerRef struct {
 	// while another goroutine holds refMu -- which is the whole point: it lets a loading
 	// runner be named without waiting for the load to finish.
 	name string
+
+	// weightsLoaded is when this runner's weights reached device memory, which splits the
+	// load into its two halves. Zero if the runner never reported the boundary.
+	weightsLoaded time.Time
 
 	// loadStarted is when this runner began loading, so load.complete can report how long
 	// it took rather than only that it finished.

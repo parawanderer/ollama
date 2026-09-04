@@ -147,8 +147,11 @@ type llamaServerRunner struct {
 	// onWeightsLoaded is called once the model's weights are in device memory. That is
 	// partway through a load, not the end of it: the KV cache and compute buffers are
 	// allocated afterwards, at context construction, and on a long-context model they are
-	// most of what the model ends up holding.
-	onWeightsLoaded func()
+	// most of what the model ends up holding. weightsLoadedAt records that moment even
+	// when nothing is listening yet, because the process starts before the caller gets a
+	// handle to set the callback on -- without it the notification is lost to that race.
+	onWeightsLoaded func(time.Time)
+	weightsLoadedAt time.Time
 
 	// System-reported free VRAM per device at model load time, parsed from
 	// "using device CUDA0 ... - 15221 MiB free" log lines. This reflects
@@ -2887,6 +2890,11 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
 			w.runner.noteLoadActivity(time.Now())
 		}
 
+		// Fired below, after memoryMu is released: the callback publishes an event and
+		// must not run under a lock the publisher's own readers may want.
+		var notifyWeightsLoaded func(time.Time)
+		var weightsLoadedAt time.Time
+
 		func() {
 			w.runner.memoryMu.Lock()
 			defer w.runner.memoryMu.Unlock()
@@ -2941,6 +2949,15 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
 							w.bufferSeq = nil
 							w.sawNonModelBuffer = false
 						}
+
+						// A real allocation is the signal that the weights arrived. The
+						// fit probe reports the same lines at 0.00 because it measures
+						// without loading, so size is what separates the two passes.
+						if mib > 0 && w.runner.weightsLoadedAt.IsZero() {
+							weightsLoadedAt = time.Now().UTC()
+							w.runner.weightsLoadedAt = weightsLoadedAt
+							notifyWeightsLoaded, w.runner.onWeightsLoaded = w.runner.onWeightsLoaded, nil
+						}
 					} else {
 						w.sawNonModelBuffer = true
 					}
@@ -2968,6 +2985,10 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
 				}
 			}
 		}()
+
+		if notifyWeightsLoaded != nil {
+			notifyWeightsLoaded(weightsLoadedAt)
+		}
 	}
 	return w.inner.Write(b)
 }
@@ -3032,9 +3053,19 @@ func (s *llamaServerRunner) VRAMByGPU(id ml.DeviceID) uint64 {
 }
 
 // SetOnWeightsLoaded registers a callback fired when the model's weights reach device
-// memory. It must be set before the server starts, and is called at most once.
-func (s *llamaServerRunner) SetOnWeightsLoaded(fn func()) {
+// memory, and is called at most once. The runner's process starts inside its constructor,
+// so on a small model the weights can land before the caller has a handle to register on;
+// in that case the callback runs immediately, with the time the weights actually arrived
+// rather than the time it was registered.
+func (s *llamaServerRunner) SetOnWeightsLoaded(fn func(time.Time)) {
 	s.memoryMu.Lock()
-	defer s.memoryMu.Unlock()
-	s.onWeightsLoaded = fn
+	already := s.weightsLoadedAt
+	if already.IsZero() {
+		s.onWeightsLoaded = fn
+	}
+	s.memoryMu.Unlock()
+
+	if !already.IsZero() && fn != nil {
+		fn(already)
+	}
 }

@@ -71,8 +71,9 @@ type LlamaServer interface {
 	MemorySize() (total, vram uint64)
 
 	// SetOnWeightsLoaded registers a callback fired when the model's weights reach device
-	// memory, which happens partway through a load rather than at its end.
-	SetOnWeightsLoaded(func())
+	// memory, which happens partway through a load rather than at its end. It is passed
+	// the moment the weights arrived, which may predate the call itself.
+	SetOnWeightsLoaded(func(time.Time))
 	VRAMByGPU(id ml.DeviceID) uint64
 	Pid() int
 	GetPort() int

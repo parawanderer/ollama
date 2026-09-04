@@ -3937,3 +3937,79 @@ func TestPredictServerVRAMCountsProjectors(t *testing.T) {
 		t.Errorf("missing projector changed the prediction: got=%d want=%d", got, withoutProjector)
 	}
 }
+
+// The weights-loaded edge splits a load into its two very different halves: reading and
+// transferring the weights, then building the context. These check that it is reported
+// once, at the right moment, and that it survives the race between the process starting
+// and the caller getting a handle to register on.
+func TestOnWeightsLoadedFiresOnFirstRealModelBuffer(t *testing.T) {
+	runner := &llamaServerRunner{}
+	w := &memoryParsingWriter{inner: io.Discard, runner: runner}
+
+	var fired []time.Time
+	runner.SetOnWeightsLoaded(func(at time.Time) { fired = append(fired, at) })
+
+	// The fit probe reports the same lines at zero: it measures without loading, so
+	// nothing has reached device memory yet and the edge must not fire.
+	for _, line := range []string{
+		"load_tensors:        CUDA0 model buffer size =     0.00 MiB\n",
+		"llama_kv_cache:      CUDA0 KV buffer size =  2000.00 MiB\n",
+	} {
+		if _, err := w.Write([]byte(line)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(fired) != 0 {
+		t.Fatalf("fired during the fit probe, before any weights were loaded: %v", fired)
+	}
+
+	before := time.Now().UTC()
+	if _, err := w.Write([]byte("load_tensors:        CUDA0 model buffer size = 39013.35 MiB\n")); err != nil {
+		t.Fatal(err)
+	}
+	if len(fired) != 1 {
+		t.Fatalf("got %d notifications for one load, want 1", len(fired))
+	}
+	if fired[0].Before(before) {
+		t.Errorf("reported a time from before the buffer was seen: %v < %v", fired[0], before)
+	}
+
+	// Weights land once. Later buffers, including the second device's, must not re-fire.
+	for _, line := range []string{
+		"load_tensors:        CUDA1 model buffer size = 37000.00 MiB\n",
+		"llama_kv_cache:      CUDA0 KV buffer size = 10000.00 MiB\n",
+	} {
+		if _, err := w.Write([]byte(line)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(fired) != 1 {
+		t.Errorf("fired %d times, want exactly 1", len(fired))
+	}
+}
+
+func TestOnWeightsLoadedRegisteredAfterTheFact(t *testing.T) {
+	runner := &llamaServerRunner{}
+	w := &memoryParsingWriter{inner: io.Discard, runner: runner}
+
+	// This is the real ordering: the runner's process starts inside its constructor, so
+	// on a small model the weights can be in memory before the scheduler has anything to
+	// register a callback on. Registering late must still report, with the time the
+	// weights actually arrived rather than the time of the call.
+	if _, err := w.Write([]byte("load_tensors:        CUDA0 model buffer size =  1000.00 MiB\n")); err != nil {
+		t.Fatal(err)
+	}
+	landed := runner.weightsLoadedAt
+	if landed.IsZero() {
+		t.Fatal("the runner did not record when the weights arrived")
+	}
+
+	var got []time.Time
+	runner.SetOnWeightsLoaded(func(at time.Time) { got = append(got, at) })
+	if len(got) != 1 {
+		t.Fatalf("got %d notifications, want 1", len(got))
+	}
+	if !got[0].Equal(landed) {
+		t.Errorf("reported the registration time %v, not the arrival time %v", got[0], landed)
+	}
+}

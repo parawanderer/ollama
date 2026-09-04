@@ -820,8 +820,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			// compute buffers -- is built afterwards in one step, and on a long-context
 			// model that step is most of what the model ends up holding. Reporting the
 			// boundary lets a client say which half it is waiting on.
-			onWeights := func() {
-				at := time.Now().UTC()
+			onWeights := func(at time.Time) {
 				s.publishEvent(api.ModelEvent{
 					Type:       EventLoadWeights,
 					Model:      req.model.Name,

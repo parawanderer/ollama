@@ -1,6 +1,10 @@
 package llm
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 const (
 	mib = 1024 * 1024
@@ -225,5 +229,58 @@ func TestCalibrationAgainstMeasuredCurve(t *testing.T) {
 			t.Errorf("ctx %d: got=%.2f GiB want=%.2f GiB (off by %.0f MiB)",
 				m.numCtx, float64(got)/gib, m.vram, (float64(got)-float64(want))/mib)
 		}
+	}
+}
+
+func TestCalibrationSurvivesARoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vram-calibration.json")
+
+	saved := NewVRAMCalibration()
+	key := testKey()
+	saved.Record(key, 8192, 20*gib+8192*2048)
+	saved.Record(key, 32768, 20*gib+32768*2048)
+	if err := saved.Save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded := NewVRAMCalibration()
+	loaded.Load(path)
+
+	got, calibrated := loaded.Predict(key, 65536, 999*gib, 1)
+	if !calibrated {
+		t.Fatal("samples did not survive the round trip, so a restart would start cold")
+	}
+	if want := uint64(20*gib + 65536*2048); !withinMiB(got, want, 1) {
+		t.Errorf("got=%d want=%d", got, want)
+	}
+}
+
+// A file from another version, or one that is corrupt, must leave the store empty rather
+// than half-populated: a cold start is always safe, a misread sample is not.
+func TestCalibrationDiscardsUnusableFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	for name, content := range map[string]string{
+		"corrupt.json":     "{not json",
+		"wrongver.json":    `{"version":999,"entries":[{"key":{"Model":"/models/test.gguf"},"samples":[{"num_ctx":8192,"vram":1}]}]}`,
+		"emptysample.json": `{"version":1,"entries":[{"key":{"Model":"/models/test.gguf"},"samples":[{"num_ctx":0,"vram":0}]}]}`,
+	} {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		c := NewVRAMCalibration()
+		c.Load(path)
+		if _, calibrated := c.Predict(testKey(), 8192, 10*gib, 1024); calibrated {
+			t.Errorf("%s: was treated as usable", name)
+		}
+	}
+
+	// A path that does not exist is the normal first-run case and must be silent.
+	c := NewVRAMCalibration()
+	c.Load(filepath.Join(dir, "absent.json"))
+	if _, calibrated := c.Predict(testKey(), 8192, 10*gib, 1024); calibrated {
+		t.Error("a missing file produced samples from nowhere")
 	}
 }

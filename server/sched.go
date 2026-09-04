@@ -79,6 +79,10 @@ type Scheduler struct {
 	// model is predicted from measurement instead of from metadata alone.
 	vramCalibration *llm.VRAMCalibration
 
+	// vramCalibrationPath is where those measurements survive a restart. Without it every
+	// restart re-earns them by making one uninformed placement per model.
+	vramCalibrationPath string
+
 	// loadsInFlight counts loads that have started and not finished. A runner object does
 	// not exist for most of a load, so the runner list cannot answer "is anything loading"
 	// -- which is exactly the period the sampler most needs to run fast.
@@ -980,6 +984,9 @@ iGPUScan:
 		_, loadedVRAM := llama.MemorySize()
 		if loadedVRAM > 0 {
 			s.vramCalibration.Record(runner.calibrationKey, runner.calibrationCtx, loadedVRAM)
+			if s.vramCalibrationPath != "" {
+				go s.vramCalibration.Persist(s.vramCalibrationPath)
+			}
 		}
 		s.loadsInFlight.Add(-1)
 		s.publishEvent(api.ModelEvent{

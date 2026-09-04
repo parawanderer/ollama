@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
@@ -2011,6 +2012,11 @@ func Serve(ln net.Listener) error {
 	// The scheduler owns the sampler but not the wire types, so the server supplies the
 	// bodies it embeds. Injected rather than reached for, so the sampler stays testable
 	// without an HTTP layer.
+	// Calibration lives beside the models it describes, so it travels with them and is
+	// discarded with them.
+	sched.vramCalibrationPath = filepath.Join(envconfig.Models(), "vram-calibration.json")
+	sched.vramCalibration.Load(sched.vramCalibrationPath)
+
 	sched.psFn = s.processResponse
 	sched.infoFn = s.infoResponse
 	sched.startSampler(schedCtx.Done())

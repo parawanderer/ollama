@@ -22,6 +22,7 @@ import (
 	"os/signal"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -2491,7 +2492,7 @@ func (s *Server) EventsHandler(c *gin.Context) {
 	started := time.Now()
 	emit := func(f api.EventFrame) bool {
 		f.V = 1
-		if f.T == 0 && f.Kind != "hello" {
+		if f.T == 0 && f.Kind != "hello" && f.PS == nil && f.Info == nil {
 			f.T = time.Since(started).Milliseconds()
 		}
 		if err := enc.Encode(f); err != nil {
@@ -2501,14 +2502,48 @@ func (s *Server) EventsHandler(c *gin.Context) {
 		return true
 	}
 
+	// ?since=<ms> asks for that much history before this connection opened. It is a
+	// duration rather than a timestamp because each connection anchors on its own hello,
+	// so a stamp from a previous one means nothing here.
+	var backfill []retainedFrame
+	var reach time.Duration
+	if raw := c.Query("since"); raw != "" {
+		ms, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || ms < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "since must be a duration in milliseconds"})
+			return
+		}
+		backfill, reach = s.sched.ring.since(time.Duration(ms) * time.Millisecond)
+	} else {
+		_, reach = s.sched.ring.since(retainedWindow)
+	}
+
 	now := started.UTC()
 	if !emit(api.EventFrame{
 		Kind:       "hello",
 		ServerTime: &now,
 		Box:        s.boxIdentity(),
-		RetainedMs: 0, // no backfill yet; a reconnecting client must treat gaps as gaps
+		// How far back the ring actually reaches, which is not always what was asked for.
+		// A client that requested more than this has a gap, and must be able to see that
+		// rather than draw a line across a period nobody measured.
+		RetainedMs: reach.Milliseconds(),
 	}) {
 		return
+	}
+
+	// Backfilled frames carry a negative offset: they happened before this connection
+	// opened, and saying so is more honest than restamping them as if they had not.
+	for _, f := range backfill {
+		if !emit(api.EventFrame{
+			Kind:   f.kind,
+			Model:  f.model,
+			Reason: f.reason,
+			PS:     f.ps,
+			Info:   f.info,
+			T:      f.at.Sub(started).Milliseconds(),
+		}) {
+			return
+		}
 	}
 
 	// Heartbeat cadence. An idle stream still has to prove it is alive, both to the client

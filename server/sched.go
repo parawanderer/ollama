@@ -847,10 +847,16 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			predictedCtx = effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
 
 			// Placement and batch size are chosen from a first estimate, and both change
-			// how much the load costs -- on Qwen3.8-Flash-Next at 256k, batch size alone
-			// moved it from 86 to 108 GiB. So the key this load is filed under cannot be
-			// settled until they are, and a probe run before them would measure a
-			// different load than the one that runs.
+			// how much the load costs. Measured on Qwen3.8-Flash-Next at 256k, where the
+			// model and context terms are identical across all three and every difference
+			// is compute buffers:
+			//
+			//	1 device, -b 512    86.35 GiB
+			//	1 device, -b 2048   91.65 GiB   batch:        +5.30
+			//	2 devices, -b 2048 108.32 GiB   device count: +16.67
+			//
+			// So the key this load is filed under cannot be settled until both are, and a
+			// probe run before them would measure a different load than the one that runs.
 			bootstrapKey := vramCalibrationKey(req, gpus, numParallel)
 			predicted := predictLlamaServerVRAM(s.vramCalibration, bootstrapKey, req, f, predictedCtx)
 			loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, predicted, req.opts)

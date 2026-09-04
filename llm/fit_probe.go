@@ -102,9 +102,17 @@ func ProbeFitVRAM(
 	}
 
 	// The probe must differ from the real invocation in the context length and nothing
-	// else. Batch size and split mode both change the compute buffers, and a probe that
-	// spreads a single-device load across two devices counts them twice -- that alone
-	// put a measured probe 39% over the truth.
+	// else. Batch size and split mode both move the compute buffers, and only those --
+	// measured on Qwen3.8-Flash-Next at 256k, the model and context terms are byte-identical
+	// across all three of these and the whole spread is compute:
+	//
+	//	1 device, -b 512    model 78056 + ctx 8560 + compute  1809 =  86.35 GiB
+	//	1 device, -b 2048   model 78056 + ctx 8560 + compute  7227 =  91.65 GiB
+	//	2 devices, -b 2048  model 78055 + ctx 8559 + compute 24304 = 108.32 GiB
+	//
+	// Spreading a single-device load over two devices is not a double count: the second
+	// device brings its own compute buffers and the pair costs 3.4x one, which is why
+	// getting split mode wrong put a probe 39% over the truth rather than 2x.
 	opts.NumCtx = numCtx
 	launch, err := newLlamaServerLaunchConfig(gpus, modelPath, f, adapters, projectors, opts, numParallel, kvCacheType, config, newLlamaServerMediaMarker())
 	if err != nil {

@@ -373,7 +373,9 @@ func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, ses
 	runner := s.loaded[key]
 	s.loadedMu.Unlock()
 	if runner != nil && !runner.needsReload(c, req) {
-		req.useLoadedRunner(runner, s.finishedReqCh)
+		if req.useLoadedRunner(runner, s.finishedReqCh) {
+			s.publishEvent(api.ModelEvent{Type: EventBusyStart, Model: runner.name})
+		}
 	} else {
 		select {
 		case s.pendingReqCh <- req:
@@ -433,7 +435,9 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					} else {
 						// Runner is usable, return it
 						logutil.Trace("using existing loaded runner", "model", pendingKey)
-						pending.useLoadedRunner(runner, s.finishedReqCh)
+						if pending.useLoadedRunner(runner, s.finishedReqCh) {
+							s.publishEvent(api.ModelEvent{Type: EventBusyStart, Model: runner.name})
+						}
 						break
 					}
 				} else if maxRunners > 0 && loadedCount >= int(maxRunners) {
@@ -557,6 +561,7 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 			runner.refMu.Lock()
 			runner.refCount--
 			if runner.refCount <= 0 {
+				s.publishEvent(api.ModelEvent{Type: EventBusyEnd, Model: runner.name})
 				if runner.sessionDuration <= 0 {
 					slog.Debug("runner with zero duration has gone idle, expiring to unload", "runner", runner)
 					if runner.expireTimer != nil {
@@ -650,13 +655,16 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 	}
 }
 
-// Complete the pending request and send the runner back to the requester
-// Wires up a finished event after the request context is completed
-// Updates session duration, and resets expiration timer
-func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *LlmRequest) {
+// useLoadedRunner completes the pending request, sends the runner back to the requester,
+// wires up a finished event after the request context completes, and resets the expiration
+// timer. It attaches a request to a runner that is already loaded. It reports whether
+// this was the transition from idle to working, which the caller publishes: the scheduler is
+// not in scope here, and the count must be read under the lock that guards it.
+func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *LlmRequest) (becameBusy bool) {
 	runner.refMu.Lock()
 	defer runner.refMu.Unlock()
 	runner.refCount++
+	becameBusy = runner.refCount == 1
 	if runner.expireTimer != nil {
 		runner.expireTimer.Stop()
 		runner.expireTimer = nil
@@ -670,6 +678,7 @@ func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *Llm
 		slog.Debug("context for request finished", "runner", runner)
 		finished <- pending
 	}()
+	return becameBusy
 }
 
 // load creates a new model based on req and loads it. If requireFull is true then the model must be loaded fully onto GPUs
@@ -953,6 +962,9 @@ iGPUScan:
 			runner.pid = llama.Pid()
 		}
 		runner.refCount++
+		if runner.refCount == 1 {
+			s.publishEvent(api.ModelEvent{Type: EventBusyStart, Model: req.model.Name})
+		}
 		runner.loading = false
 		// The load has finished, so llama-server has reported every buffer it allocated.
 		// Remember what it came to: the next load of this model made from the same inputs

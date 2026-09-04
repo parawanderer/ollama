@@ -23,6 +23,13 @@ const (
 	// countdown has no way to know from /api/ps alone that the number it is counting from
 	// is being held rather than approaching.
 	EventExpires = "expires"
+
+	// EventBusyStart and EventBusyEnd bracket a model actually working. They fire on the
+	// transitions in and out of idle, not per request, so overlapping requests produce one
+	// span rather than nested ones. The end matters twice over: it is also the only moment
+	// the keep-alive deadline moves, so a countdown is meaningless before it.
+	EventBusyStart = "busy.start"
+	EventBusyEnd   = "busy.end"
 )
 
 // eventSubscriberBuffer is how many events a subscriber may fall behind before its events

@@ -200,3 +200,16 @@ func clampFloat(v float64) uint64 {
 		return uint64(v)
 	}
 }
+
+// Forget discards every sample for a key. It exists for the case where samples were
+// gathered but turned out to be unusable as a set -- a single point, say, which fixes an
+// intercept but leaves the slope coming from a prior that is the known-wrong part.
+// Leaving those behind would present an estimate as a measurement.
+func (c *VRAMCalibration) Forget(key CalibrationKey) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.samples, key)
+}

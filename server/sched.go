@@ -295,6 +295,77 @@ func (s *Scheduler) warnIfPredictionIsALowerBound(key llm.CalibrationKey, f *ggm
 		"note", "this estimate is a lower bound; it is corrected by measurement once this model has loaded once")
 }
 
+// probeContexts are the two context lengths a cold probe measures at. Any two distinct
+// points determine the line, and these are cheap: the pass never reads tensors, so its
+// cost is flat in model size. They bracket ordinary use rather than sitting at the
+// extremes, because the line is fitted, not interpolated.
+var probeContexts = [2]int{8192, 131072}
+
+// probeCalibration measures a model at two context lengths without loading it, for the
+// case where nothing else can answer: an architecture whose metadata does not describe
+// everything it allocates, and which has never been loaded here.
+//
+// Without this the first load of such a model is placed from a lower bound, and a lower
+// bound is what overcommits a device. The probe costs about a second in total and turns
+// the first load into a calibrated one.
+//
+// Samples are recorded exactly as a completed load's are, because they are the same
+// quantity: llama-server's fit pass reports what the load would hold, and replaying the
+// real invocation with only the context changed reproduced two real measurements to
+// within 0.01 GiB. That equivalence is the whole reason this is worth doing, and it is
+// entirely dependent on the invocation being identical -- see ProbeFitVRAM.
+func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey, req *LlmRequest, f *ggml.GGML, gpus []ml.DeviceInfo, numParallel int, numCtx int) bool {
+	if f.KV().KVCacheModelIsComplete() {
+		return false
+	}
+	if _, calibrated := s.vramCalibration.Predict(key, numCtx, 0, 0); calibrated {
+		return false
+	}
+
+	// Probing at one context tells us nothing a metadata estimate does not: the point is
+	// the slope, and a slope needs two points. A model whose maximum context cannot
+	// accommodate both is left to the estimate.
+	contexts := probeContexts
+	for i := range contexts {
+		contexts[i] = effectiveLlamaServerContext(contexts[i], f, numParallel)
+	}
+	if contexts[0] == contexts[1] {
+		return false
+	}
+
+	started := time.Now()
+	var recorded int
+	for _, probeCtx := range contexts {
+		vram, err := llm.ProbeFitVRAM(ctx, gpus, req.model.ModelPath, f, req.model.AdapterPaths, req.model.ProjectorPaths,
+			req.opts, numParallel, envconfig.KvCacheType(), llamaServerConfigForModel(req.model), probeCtx)
+		if err != nil {
+			slog.Debug("could not measure model memory without loading it", "model", req.model.ModelPath, "num_ctx", probeCtx, "error", err)
+			continue
+		}
+		s.vramCalibration.Record(key, probeCtx, vram)
+		recorded++
+	}
+
+	// One sample is worse than none here. It fixes the intercept but leaves the slope
+	// coming from the metadata prior, which for this architecture is the thing known to
+	// be wrong -- so the result would look calibrated while carrying the same error.
+	if recorded < 2 {
+		s.vramCalibration.Forget(key)
+		return false
+	}
+
+	if s.vramCalibrationPath != "" {
+		go s.vramCalibration.Persist(s.vramCalibrationPath)
+	}
+	slog.Info("measured a model's memory use without loading it",
+		"model", req.model.ModelPath,
+		"architecture", f.KV().Architecture(),
+		"contexts", contexts,
+		"took", time.Since(started).Round(time.Millisecond),
+		"reason", "this architecture's metadata does not describe everything it allocates")
+	return true
+}
+
 // predictLlamaServerVRAM estimates VRAM for a llama-server load, preferring a measurement
 // of an earlier load made from the same inputs over the metadata estimate.
 func predictLlamaServerVRAM(cal *llm.VRAMCalibration, key llm.CalibrationKey, req *LlmRequest, f *ggml.GGML, numCtx int) uint64 {
@@ -765,14 +836,28 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			}
 
 			predictedCtx = effectiveLlamaServerContext(req.opts.NumCtx, f, numParallel)
-			calibrationKey = vramCalibrationKey(req, gpus, numParallel)
-			predicted := predictLlamaServerVRAM(s.vramCalibration, calibrationKey, req, f, predictedCtx)
-			s.warnIfPredictionIsALowerBound(calibrationKey, f, req.model.ModelPath, predictedCtx, predicted)
+
+			// Placement and batch size are chosen from a first estimate, and both change
+			// how much the load costs -- on Qwen3.8-Flash-Next at 256k, batch size alone
+			// moved it from 86 to 108 GiB. So the key this load is filed under cannot be
+			// settled until they are, and a probe run before them would measure a
+			// different load than the one that runs.
+			bootstrapKey := vramCalibrationKey(req, gpus, numParallel)
+			predicted := predictLlamaServerVRAM(s.vramCalibration, bootstrapKey, req, f, predictedCtx)
 			loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, predicted, req.opts)
 			availableForBatch, _, _ := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
 			flashAttention := llm.LlamaServerFlashAttention(loadGpus)
 			req.applyAutomaticGenerationBatch(completion, predictedCtx, predicted, availableForBatch, flashAttention, loadGpus)
 			launchOpts.NumBatch = req.opts.NumBatch
+
+			// Now the invocation is fully determined, so this key describes the load that
+			// will actually run, and the measurement it produces is filed where the next
+			// prediction for the same invocation will look.
+			calibrationKey = vramCalibrationKey(req, loadGpus, numParallel)
+			if s.probeCalibration(req.ctx, calibrationKey, req, f, loadGpus, numParallel, predictedCtx) {
+				predicted = predictLlamaServerVRAM(s.vramCalibration, calibrationKey, req, f, predictedCtx)
+			}
+			s.warnIfPredictionIsALowerBound(calibrationKey, f, req.model.ModelPath, predictedCtx, predicted)
 			predictedForLoad := predicted + generationBatchSurchargeForCompletion(completion, launchOpts.NumBatch)
 
 			// Pre-flight check: estimate whether the model fits in remaining memory.

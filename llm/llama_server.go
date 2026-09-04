@@ -359,27 +359,10 @@ func FindLlamaServer() (string, error) {
 	return path, nil
 }
 
-// startLlamaServer spawns the upstream llama-server process with appropriate CLI flags.
-func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.Cmd, port int, err error) {
-	exe, err := FindLlamaServer()
-	if err != nil {
-		return nil, 0, err
-	}
-
-	// Allocate a port
-	port = 0
-	if a, err := net.ResolveTCPAddr("tcp", "localhost:0"); err == nil {
-		var l *net.TCPListener
-		if l, err = net.ListenTCP("tcp", a); err == nil {
-			port = l.Addr().(*net.TCPAddr).Port
-			l.Close()
-		}
-	}
-	if port == 0 {
-		slog.Debug("ResolveTCPAddr failed, using random port")
-		port = rand.Intn(65535-49152) + 49152
-	}
-
+// llamaServerParams builds the command line for a llama-server invocation. It is separate
+// from starting the process so the fit probe can run the same invocation with only the
+// context length changed -- see newLlamaServerLaunchConfig for why that identity matters.
+func llamaServerParams(launch llamaServerLaunchConfig, port int) []string {
 	// Build CLI flags — minimal set, let llama-server auto-detect the rest
 	params := []string{
 		"--model", launch.modelPath,
@@ -433,6 +416,32 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 	params = appendMainGPUArgs(params, launch.opts)
 
 	params = appendContextShiftArgs(params, launch.opts, launch.config.ContextShift)
+
+	return params
+}
+
+// startLlamaServer spawns the upstream llama-server process with appropriate CLI flags.
+func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.Cmd, port int, err error) {
+	exe, err := FindLlamaServer()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Allocate a port
+	port = 0
+	if a, err := net.ResolveTCPAddr("tcp", "localhost:0"); err == nil {
+		var l *net.TCPListener
+		if l, err = net.ListenTCP("tcp", a); err == nil {
+			port = l.Addr().(*net.TCPAddr).Port
+			l.Close()
+		}
+	}
+	if port == 0 {
+		slog.Debug("ResolveTCPAddr failed, using random port")
+		port = rand.Intn(65535-49152) + 49152
+	}
+
+	params := llamaServerParams(launch, port)
 
 	// Set up library paths for GPU backend discovery
 	cmd = exec.Command(exe, params...)
@@ -866,7 +875,15 @@ func hasLegacyQwenMTPDraft(arch string, tensors []*ggml.Tensor) bool {
 }
 
 // NewLlamaServerRunner creates a new llama-server runner that wraps the upstream llama-server binary.
-func NewLlamaServerRunner(
+// newLlamaServerLaunchConfig assembles everything that determines how llama-server is
+// invoked for a model. It is shared by the real runner and by the fit probe, because the
+// probe is only meaningful if it replays the real invocation exactly: measured on
+// Qwen3.8-Flash-Next, a probe run with plausible-but-different flags reported a
+// per-token cost 39% above the truth, while one built from this config matched the real
+// load to 0.01 GiB. Batch size and split mode were the two that mattered most -- they
+// change the compute buffers, and a two-device probe of a single-device load counts
+// those buffers twice.
+func newLlamaServerLaunchConfig(
 	gpus []ml.DeviceInfo,
 	modelPath string,
 	f *ggml.GGML,
@@ -875,7 +892,9 @@ func NewLlamaServerRunner(
 	numParallel int,
 	kvCacheType string,
 	config LlamaServerConfig,
-) (LlamaServer, error) {
+	mediaMarker string,
+) (llamaServerLaunchConfig, error) {
+	var err error
 	// Check if this is an embedding model
 	arch := f.KV().Architecture()
 	_, isEmbedding := f.KV()[fmt.Sprintf("%s.pooling_type", arch)]
@@ -911,7 +930,7 @@ func NewLlamaServerRunner(
 	}
 	mmprojMemory, err := mmprojMemoryRequirement(modelPath, f, projectors)
 	if err != nil {
-		return nil, err
+		return llamaServerLaunchConfig{}, err
 	}
 	if config.DraftModelPath == "" && hasMTPDraft(f) {
 		config.EnableMTP = true
@@ -924,17 +943,11 @@ func NewLlamaServerRunner(
 	if config.DraftModelPath != "" {
 		draftType, err = externalDraftType(config.DraftModelPath)
 		if err != nil {
-			return nil, err
+			return llamaServerLaunchConfig{}, err
 		}
 	}
 
 	gpuLibs := ml.LibraryPaths(gpus)
-	status := NewStatusWriter(os.Stderr)
-
-	// memWriter wraps the status writer and parses buffer size lines from llama-server logs
-	memWriter := &memoryParsingWriter{inner: status}
-
-	mediaMarker := newLlamaServerMediaMarker()
 	extraEnvs := ml.GetDevicesEnv(gpus)
 	serverEnvs := make(map[string]string, len(extraEnvs)+1)
 	for k, v := range extraEnvs {
@@ -942,7 +955,7 @@ func NewLlamaServerRunner(
 	}
 	serverEnvs["LLAMA_MEDIA_MARKER"] = mediaMarker
 
-	launch := llamaServerLaunchConfig{
+	return llamaServerLaunchConfig{
 		modelPath:    modelPath,
 		modelArch:    arch,
 		draftType:    draftType,
@@ -958,7 +971,29 @@ func NewLlamaServerRunner(
 		gpus:         slices.Clone(gpus),
 		gpuLibs:      slices.Clone(gpuLibs),
 		extraEnvs:    cloneStringMap(serverEnvs),
+	}, nil
+}
+
+func NewLlamaServerRunner(
+	gpus []ml.DeviceInfo,
+	modelPath string,
+	f *ggml.GGML,
+	adapters, projectors []string,
+	opts api.Options,
+	numParallel int,
+	kvCacheType string,
+	config LlamaServerConfig,
+) (LlamaServer, error) {
+	mediaMarker := newLlamaServerMediaMarker()
+	launch, err := newLlamaServerLaunchConfig(gpus, modelPath, f, adapters, projectors, opts, numParallel, kvCacheType, config, mediaMarker)
+	if err != nil {
+		return nil, err
 	}
+
+	status := NewStatusWriter(os.Stderr)
+
+	// memWriter wraps the status writer and parses buffer size lines from llama-server logs
+	memWriter := &memoryParsingWriter{inner: status}
 
 	s := &llamaServerRunner{
 		client:           newLlamaServerHTTPClient(),

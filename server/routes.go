@@ -1911,6 +1911,7 @@ func (s *Server) GenerateRoutes() (http.Handler, error) {
 	r.POST("/api/embed", s.EmbedHandler)
 	r.POST("/api/embeddings", s.EmbeddingsHandler)
 	r.GET("/api/info", s.InfoHandler)
+	r.GET("/api/events", s.EventsHandler)
 
 	// Inference (OpenAI compatibility)
 	// TODO(cloud-stage-a): apply Modelfile overlay deltas for local models with cloud
@@ -2005,6 +2006,12 @@ func Serve(ln net.Listener) error {
 	schedCtx, schedDone := context.WithCancel(ctx)
 	sched := InitScheduler(schedCtx)
 	s.sched = sched
+	// The scheduler owns the sampler but not the wire types, so the server supplies the
+	// bodies it embeds. Injected rather than reached for, so the sampler stays testable
+	// without an HTTP layer.
+	sched.psFn = s.processResponse
+	sched.infoFn = s.infoResponse
+	sched.startSampler(schedCtx.Done())
 	s.modelCaches.Start(ctx)
 
 	slog.Info(fmt.Sprintf("Listening on %s (version %s)", ln.Addr(), version.Version))
@@ -2271,9 +2278,22 @@ func (s *Server) SignoutHandler(c *gin.Context) {
 }
 
 func (s *Server) PsHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, *s.processResponse())
+}
+
+// processResponse builds the /api/ps body. The event stream embeds the same structure, so
+// a client has one way to read model placement rather than two that can drift.
+func (s *Server) processResponse() *api.ProcessResponse {
 	models := []api.ProcessModelResponse{}
 
 	for _, v := range s.sched.loadedModels() {
+		if v.loading {
+			// Still loading, so nothing but its identity is known yet. Reporting it is
+			// what lets a client tell "a model is arriving" from "nothing is happening";
+			// the alternative is an empty list for the whole load.
+			models = append(models, api.ProcessModelResponse{Name: v.name, Model: v.name, State: "loading"})
+			continue
+		}
 		m := v.model
 		displayName := model.ParseName(m.ShortName).DisplayShortest()
 		modelDetails := api.ModelDetails{
@@ -2311,7 +2331,7 @@ func (s *Server) PsHandler(c *gin.Context) {
 		return cmp.Compare(j.ExpiresAt.Unix(), i.ExpiresAt.Unix())
 	})
 
-	c.JSON(http.StatusOK, api.ProcessResponse{Models: models})
+	return &api.ProcessResponse{Models: models}
 }
 
 func toolCallId() string {
@@ -2449,11 +2469,109 @@ func writeChatResponse(c *gin.Context, req api.ChatRequest, ch chan any) {
 	streamResponse(c, ch)
 }
 
+// EventsHandler streams model lifecycle events as newline-delimited JSON until the client
+// disconnects.
+//
+// This reports transitions, which /api/ps cannot: it returns state, so a client polling it
+// sees a model that was evicted and replaced between two samples as a single change, and
+// sees nothing at all for the tens of seconds a large model takes to load. Counting loads
+// and evictions, or placing them on a timeline, needs the moments rather than the states.
+//
+// A subscriber that stops reading is dropped from rather than blocking the scheduler; how
+// much it lost travels on the next event it receives as "dropped".
+func (s *Server) EventsHandler(c *gin.Context) {
+	events, unsubscribe := s.sched.events.Subscribe()
+	defer unsubscribe()
+
+	c.Header("Content-Type", "application/x-ndjson")
+	c.Header("Cache-Control", "no-store")
+	c.Header("X-Accel-Buffering", "no") // ask any nginx in the path not to buffer this
+
+	enc := json.NewEncoder(c.Writer)
+	started := time.Now()
+	emit := func(f api.EventFrame) bool {
+		f.V = 1
+		if f.T == 0 && f.Kind != "hello" {
+			f.T = time.Since(started).Milliseconds()
+		}
+		if err := enc.Encode(f); err != nil {
+			return false
+		}
+		c.Writer.Flush()
+		return true
+	}
+
+	now := started.UTC()
+	if !emit(api.EventFrame{
+		Kind:       "hello",
+		ServerTime: &now,
+		Box:        s.boxIdentity(),
+		RetainedMs: 0, // no backfill yet; a reconnecting client must treat gaps as gaps
+	}) {
+		return
+	}
+
+	// Heartbeat cadence. An idle stream still has to prove it is alive, both to the client
+	// and to anything in the path that closes quiet connections.
+	heartbeat := time.NewTicker(5 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			return
+		case ev, ok := <-events:
+			if !ok {
+				return
+			}
+			f := api.EventFrame{
+				Kind:    ev.Type,
+				Model:   ev.Model,
+				Reason:  ev.Reason,
+				Dropped: ev.Dropped,
+				T:       ev.At.Sub(started).Milliseconds(),
+			}
+			// Bodies come from the event where it carried them -- a sample measured them
+			// at its own instant, and re-reading here would report a later moment under an
+			// earlier timestamp. An edge carries none, so its resulting placement is read
+			// now, which is as close to the edge as this can get.
+			f.PS, f.Info = ev.PS, ev.Info
+			if f.PS == nil && ev.Type != EventLoadStart {
+				f.PS = s.processResponse()
+			}
+			if !emit(f) {
+				return
+			}
+		case <-heartbeat.C:
+			if !emit(api.EventFrame{Kind: "heartbeat"}) {
+				return
+			}
+		}
+	}
+}
+
+// boxIdentity is a stable identifier for this machine, so a client can tell it has been
+// pointed at a different backend and drop history that describes another box.
+func (s *Server) boxIdentity() string {
+	if host, err := os.Hostname(); err == nil && host != "" {
+		return host
+	}
+	return "ollama"
+}
+
 func (s *Server) InfoHandler(c *gin.Context) {
-	// Read discovery through the scheduler's hooks rather than calling discover
-	// directly, so the reported devices are the same ones the scheduler places
-	// models on (and so this handler is testable with injected devices).
-	devices := s.sched.getGpuFn(c.Request.Context(), nil)
+	c.JSON(http.StatusOK, *s.infoResponse())
+}
+
+// infoResponse builds the /api/info body, shared with the event stream so capacity is
+// described one way rather than two.
+func (s *Server) infoResponse() *api.InfoResponse {
+	// Read discovery through the scheduler rather than calling discover directly, so the
+	// devices reported are the ones the scheduler places models on, and so this is
+	// testable with injected devices. cachedDevices serves a recent result rather than
+	// probing per call: discovery can only refresh cheaply when every device has a runner
+	// to ask, which is not the normal state of a multi-GPU host.
+	devices := s.sched.cachedDevices(context.Background())
 
 	gpus := make([]api.GPUInfo, len(devices))
 	for i, dev := range devices {
@@ -2497,7 +2615,7 @@ func (s *Server) InfoHandler(c *gin.Context) {
 	}
 
 	sysInfo := s.sched.getSystemInfoFn()
-	c.JSON(http.StatusOK, api.InfoResponse{
+	return &api.InfoResponse{
 		Version: version.Version,
 		Models: api.SystemModelInfo{
 			Store:          envconfig.Models(),
@@ -2515,7 +2633,7 @@ func (s *Server) InfoHandler(c *gin.Context) {
 			},
 			SupportedGPUs: gpus,
 		},
-	})
+	}
 }
 
 func (s *Server) ChatHandler(c *gin.Context) {

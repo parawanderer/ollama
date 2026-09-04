@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ollama/ollama/api"
@@ -77,6 +79,33 @@ type Scheduler struct {
 	// model is predicted from measurement instead of from metadata alone.
 	vramCalibration *llm.VRAMCalibration
 
+	// loadsInFlight counts loads that have started and not finished. A runner object does
+	// not exist for most of a load, so the runner list cannot answer "is anything loading"
+	// -- which is exactly the period the sampler most needs to run fast.
+	loadsInFlight atomic.Int64
+
+	// events publishes model lifecycle transitions to /api/events subscribers, and ring
+	// retains them so a client that reconnects can be told what it missed rather than
+	// having a gap drawn over.
+	events *eventBus
+	ring   *frameRing
+
+	// psFn and infoFn build the bodies the stream embeds. They are supplied by the server
+	// rather than reached for, so the scheduler does not depend on the HTTP layer and the
+	// sampler stays testable.
+	psFn   func() *api.ProcessResponse
+	infoFn func() *api.InfoResponse
+
+	// deviceCacheMu guards a recent discovery result. Discovery can refresh free memory
+	// through runners that already hold a device, but only when the runners it is given
+	// account for every device -- so on a host with an idle GPU it always falls back to
+	// spawning a probe, which costs hundreds of milliseconds. Reporting endpoints serve a
+	// recent result instead of probing per request.
+	deviceCacheMu  sync.Mutex
+	deviceCache    []ml.DeviceInfo
+	deviceCacheAt  time.Time
+	deviceCacheTTL time.Duration
+
 	loadFn          func(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool
 	newServerFn     func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *ggml.GGML, adapters []string, projectors []string, opts api.Options, numParallel int, config llm.LlamaServerConfig) (llm.LlamaServer, error)
 	getGpuFn        func(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.DeviceInfo
@@ -104,9 +133,112 @@ func InitScheduler(ctx context.Context) *Scheduler {
 		getSystemInfoFn: discover.GetSystemInfo,
 		waitForRecovery: 5 * time.Second,
 		vramCalibration: llm.NewVRAMCalibration(),
+		events:          newEventBus(),
+		ring:            newFrameRing(retainedWindow),
+		deviceCacheTTL:  2 * time.Second,
 	}
 	sched.loadFn = sched.load
 	return sched
+}
+
+// publishEvent emits a lifecycle event and drops the cached capacity snapshot, since every
+// event this publishes is something that changed how much device memory is free.
+func (s *Scheduler) publishEvent(ev api.ModelEvent) {
+	s.invalidateDeviceCache()
+
+	// The body is deliberately NOT built here. publishEvent is called from goroutines that
+	// hold a runner's refMu for the duration of a load, and building the body takes that
+	// same lock for every runner -- so fetching it here deadlocks the load against itself.
+	// The stream attaches the body when it serialises the frame instead.
+	if ev.At.IsZero() {
+		ev.At = time.Now().UTC()
+	}
+	s.ring.add(retainedFrame{at: ev.At, kind: ev.Type, model: ev.Model, reason: ev.Reason})
+	s.events.Publish(ev)
+}
+
+// publishSample emits a periodic level snapshot, which corresponds to no discrete event:
+// a KV cache filling during a generation moves the number with nothing to announce it.
+func (s *Scheduler) publishSample(ps *api.ProcessResponse, info *api.InfoResponse) {
+	at := time.Now().UTC()
+	s.ring.add(retainedFrame{at: at, kind: "sample", ps: ps, info: info})
+	s.events.Publish(api.ModelEvent{Type: "sample", At: at, PS: ps, Info: info})
+}
+
+// encodeInfoForCompare renders capacity for change detection only.
+func encodeInfoForCompare(info *api.InfoResponse) string {
+	if info == nil {
+		return ""
+	}
+	b, err := json.Marshal(info)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// encodeForCompare renders a body for change detection only.
+func encodeForCompare(ps *api.ProcessResponse) string {
+	if ps == nil {
+		return ""
+	}
+	b, err := json.Marshal(ps)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// cachedDevices returns device information for reporting, refreshing it only when the
+// cached copy has aged out or a model lifecycle event has invalidated it.
+//
+// The cache exists because discovery is expensive whenever any device lacks a runner to
+// ask, which is the normal state of a multi-GPU host. Free memory is the only field that
+// moves, and the things that move it -- a load, an unload, an eviction -- all publish an
+// event, so the cache is dropped exactly when it stops being true rather than merely when
+// it gets old. The TTL then covers what ollama does not control, such as another process
+// on the same card.
+func (s *Scheduler) cachedDevices(ctx context.Context) []ml.DeviceInfo {
+	s.deviceCacheMu.Lock()
+	if s.deviceCache != nil && time.Since(s.deviceCacheAt) < s.deviceCacheTTL {
+		devices := s.deviceCache
+		s.deviceCacheMu.Unlock()
+		return devices
+	}
+	s.deviceCacheMu.Unlock()
+
+	devices := s.getGpuFn(ctx, s.runnerDiscoverySnapshot())
+
+	s.deviceCacheMu.Lock()
+	s.deviceCache = devices
+	s.deviceCacheAt = time.Now()
+	s.deviceCacheMu.Unlock()
+	return devices
+}
+
+// invalidateDeviceCache drops the cached discovery so the next reader re-reads. Called
+// when something ollama did has changed how much memory is free.
+func (s *Scheduler) invalidateDeviceCache() {
+	s.deviceCacheMu.Lock()
+	s.deviceCache = nil
+	s.deviceCacheMu.Unlock()
+}
+
+// runnerDiscoverySnapshot returns the loaded runners as discovery participants.
+//
+// Device discovery has two paths: it can ask the runners that already hold a device how
+// much memory is free, which is cheap, or it can spawn a bootstrap probe, which is not.
+// It takes the first only when the runners it is given can account for every device, so a
+// caller that passes none forces the expensive path every time.
+func (s *Scheduler) runnerDiscoverySnapshot() []ml.FilteredRunnerDiscovery {
+	s.loadedMu.Lock()
+	defer s.loadedMu.Unlock()
+
+	runners := make([]ml.FilteredRunnerDiscovery, 0, len(s.loaded))
+	for _, r := range s.loaded {
+		runners = append(runners, r)
+	}
+	return runners
 }
 
 // vramCalibrationKey describes the inputs to a placement decision, so that a later
@@ -495,7 +627,12 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 				s.loadedMu.Unlock()
 				slog.Debug("runner terminated and removed from list, blocking for VRAM recovery", "runner", runner)
 				<-finished
+				name := ""
+				if runner.model != nil {
+					name = runner.model.Name
+				}
 				runner.refMu.Unlock()
+				s.publishEvent(api.ModelEvent{Type: EventUnload, Model: name})
 				slog.Debug("sending an unloaded event", "runner", runner)
 				s.unloadedCh <- struct{}{}
 			}
@@ -553,6 +690,10 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 	var f *ggml.GGML
 	loadGpus := gpus
 	var launchOpts api.Options
+
+	// When the load began, so load.complete can report a duration that covers the whole
+	// thing rather than the sliver after the runner object was created.
+	var loadStartedAt time.Time
 
 	// The context the prediction was made at, kept in scope so the measurement this load
 	// produces is recorded against the same value. req.opts.NumCtx is rewritten further
@@ -613,6 +754,13 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 
 			config := llamaServerConfigForModel(req.model)
 			config.ContextShift = req.contextShift
+			// The load begins here. The runner object does not exist until this returns,
+			// which is why a client watching /api/ps sees nothing at all for the duration:
+			// there is no runner to report yet. The edge has to be emitted from the point
+			// work actually starts, or it lands a millisecond before completion.
+			loadStartedAt = time.Now().UTC()
+			s.loadsInFlight.Add(1)
+			s.publishEvent(api.ModelEvent{Type: EventLoadStart, Model: req.model.Name, At: loadStartedAt})
 			llama, err = s.newServerFn(systemInfo, loadGpus, req.model.ModelPath, f, req.model.AdapterPaths, req.model.ProjectorPaths, launchOpts, numParallel, config)
 			if err != nil {
 				// some older models are not compatible with newer versions of llama.cpp
@@ -751,9 +899,14 @@ iGPUScan:
 		contextShift:    req.contextShift,
 		trainContext:    trainContext,
 	}
+	runner.name = req.model.Name
 	runner.numParallel = numParallel
 	runner.calibrationKey = vramCalibrationKey(req, gpus, numParallel)
 	runner.calibrationCtx = predictedCtx
+	runner.loadStarted = loadStartedAt
+	if runner.loadStarted.IsZero() {
+		runner.loadStarted = time.Now()
+	}
 	runner.refMu.Lock() // hold lock until running or aborted
 
 	s.loadedMu.Lock()
@@ -773,6 +926,13 @@ iGPUScan:
 		defer runner.refMu.Unlock()
 		if err = llama.WaitUntilRunning(req.ctx); err != nil {
 			slog.Error("error loading llama server", "error", err)
+			s.loadsInFlight.Add(-1)
+			s.publishEvent(api.ModelEvent{
+				Type:       EventLoadFailed,
+				Model:      req.model.Name,
+				DurationMs: time.Since(runner.loadStarted).Milliseconds(),
+				Reason:     err.Error(),
+			})
 			req.errCh <- err
 			slog.Debug("triggering expiration for failed load", "runner", runner)
 			s.expiredCh <- runner
@@ -787,9 +947,17 @@ iGPUScan:
 		// The load has finished, so llama-server has reported every buffer it allocated.
 		// Remember what it came to: the next load of this model made from the same inputs
 		// is predicted from this rather than from metadata.
-		if _, vram := llama.MemorySize(); vram > 0 {
-			s.vramCalibration.Record(runner.calibrationKey, runner.calibrationCtx, vram)
+		_, loadedVRAM := llama.MemorySize()
+		if loadedVRAM > 0 {
+			s.vramCalibration.Record(runner.calibrationKey, runner.calibrationCtx, loadedVRAM)
 		}
+		s.loadsInFlight.Add(-1)
+		s.publishEvent(api.ModelEvent{
+			Type:       EventLoadComplete,
+			Model:      req.model.Name,
+			DurationMs: time.Since(runner.loadStarted).Milliseconds(),
+			SizeVRAM:   int64(loadedVRAM),
+		})
 		go func() {
 			<-req.ctx.Done()
 			slog.Debug("context for request finished")
@@ -1395,6 +1563,15 @@ type runnerRef struct {
 	calibrationKey llm.CalibrationKey
 	calibrationCtx int
 
+	// name is fixed when the runner is created and never reassigned, so it can be read
+	// while another goroutine holds refMu -- which is the whole point: it lets a loading
+	// runner be named without waiting for the load to finish.
+	name string
+
+	// loadStarted is when this runner began loading, so load.complete can report how long
+	// it took rather than only that it finished.
+	loadStarted time.Time
+
 	loading      bool          // True only during initial load, then false forever
 	gpus         []ml.DeviceID // Recorded at time of provisioning
 	discreteGPUs bool          // True if all devices are discrete GPUs - used to skip VRAM recovery check for iGPUs
@@ -1657,6 +1834,11 @@ func (s *Scheduler) evictAllAndWait(ctx context.Context, keepKey string) bool {
 	}
 
 	slog.Info("evicting all other loaded models for OOM retry", "count", len(runnersToExpire))
+	for _, r := range runnersToExpire {
+		if r.model != nil {
+			s.publishEvent(api.ModelEvent{Type: EventEvict, Model: r.model.Name, Reason: "oom-retry"})
+		}
+	}
 	for _, runner := range runnersToExpire {
 		runner.refMu.Lock()
 		if runner.expireTimer != nil {
@@ -1787,7 +1969,13 @@ func (s *Scheduler) expireRunner(model *Model) {
 // loadedModel is a point-in-time snapshot of a loaded runner's state, safe to
 // use without holding any scheduler locks.
 type loadedModel struct {
-	model         *Model
+	model *Model
+
+	// name and loading describe a runner that could not be inspected because it is still
+	// loading. model is nil in that case; everything else is unknown until the load ends.
+	name    string
+	loading bool
+
 	size          int64
 	sizeVRAM      int64
 	contextLength int
@@ -1810,7 +1998,15 @@ func (s *Scheduler) loadedModels() []loadedModel {
 	// locks them in the opposite order.
 	models := make([]loadedModel, 0, len(runners))
 	for _, r := range runners {
-		r.refMu.Lock()
+		// A loading runner holds refMu for the whole load, so waiting for it here makes
+		// this call block for as long as the load takes -- tens of seconds for a large
+		// model, during which a client polling for state gets nothing back at all. Report
+		// that the model is loading instead. The name is read from a field fixed at
+		// construction rather than from r.model, which is only safe under the lock.
+		if !r.refMu.TryLock() {
+			models = append(models, loadedModel{name: r.name, loading: true})
+			continue
+		}
 		if r.model == nil {
 			// Unloaded after the snapshot above was taken
 			r.refMu.Unlock()

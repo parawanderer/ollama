@@ -236,7 +236,7 @@ func TestInfoHandlerNoDevices(t *testing.T) {
 func TestInfoHandlerReportsPhysicalMemoryWhenItDiffers(t *testing.T) {
 	t.Setenv("OLLAMA_MODELS", t.TempDir())
 
-	const usable, physical = 94*format.GibiByte, 95*format.GibiByte
+	const usable, physical = 94 * format.GibiByte, 95 * format.GibiByte
 	s := &Server{
 		sched: &Scheduler{
 			getSystemInfoFn: getSystemInfoFn,

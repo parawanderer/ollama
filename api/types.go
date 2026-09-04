@@ -843,7 +843,14 @@ type ListModelResponse struct {
 
 // ProcessModelResponse is a single model description in [ProcessResponse].
 type ProcessModelResponse struct {
-	Name          string       `json:"name"`
+	Name string `json:"name"`
+
+	// State is "loading" while a model is still being loaded, and empty once it is
+	// resident. A loading entry carries only its name: nothing else is known until the
+	// load finishes. Absent means resident, so existing clients read the field's absence
+	// the way they always have.
+	State string `json:"state,omitempty"`
+
 	Model         string       `json:"model"`
 	Size          int64        `json:"size"`
 	Digest        string       `json:"digest"`
@@ -1404,6 +1411,84 @@ type SystemComputeInfo struct {
 
 	// FreeSwap is the amount of swap space available for loading new models
 	FreeSwap uint64 `json:"free_swap"`
+}
+
+// EventFrame is one line of the /api/events stream.
+//
+// The envelope is versioned and every frame carries a kind, so a client has one parser for
+// edges and levels alike. Times are an offset in milliseconds from the hello frame that
+// opened the connection, never an absolute stamp: the server's clock is not the viewer's,
+// and a client that has to decide whether to trust a remote clock will generally decide
+// not to.
+type EventFrame struct {
+	V    int    `json:"v"`
+	Kind string `json:"kind"`
+
+	// T is milliseconds since this connection's hello frame.
+	T int64 `json:"t"`
+
+	// ServerTime, Box and RetainedMs appear on the hello frame only. Box identifies the
+	// machine so a client can drop history it collected from a different one, and
+	// RetainedMs says how much backfill can be served rather than leaving it to guess.
+	ServerTime *time.Time `json:"serverTime,omitempty"`
+	Box        string     `json:"box,omitempty"`
+	RetainedMs int64      `json:"retainedMs,omitempty"`
+
+	// Model and Reason describe an edge.
+	Model  string `json:"model,omitempty"`
+	Reason string `json:"reason,omitempty"`
+
+	// PS is the /api/ps body, byte-identical to what that endpoint serves, so one piece of
+	// client code reads model placement everywhere. Info is the /api/info body, sent on
+	// the first sample and whenever it changes. Both are pointers: absent means "this
+	// frame did not say", which is not the same as zero.
+	PS   *ProcessResponse `json:"ps,omitempty"`
+	Info *InfoResponse    `json:"info,omitempty"`
+
+	// Dropped is how many frames this subscriber lost to a full buffer, cumulative.
+	// Non-zero means its record has a gap, which must not be drawn as a flat line.
+	Dropped uint64 `json:"dropped,omitempty"`
+}
+
+// ModelEvent is one model-lifecycle transition, as delivered by /api/events.
+//
+// These describe moments rather than state. A client polling /api/ps sees state and can
+// miss the transitions between two samples entirely: a model evicted to make room for
+// another is replaced between polls, and a load lasting tens of seconds is invisible for
+// all of them. Anything counting loads or evictions, or placing them on a timeline, needs
+// the moments.
+type ModelEvent struct {
+	// Type is one of load.start, load.complete, load.failed, evict, unload.
+	Type string `json:"type"`
+
+	// Model is the name the event concerns.
+	Model string `json:"model"`
+
+	// At is when the event occurred, UTC.
+	At time.Time `json:"at"`
+
+	// DurationMs is how long the transition took, on the events that conclude one:
+	// load.complete measures from the matching load.start.
+	DurationMs int64 `json:"duration_ms,omitempty"`
+
+	// SizeVRAM is the model's device memory once loaded, and GPUs how it is distributed,
+	// matching the fields of the same name on /api/ps.
+	SizeVRAM int64        `json:"size_vram,omitempty"`
+	GPUs     []ProcessGPU `json:"gpus,omitempty"`
+
+	// Reason carries why an eviction or failure happened, where one is known.
+	Reason string `json:"reason,omitempty"`
+
+	// PS is the model placement body as it stood at this event, so an edge and the level
+	// it produced arrive together. Info is capacity, sent when it has changed; its absence
+	// means this frame did not say, never that capacity is zero.
+	PS   *ProcessResponse `json:"ps,omitempty"`
+	Info *InfoResponse    `json:"info,omitempty"`
+
+	// Dropped is how many events this subscriber has lost to a full buffer. It is
+	// cumulative, and non-zero means the client's own record has a gap -- a distinction
+	// worth surfacing, because a gap and a quiet period look identical otherwise.
+	Dropped uint64 `json:"dropped,omitempty"`
 }
 
 type GPUInfo struct {

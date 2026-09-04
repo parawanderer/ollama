@@ -845,6 +845,12 @@ type ListModelResponse struct {
 type ProcessModelResponse struct {
 	Name string `json:"name"`
 
+	// Busy reports that a request is in flight against this model. It is what makes
+	// ExpiresAt readable: the deadline only moves when a request finishes, so while Busy
+	// is true a countdown from ExpiresAt is measuring the wrong thing and will run past
+	// zero on a model that is resident and working.
+	Busy bool `json:"busy,omitempty"`
+
 	// State is "loading" while a model is still being loaded, and empty once it is
 	// resident. A loading entry carries only its name: nothing else is known until the
 	// load finishes. Absent means resident, so existing clients read the field's absence
@@ -1444,6 +1450,9 @@ type EventFrame struct {
 	Model  string `json:"model,omitempty"`
 	Reason string `json:"reason,omitempty"`
 
+	// ExpiresAt is the new keep-alive deadline, on an expires frame.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+
 	// PS is the /api/ps body, byte-identical to what that endpoint serves, so one piece of
 	// client code reads model placement everywhere. Info is the /api/info body, sent on
 	// the first sample and whenever it changes. Both are pointers: absent means "this
@@ -1484,6 +1493,9 @@ type ModelEvent struct {
 
 	// Reason carries why an eviction or failure happened, where one is known.
 	Reason string `json:"reason,omitempty"`
+
+	// ExpiresAt is the new keep-alive deadline, on an expires event.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 
 	// PS is the model placement body as it stood at this event, so an edge and the level
 	// it produced arrive together. Info is capacity, sent when it has changed; its absence

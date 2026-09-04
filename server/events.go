@@ -17,6 +17,12 @@ const (
 	EventLoadFailed   = "load.failed"
 	EventEvict        = "evict"
 	EventUnload       = "unload"
+
+	// EventExpires reports a keep-alive deadline moving. It is emitted when the deadline
+	// is written, which happens only as a request finishes -- so a client that draws a
+	// countdown has no way to know from /api/ps alone that the number it is counting from
+	// is being held rather than approaching.
+	EventExpires = "expires"
 )
 
 // eventSubscriberBuffer is how many events a subscriber may fall behind before its events

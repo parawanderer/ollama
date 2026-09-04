@@ -2324,6 +2324,7 @@ func (s *Server) processResponse() *api.ProcessResponse {
 			Digest:        m.Digest,
 			Details:       modelDetails,
 			ExpiresAt:     v.expiresAt,
+			Busy:          v.busy,
 			ContextLength: v.contextLength,
 		})
 	}
@@ -2573,7 +2574,7 @@ func (s *Server) EventsHandler(c *gin.Context) {
 			// at its own instant, and re-reading here would report a later moment under an
 			// earlier timestamp. An edge carries none, so its resulting placement is read
 			// now, which is as close to the edge as this can get.
-			f.PS, f.Info = ev.PS, ev.Info
+			f.PS, f.Info, f.ExpiresAt = ev.PS, ev.Info, ev.ExpiresAt
 			if f.PS == nil && ev.Type != EventLoadStart {
 				f.PS = s.processResponse()
 			}

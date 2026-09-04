@@ -157,6 +157,14 @@ func (s *Scheduler) publishEvent(ev api.ModelEvent) {
 	s.events.Publish(ev)
 }
 
+// publishExpiry reports a keep-alive deadline moving, which happens only as a request
+// finishes. A client cannot infer this from /api/ps: the field is there, but nothing says
+// whether it is being held or approaching.
+func (s *Scheduler) publishExpiry(model string, at time.Time) {
+	deadline := at
+	s.publishEvent(api.ModelEvent{Type: EventExpires, Model: model, ExpiresAt: &deadline})
+}
+
 // publishSample emits a periodic level snapshot, which corresponds to no discrete event:
 // a KV cache filling during a generation moves the number with nothing to announce it.
 func (s *Scheduler) publishSample(ps *api.ProcessResponse, info *api.InfoResponse) {
@@ -569,10 +577,12 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 						s.expiredCh <- runner
 					})
 					runner.expiresAt = time.Now().Add(runner.sessionDuration)
+					s.publishExpiry(runner.name, runner.expiresAt)
 				} else {
 					slog.Debug("runner with non-zero duration has gone idle, resetting timer", "runner", runner, "duration", runner.sessionDuration)
 					runner.expireTimer.Reset(runner.sessionDuration)
 					runner.expiresAt = time.Now().Add(runner.sessionDuration)
+					s.publishExpiry(runner.name, runner.expiresAt)
 				}
 			}
 			slog.Debug("after processing request finished event", "runner", runner, "refCount", runner.refCount)
@@ -1976,6 +1986,12 @@ type loadedModel struct {
 	name    string
 	loading bool
 
+	// busy reports that a request is in flight against this runner. It matters because
+	// expiresAt does not move while one is: the deadline is only pushed out when a request
+	// finishes, so a countdown drawn from expiresAt during a long generation runs down and
+	// past zero for a model that is resident and working.
+	busy bool
+
 	size          int64
 	sizeVRAM      int64
 	contextLength int
@@ -2014,6 +2030,7 @@ func (s *Scheduler) loadedModels() []loadedModel {
 		}
 		lm := loadedModel{
 			model:     r.model,
+			busy:      r.refCount > 0,
 			size:      int64(r.totalSize),
 			sizeVRAM:  int64(r.vramSize),
 			expiresAt: r.expiresAt,

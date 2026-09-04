@@ -339,7 +339,16 @@ func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey
 		vram, err := llm.ProbeFitVRAM(ctx, gpus, req.model.ModelPath, f, req.model.AdapterPaths, req.model.ProjectorPaths,
 			req.opts, numParallel, envconfig.KvCacheType(), llamaServerConfigForModel(req.model), probeCtx)
 		if err != nil {
-			slog.Debug("could not measure model memory without loading it", "model", req.model.ModelPath, "num_ctx", probeCtx, "error", err)
+			// Not fitting is worth saying out loud: it is the reason this load is about
+			// to be placed from a lower bound, and it is recoverable -- the probe runs
+			// before the pre-flight eviction, so a model resident right now can be what
+			// denies it. The next load, once that model has gone, will measure normally.
+			if errors.Is(err, llm.ErrFitProbeWouldNotFit) {
+				slog.Info("could not measure this model without loading it: it does not fit in the memory free right now",
+					"model", req.model.ModelPath, "num_ctx", probeCtx)
+			} else {
+				slog.Debug("could not measure model memory without loading it", "model", req.model.ModelPath, "num_ctx", probeCtx, "error", err)
+			}
 			continue
 		}
 		s.vramCalibration.Record(key, probeCtx, vram)

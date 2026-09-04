@@ -26,10 +26,35 @@ import (
 // self is what this load would hold on that device. Summing it across devices gives the
 // same quantity a completed load reports, which is what makes a probe interchangeable
 // with a measurement.
+// Only device rows are summed. A "Host" row appears even on a load that is entirely on
+// GPU -- it is the mmap'd, file-backed view of the weights, whose span overlaps the device
+// copy rather than adding to it, which is why ollama's own accounting excludes it too. It
+// has no parentheses after the name, so this pattern skips it. Do not "fix" that: counting
+// it would add the whole model file a second time.
+var fitBreakdownRegex = regexp.MustCompile(`memory_breakdown_print:.*\|\s+-\s+\S+\s+\([^)]*\)\s+\|\s+\d+\s+=\s+\d+\s+\+\s+\(\s*(\d+)\s+=`)
+
+// The fit pass always states its verdict, and a result is only usable when that verdict is
+// the clean one. This is a positive requirement rather than a list of failure phrasings on
+// purpose: an earlier version enumerated adjustment verbs and matched none of the ones
+// llama-server actually prints ("cannot meet", "moved", "filling"), so a degraded probe
+// would have been recorded as a measurement.
+// "no changes needed" is the invariant across the verdict's three phrasings -- the wording
+// before it names how the check was framed, and differs by device count:
+//
+//	multi-device:  targets for free memory can be met on all devices, no changes needed
+//	single device: will leave 17886 >= 1024 MiB of free device memory, no changes needed
+//	cpu only:      will leave 123126 >= 1024 MiB of system memory, no changes needed
+//
+// Matching the multi-device wording alone rejected every single-device probe, which is the
+// common case here, so key on the part that does not vary.
 var (
-	fitBreakdownRegex = regexp.MustCompile(`memory_breakdown_print:.*\|\s+-\s+\S+\s+\([^)]*\)\s+\|\s+\d+\s+=\s+\d+\s+\+\s+\(\s*(\d+)\s+=`)
-	fitConcludedRegex = regexp.MustCompile(`common_params_fit_impl: (projected to use|targets for free memory)`)
-	fitAdjustedRegex  = regexp.MustCompile(`common_params_fit_impl: (reducing|decreasing|increasing|adjusting|moving)`)
+	fitCleanRegex = regexp.MustCompile(`common_params_fit_impl:.*no changes needed`)
+	// Singular and plural both occur -- "cannot meet free memory target of 90000 MiB" on
+	// one device, "...targets on all devices" on several. This is only an early exit:
+	// correctness rests on the clean verdict above, which a degraded pass never prints.
+	// But it is worth having, because giving up here takes 0.7s where letting the pass
+	// exhaust its fallbacks takes 15.
+	fitTooSmallRegex = regexp.MustCompile(`common_params_fit_impl: cannot meet free memory target`)
 )
 
 // fitProbeTimeout bounds one probe. Measured cost is 0.4-0.9s including process start,
@@ -38,9 +63,14 @@ var (
 // and exists only so a probe cannot become the thing that delays a load.
 const fitProbeTimeout = 30 * time.Second
 
-// ErrFitProbeAdjusted reports that llama-server changed the parameters it was asked to
-// measure, so the figure it printed describes a different load than the one requested.
-var ErrFitProbeAdjusted = errors.New("fit probe adjusted the parameters it was asked to measure")
+// ErrFitProbeWouldNotFit reports that the model could not be placed as asked in the memory
+// free at the time, so llama-server began moving it to system memory instead.
+//
+// llama-server does not fail in this situation -- it degrades, printing a fresh breakdown
+// for each fallback it tries (all experts to host, then dense layers back-to-front), each
+// one smaller than the last. A reader that simply takes the final breakdown records about
+// a gigabyte as the cost of a hundred-gigabyte model, and persists it.
+var ErrFitProbeWouldNotFit = errors.New("model does not fit in the memory free right now, so it cannot be measured")
 
 // ProbeFitVRAM reports what a model would occupy at numCtx, by running llama-server's fit
 // pass and killing it as soon as it has answered. Nothing is loaded and no memory is
@@ -115,31 +145,34 @@ func ProbeFitVRAM(
 		}
 	}()
 
-	total, adjusted := scanFitBreakdown(out)
+	total, clean := scanFitBreakdown(out)
 	close(done)
 	_ = cmd.Process.Kill()
 	_, _ = io.Copy(io.Discard, out)
 	_ = cmd.Wait()
 
 	switch {
-	case adjusted:
-		return 0, ErrFitProbeAdjusted
 	case total == 0:
 		if err := ctx.Err(); err != nil {
 			return 0, fmt.Errorf("fit probe did not report in %s: %w", fitProbeTimeout, err)
 		}
 		return 0, errors.New("fit probe produced no memory breakdown")
+	case !clean:
+		return 0, ErrFitProbeWouldNotFit
 	}
 
 	slog.Debug("probed model memory without loading it", "model", modelPath, "num_ctx", numCtx, "vram", total)
 	return total, nil
 }
 
-// scanFitBreakdown sums the per-device figures of the last breakdown printed, and reports
-// whether llama-server changed the parameters it was measuring. The pass prints a
-// breakdown per candidate configuration, so only the final one describes what it settled
-// on; each new breakdown therefore replaces the running total rather than adding to it.
-func scanFitBreakdown(r io.Reader) (total uint64, adjusted bool) {
+// scanFitBreakdown sums the per-device figures of the breakdown the fit pass reaches its
+// verdict on, and reports whether that verdict was the clean one.
+//
+// The pass prints one breakdown per configuration it considers, so a running total has to
+// be replaced by each new breakdown rather than added to. Scanning stops at the verdict,
+// which is what makes the figure correspond to the configuration that was requested rather
+// than to whichever fallback was printed last.
+func scanFitBreakdown(r io.Reader) (total uint64, clean bool) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
@@ -163,15 +196,15 @@ func scanFitBreakdown(r io.Reader) (total uint64, adjusted bool) {
 			// row ends it.
 			total, sawRow = current, false
 		}
-		if fitAdjustedRegex.MatchString(line) {
-			adjusted = true
-		}
-		if fitConcludedRegex.MatchString(line) && total > 0 {
-			return total, adjusted
+		switch {
+		case fitTooSmallRegex.MatchString(line):
+			return total, false
+		case fitCleanRegex.MatchString(line):
+			return total, total > 0
 		}
 	}
 	if sawRow {
 		total = current
 	}
-	return total, adjusted
+	return total, false
 }

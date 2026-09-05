@@ -33,6 +33,9 @@ type ChatWriter struct {
 	id             string
 	toolCallSent   bool
 	firstChunkSent bool
+	// proto sends the stream as length-delimited protobuf instead of SSE JSON, when the
+	// client asked for it in Accept. See protostream.go.
+	proto bool
 	// createdAt pins the shared timestamp for every chunk in the stream,
 	// captured from the first response.
 	createdAt time.Time
@@ -86,7 +89,13 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 
 	// chat chunk
 	if w.stream {
-		w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
+		// Set here rather than only at negotiation: this runs on the first write and
+		// would otherwise overwrite the negotiated type with the SSE one.
+		if w.proto {
+			w.ResponseWriter.Header().Set("Content-Type", protoStreamContentType)
+		} else {
+			w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
+		}
 
 		// OpenAI stamps one created value on every chunk in a stream; pin the
 		// timestamp from the first response (the server stamps each response).
@@ -113,12 +122,36 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 			includeRole := !w.firstChunkSent
 			chunks := openai.ToStreamChunks(w.id, chatResponse, includeRole)
 			for _, c := range chunks {
+				if !w.toolCallSent && len(c.Choices) > 0 && len(c.Choices[0].Delta.ToolCalls) > 0 {
+					w.toolCallSent = true
+				}
+
+				if w.proto {
+					// The fields JSON repeats on every chunk go out once, ahead of the
+					// first delta, and each token after that costs only itself.
+					if !w.firstChunkSent {
+						if _, err := w.ResponseWriter.Write(StartFrame(
+							c.Id, c.Model, c.SystemFingerprint, "assistant", c.Created,
+						)); err != nil {
+							return 0, err
+						}
+					}
+					for _, choice := range c.Choices {
+						content, reasoning := deltaOf(choice)
+						if content == "" && reasoning == "" {
+							continue
+						}
+						if _, err := w.ResponseWriter.Write(DeltaFrame(content, reasoning)); err != nil {
+							return 0, err
+						}
+					}
+					w.firstChunkSent = true
+					continue
+				}
+
 				d, err := json.Marshal(c)
 				if err != nil {
 					return 0, err
-				}
-				if !w.toolCallSent && len(c.Choices) > 0 && len(c.Choices[0].Delta.ToolCalls) > 0 {
-					w.toolCallSent = true
 				}
 				_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
 				if err != nil {
@@ -131,6 +164,20 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 		}
 
 		if chatResponse.Done {
+			if w.proto {
+				// One End frame replaces the finish chunk, the optional usage chunk and
+				// "data: [DONE]", all three of which say the same thing in JSON.
+				u := openai.ToUsage(chatResponse)
+				reason := "stop"
+				if fc := openai.FinishChunk(w.id, chatResponse, w.toolCallSent); len(fc.Choices) > 0 && fc.Choices[0].FinishReason != nil {
+					reason = *fc.Choices[0].FinishReason
+				}
+				if _, err := w.ResponseWriter.Write(EndFrame(reason, u.PromptTokens, u.CompletionTokens)); err != nil {
+					return 0, err
+				}
+				return len(data), nil
+			}
+
 			finishChunk := openai.FinishChunk(w.id, chatResponse, w.toolCallSent)
 			d, err := json.Marshal(finishChunk)
 			if err != nil {
@@ -472,9 +519,17 @@ func ChatMiddleware() gin.HandlerFunc {
 
 		c.Request.Body = io.NopCloser(&b)
 
+		// Content negotiation, so this is the same endpoint and a client that asks for
+		// nothing gets exactly the SSE it got before.
+		wantsProto := req.Stream && strings.Contains(c.GetHeader("Accept"), protoStreamAccept)
+		if wantsProto {
+			c.Header("Content-Type", protoStreamContentType)
+		}
+
 		w := &ChatWriter{
 			BaseWriter:    BaseWriter{ResponseWriter: c.Writer},
 			stream:        req.Stream,
+			proto:         wantsProto,
 			id:            fmt.Sprintf("chatcmpl-%d", rand.Intn(999)),
 			streamOptions: req.StreamOptions,
 		}

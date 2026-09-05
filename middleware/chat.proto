@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+// A streaming chat completion, shaped like OpenAI's but without re-sending the invariant
+// half of it on every token.
+//
+// OpenAI's chunk repeats id, object, created, model, system_fingerprint and a nested
+// choices[0].delta wrapper for each token, so 224 bytes of envelope arrive with about 5
+// bytes of text. Everything constant for a response is sent once here, in Start, and a
+// token costs a tag, a length and its own bytes.
+package slop.chat.v1;
+
+// Sent once, before any Delta. These are the fields OpenAI repeats per chunk.
+message Start {
+  string id = 1;
+  string model = 2;
+  uint64 created = 3;
+  string system_fingerprint = 4;
+  string role = 5;  // "assistant"
+}
+
+// One token, or one step of one. Both fields are optional: a reasoning model emits
+// reasoning before content, and a chunk carries whichever it produced.
+message Delta {
+  string content = 1;
+  string reasoning = 2;
+}
+
+// Sent once, after the last Delta.
+message End {
+  string finish_reason = 1;
+  uint32 prompt_tokens = 2;
+  uint32 completion_tokens = 3;
+}
+
+message Frame {
+  oneof kind {
+    Start start = 1;
+    Delta delta = 2;
+    End end = 3;
+  }
+}

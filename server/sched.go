@@ -1307,11 +1307,24 @@ iGPUScan:
 			}
 		}
 		s.loadsInFlight.Add(-1)
+		// A spill is reported rather than merely recorded. It is the visible consequence of
+		// a prediction that was too low, and it is otherwise silent: the load succeeds, the
+		// model answers, and the only trace is that it is slow.
+		if loadedTotal > loadedVRAM {
+			slog.Warn("model did not fit and is running partly on the CPU",
+				"model", req.model.ModelPath,
+				"num_ctx", runner.calibrationCtx,
+				"needed", format.HumanBytes2(loadedTotal),
+				"on_device", format.HumanBytes2(loadedVRAM),
+				"on_host", format.HumanBytes2(loadedTotal-loadedVRAM))
+		}
+
 		complete := api.ModelEvent{
 			Type:       EventLoadComplete,
 			Model:      req.model.Name,
 			DurationMs: time.Since(runner.loadStarted).Milliseconds(),
 			SizeVRAM:   int64(loadedVRAM),
+			SizeTotal:  int64(loadedTotal),
 		}
 		if !runner.weightsLoaded.IsZero() && !runner.loadStarted.IsZero() {
 			complete.WeightsMs = runner.weightsLoaded.Sub(runner.loadStarted).Milliseconds()

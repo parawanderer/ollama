@@ -284,3 +284,74 @@ func TestCalibrationDiscardsUnusableFiles(t *testing.T) {
 		t.Error("a missing file produced samples from nowhere")
 	}
 }
+
+// TestMaxContextForInvertsPredict is the property that matters: whatever context this hands
+// back must be one Predict then says fits. If the two disagree, a caller solves for a
+// context with one line and is judged against another, and the answer corresponds to no
+// decision anyone made.
+func TestMaxContextForInvertsPredict(t *testing.T) {
+	key := testKey()
+
+	for name, setup := range map[string]func(*VRAMCalibration){
+		"no samples":     func(c *VRAMCalibration) {},
+		"one sample":     func(c *VRAMCalibration) { c.Record(key, 8192, 20*gib) },
+		"fitted line":    func(c *VRAMCalibration) { c.Record(key, 8192, 20*gib+8192*2048); c.Record(key, 32768, 20*gib+32768*2048) },
+		"negative slope": func(c *VRAMCalibration) { c.Record(key, 8192, 40*gib); c.Record(key, 32768, 30*gib) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := NewVRAMCalibration()
+			setup(c)
+
+			const budget = 40 * gib
+			ctx := c.MaxContextFor(key, budget, 20*gib, 2048)
+			if ctx <= 0 {
+				t.Fatalf("no context fits in %d GiB for a 20 GiB model", budget/gib)
+			}
+
+			// Rounding down means the answer is safe, so a small overshoot at ctx+1 is
+			// expected and an overshoot at ctx is not.
+			if got, _ := c.Predict(key, ctx, 20*gib, 2048); got > budget {
+				t.Errorf("solved for %d, which Predict then puts at %d bytes -- over the %d budget",
+					ctx, got, uint64(budget))
+			}
+			if got, _ := c.Predict(key, ctx+8192, 20*gib, 2048); got <= budget {
+				t.Errorf("solved for %d but %d also fits, so this is not the largest", ctx, ctx+8192)
+			}
+		})
+	}
+}
+
+// A model whose weights alone exceed the budget has no context to solve for, and saying
+// "zero" is different from saying "a very small one": the caller must split or refuse, not
+// shrink.
+func TestMaxContextForRefusesWhenWeightsDoNotFit(t *testing.T) {
+	c := NewVRAMCalibration()
+	key := testKey()
+	c.Record(key, 8192, 80*gib+8192*2048)
+	c.Record(key, 32768, 80*gib+32768*2048)
+
+	if got := c.MaxContextFor(key, 40*gib, 80*gib, 2048); got != 0 {
+		t.Errorf("offered %d context for a model whose weights are twice the budget", got)
+	}
+	if got := c.MaxContextFor(key, 0, 80*gib, 2048); got != 0 {
+		t.Errorf("offered %d context against no budget at all", got)
+	}
+}
+
+// The measured curve again, used the other way round: given the memory a card actually has,
+// how much context does this model get? The answer has to agree with the loads that were
+// really run at those sizes.
+func TestMaxContextForAgainstMeasuredCurve(t *testing.T) {
+	c := NewVRAMCalibration()
+	key := testKey()
+	perGiB := float64(gib)
+	c.Record(key, 8192, uint64(76.84*perGiB))
+	c.Record(key, 32768, uint64(77.71*perGiB))
+
+	// 86.35 GiB was measured at 262144, so a budget of that size should offer about that
+	// context -- within a few percent, since the line is fitted from two shorter loads.
+	got := c.MaxContextFor(key, uint64(86.35*perGiB), 0, 0)
+	if got < 240000 || got > 285000 {
+		t.Errorf("offered %d context for the budget a 262144 load actually used", got)
+	}
+}

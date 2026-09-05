@@ -1469,6 +1469,13 @@ type EventFrame struct {
 	// timestamps.
 	SizeVRAM int64 `json:"size_vram,omitempty"`
 
+	// SizeTotal is what the load holds everywhere, device and host together. It equals
+	// SizeVRAM when the model fit on the GPU and exceeds it when it did not: llama-server
+	// re-fits against the memory actually free, so a load that was predicted too low does
+	// not fail, it quietly runs part of itself on the CPU. Nothing else reports that, so a
+	// client watching a load has no other way to tell a fit from a spill.
+	SizeTotal int64 `json:"size_total,omitempty"`
+
 	// PS is the /api/ps body, byte-identical to what that endpoint serves, so one piece of
 	// client code reads model placement everywhere. Info is the /api/info body, sent on
 	// the first sample and whenever it changes. Both are pointers: absent means "this
@@ -1508,6 +1515,11 @@ type ModelEvent struct {
 	// buffers -- so which half is running is what a progress display wants to say.
 	WeightsMs int64 `json:"weights_ms,omitempty"`
 	ContextMs int64 `json:"context_ms,omitempty"`
+
+	// SizeTotal is what the load holds everywhere. It exceeds SizeVRAM exactly when the
+	// load spilled to the host, which is the only signal that a prediction was too low --
+	// such a load succeeds and is merely slow.
+	SizeTotal int64 `json:"size_total,omitempty"`
 
 	// SizeVRAM is the model's device memory once loaded, and GPUs how it is distributed,
 	// matching the fields of the same name on /api/ps.

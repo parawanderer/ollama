@@ -150,6 +150,7 @@ func TestEventFrameCopiesEveryCommonField(t *testing.T) {
 		WeightsMs:  2000,
 		ContextMs:  6000,
 		SizeVRAM:   86 << 30,
+		SizeTotal:  88 << 30,
 		Dropped:    3,
 		ExpiresAt:  &expires,
 		PS:         &api.ProcessResponse{},

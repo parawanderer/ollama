@@ -230,3 +230,79 @@ func (c *VRAMCalibration) Forget(key CalibrationKey) {
 	defer c.mu.Unlock()
 	delete(c.samples, key)
 }
+
+// MaxContextFor reports the largest context length whose predicted memory fits in budget,
+// which is Predict solved the other way round.
+//
+// It exists because choosing a context and then asking whether it fits is the wrong way
+// round when the answer is known in closed form. Memory is linear in context -- across two
+// architectures at four context lengths the residual of a straight-line fit stayed under 30
+// MiB -- so a budget determines a context directly, without loading anything to find out.
+//
+// The reported value is the largest context that fits, so it is safe to use as-is: a caller
+// that asks for it and gets it will not spill. Zero means not even an empty context fits,
+// which is a model too large for the budget rather than a context to reduce.
+//
+// The same call answers three different questions, differing only in what the budget is:
+// what fits on one device, what fits under a limit a user set for reasons of their own, and
+// what fits across everything available.
+func (c *VRAMCalibration) MaxContextFor(key CalibrationKey, budget, base, bytesPerToken uint64) int {
+	if budget == 0 {
+		return 0
+	}
+
+	intercept, perToken, ok := c.line(key, base, bytesPerToken)
+	if !ok || perToken <= 0 {
+		return 0
+	}
+	if budget <= intercept {
+		// The weights alone do not fit. There is no context to solve for.
+		return 0
+	}
+
+	ctx := float64(budget-intercept) / perToken
+	if ctx > float64(math.MaxInt32) {
+		return math.MaxInt32
+	}
+	return int(ctx)
+}
+
+// line returns the intercept and per-token slope this key predicts with, preferring measured
+// samples over the metadata prior in the same order Predict does. Keeping the two in step
+// matters: a caller that solves for a context with one line and is then predicted against a
+// different one gets an answer that does not correspond to any decision.
+func (c *VRAMCalibration) line(key CalibrationKey, base, bytesPerToken uint64) (intercept uint64, perToken float64, ok bool) {
+	if c == nil {
+		return base, float64(bytesPerToken), bytesPerToken > 0
+	}
+
+	c.mu.Lock()
+	samples := append([]calibrationSample(nil), c.samples[key]...)
+	c.mu.Unlock()
+
+	switch {
+	case len(samples) == 0:
+		return base, float64(bytesPerToken), bytesPerToken > 0
+
+	case !hasDistinctContexts(samples):
+		// One measured point fixes a line of the prior's slope through it, so the
+		// intercept is that point projected back to zero context.
+		s := samples[0]
+		slope := float64(bytesPerToken)
+		at := slope * float64(s.numCtx)
+		if float64(s.vram) < at {
+			return 0, slope, slope > 0
+		}
+		return s.vram - uint64(at), slope, slope > 0
+
+	default:
+		fitted, slope := leastSquares(samples)
+		if slope <= 0 {
+			return base, float64(bytesPerToken), bytesPerToken > 0
+		}
+		if fitted < 0 {
+			fitted = 0
+		}
+		return uint64(fitted), slope, true
+	}
+}

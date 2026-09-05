@@ -1310,6 +1310,9 @@ iGPUScan:
 		}
 		runner.loading = false
 		runner.stillLoading.Store(false)
+		// Publish a first reading while the lock is still held, so a reader arriving
+		// before any successful read has something to report rather than nothing.
+		runner.reportLocked()
 		// The load has finished, so llama-server has reported every buffer it allocated.
 		// Remember what it came to: the next load of this model made from the same inputs
 		// is predicted from this rather than from metadata.
@@ -2430,11 +2433,15 @@ func (s *Scheduler) loadedModels() []loadedModel {
 			// was held. refMu is taken by ordinary traffic: a request finishing, an
 			// expiry being reset, another model being admitted.
 			switch snapshot := r.lastReported.Load(); {
-			case r.stillLoading.Load():
-				models = append(models, loadedModel{name: r.name, loading: true})
-			case snapshot != nil:
-				// Resident, merely contended. What was last read is still true.
+			case snapshot != nil && !r.stillLoading.Load():
+				// Resident, merely contended. What was last read is still true: a loaded
+				// model's figures do not change while its lock is held. Only busy can
+				// have moved, and it moves under this same lock.
 				models = append(models, *snapshot)
+			default:
+				// Either genuinely still loading, or loaded so recently that nothing has
+				// read it yet -- and in both cases its identity is all that is known.
+				models = append(models, loadedModel{name: r.name, loading: true})
 			}
 			continue
 		}
@@ -2443,39 +2450,50 @@ func (s *Scheduler) loadedModels() []loadedModel {
 			r.refMu.Unlock()
 			continue
 		}
-		lm := loadedModel{
-			model:     r.model,
-			busy:      r.refCount > 0,
-			size:      int64(r.totalSize),
-			sizeVRAM:  int64(r.vramSize),
-			expiresAt: r.expiresAt,
-			gpus:      slices.Clone(r.gpus),
-		}
-		if r.llama != nil {
-			lm.contextLength = r.llama.ContextLength()
-			total, vram := r.llama.MemorySize()
-			lm.size = int64(total)
-			lm.sizeVRAM = int64(vram)
-
-			// Per-device residency. A backend with one device reports the whole
-			// figure for it; one whose device names don't map back reports zero
-			// rather than guessing.
-			lm.vramByGPU = make(map[ml.DeviceID]uint64, len(lm.gpus))
-			for _, dev := range lm.gpus {
-				lm.vramByGPU[dev] = r.llama.VRAMByGPU(dev)
-			}
-		}
-		// The scheduler waits to set expiresAt, so a model that is still
-		// loading may have the zero value. Estimate expiration from the
-		// session duration instead.
-		if lm.expiresAt.IsZero() {
-			lm.expiresAt = time.Now().Add(r.sessionDuration)
-		}
+		lm := r.reportLocked()
 		r.refMu.Unlock()
 
-		// Kept for the next reader that finds this runner's lock busy.
-		r.lastReported.Store(&lm)
 		models = append(models, lm)
 	}
 	return models
+}
+
+// reportLocked builds this runner's reportable state and remembers it, so a later reader
+// that finds refMu busy has something true to report instead of zeros. refMu must be held.
+//
+// Storing it here rather than only in the reader matters: a runner that has just finished
+// loading has never been read, so without this the first reader to find its lock busy has
+// no snapshot and drops the row entirely -- the model disappears from /api/ps rather than
+// merely reading wrong, which is not an improvement.
+func (r *runnerRef) reportLocked() loadedModel {
+	lm := loadedModel{
+		model:     r.model,
+		busy:      r.refCount > 0,
+		size:      int64(r.totalSize),
+		sizeVRAM:  int64(r.vramSize),
+		expiresAt: r.expiresAt,
+		gpus:      slices.Clone(r.gpus),
+	}
+	if r.llama != nil {
+		lm.contextLength = r.llama.ContextLength()
+		total, vram := r.llama.MemorySize()
+		lm.size = int64(total)
+		lm.sizeVRAM = int64(vram)
+
+		// Per-device residency. A backend with one device reports the whole
+		// figure for it; one whose device names don't map back reports zero
+		// rather than guessing.
+		lm.vramByGPU = make(map[ml.DeviceID]uint64, len(lm.gpus))
+		for _, dev := range lm.gpus {
+			lm.vramByGPU[dev] = r.llama.VRAMByGPU(dev)
+		}
+	}
+	// The scheduler waits to set expiresAt, so a model that is still loading may have the
+	// zero value. Estimate expiration from the session duration instead.
+	if lm.expiresAt.IsZero() {
+		lm.expiresAt = time.Now().Add(r.sessionDuration)
+	}
+
+	r.lastReported.Store(&lm)
+	return lm
 }

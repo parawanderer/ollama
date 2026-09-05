@@ -2302,3 +2302,58 @@ func TestLoadedModelsStillReportsAGenuineLoad(t *testing.T) {
 		t.Fatalf("a model with no runner yet was not reported as loading: %+v", got)
 	}
 }
+
+// TestLoadedModelsNeverDropsALoadedRunner covers the window the first fix left open. A runner
+// that has finished loading but has not yet been read has no snapshot, and a reader that then
+// finds its lock busy has nothing true to say about it. Dropping the row is not an
+// improvement on reporting it wrongly: the model disappears from /api/ps entirely.
+//
+// The load path now takes a first reading while it still holds the lock, so this cannot
+// happen. If it somehow does, the row is reported as loading rather than omitted -- its
+// identity is the one thing that is still known.
+func TestLoadedModelsNeverDropsALoadedRunner(t *testing.T) {
+	s := InitScheduler(t.Context())
+
+	// Finished loading, never read, lock held by a request that has just arrived.
+	fresh := &runnerRef{
+		name:      "registry.ollama.ai/library/gemma4:e2b",
+		modelKey:  "fresh",
+		model:     &Model{Name: "gemma4:e2b", ShortName: "gemma4:e2b"},
+		expiresAt: time.Now().Add(time.Hour),
+	}
+	fresh.stillLoading.Store(false)
+	fresh.refMu.Lock()
+	defer fresh.refMu.Unlock()
+	s.loaded["fresh"] = fresh
+
+	got := s.loadedModels()
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want 1: a loaded model must never vanish from the list", len(got))
+	}
+}
+
+// And the reading taken during the load is the one a contended reader gets, so the window
+// between finishing a load and being read for the first time reports real figures.
+func TestReportLockedSeedsTheSnapshot(t *testing.T) {
+	r := &runnerRef{
+		model:     &Model{Name: "m", ShortName: "m"},
+		vramSize:  42 << 30,
+		totalSize: 42 << 30,
+		expiresAt: time.Now().Add(time.Hour),
+	}
+	if r.lastReported.Load() != nil {
+		t.Fatal("a fresh runner already had a snapshot")
+	}
+
+	r.refMu.Lock()
+	r.reportLocked()
+	r.refMu.Unlock()
+
+	snapshot := r.lastReported.Load()
+	if snapshot == nil {
+		t.Fatal("taking a reading did not leave one behind")
+	}
+	if snapshot.sizeVRAM != 42<<30 {
+		t.Errorf("snapshot size_vram = %d, want %d", snapshot.sizeVRAM, int64(42<<30))
+	}
+}

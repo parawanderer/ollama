@@ -18,11 +18,43 @@ message Start {
   string role = 5;  // "assistant"
 }
 
-// One token, or one step of one. Both fields are optional: a reasoning model emits
-// reasoning before content, and a chunk carries whichever it produced.
+// One token, or one step of one. Every field is optional -- proto3 has no other kind -- so
+// a plain text delta costs a tag, a length and its bytes, and carries nothing for the rest.
 message Delta {
   string content = 1;
   string reasoning = 2;
+
+  // Present only on the chunks that carry them. A tool call arrives in pieces: the first
+  // chunk for an index names the function, later ones append to arguments.
+  repeated ToolCall tool_calls = 3;
+
+  // Present only when the request asked for logprobs.
+  repeated Logprob logprobs = 4;
+}
+
+message ToolCall {
+  string id = 1;
+  uint32 index = 2;
+  string type = 3;  // "function"
+  Function function = 4;
+}
+
+message Function {
+  string name = 1;
+  string arguments = 2;  // a JSON fragment, streamed in pieces
+}
+
+// One position in the output. Bytes is the token's raw representation, which is how a
+// client reassembles text a token boundary splits in the middle of a character.
+message TokenLogprob {
+  string token = 1;
+  double logprob = 2;
+  repeated uint32 bytes = 3;
+}
+
+message Logprob {
+  TokenLogprob token = 1;
+  repeated TokenLogprob top_logprobs = 2;
 }
 
 // Sent once, after the last Delta.

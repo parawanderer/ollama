@@ -18,7 +18,9 @@ package middleware
 
 import (
 	"encoding/binary"
+	"math"
 
+	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/openai"
 )
 
@@ -55,16 +57,34 @@ const (
 
 	deltaContent   = 1
 	deltaReasoning = 2
+	deltaToolCalls = 3
+	deltaLogprobs  = 4
+
+	toolCallID       = 1
+	toolCallIndex    = 2
+	toolCallType     = 3
+	toolCallFunction = 4
+
+	functionName      = 1
+	functionArguments = 2
+
+	tokenLogprobToken   = 1
+	tokenLogprobLogprob = 2
+	tokenLogprobBytes   = 3
+
+	logprobToken       = 1
+	logprobTopLogprobs = 2
 
 	endFinishReason     = 1
 	endPromptTokens     = 2
 	endCompletionTokens = 3
 )
 
-// wire types, of which this needs two
+// wire types, of which this needs three
 const (
-	wireVarint = 0
-	wireBytes  = 2
+	wireVarint  = 0
+	wireFixed64 = 1
+	wireBytes   = 2
 )
 
 func appendTag(b []byte, field, wire int) []byte {
@@ -88,6 +108,13 @@ func appendUint(b []byte, field int, v uint64) []byte {
 	}
 	b = appendTag(b, field, wireVarint)
 	return binary.AppendUvarint(b, v)
+}
+
+// appendDouble writes a float64. Unlike the other fields here a zero is written rather than
+// omitted: a logprob of 0 means certainty, which is a real value and not an absent one.
+func appendDouble(b []byte, field int, v float64) []byte {
+	b = appendTag(b, field, wireFixed64)
+	return binary.LittleEndian.AppendUint64(b, math.Float64bits(v))
 }
 
 // appendMessage nests one message inside another, length-delimited.
@@ -118,12 +145,52 @@ func StartFrame(id, model, fingerprint, role string, created int64) []byte {
 	return frame(frameStart, m)
 }
 
-// DeltaFrame carries one step of the generation and nothing else.
-func DeltaFrame(content, reasoning string) []byte {
+// DeltaFrame carries one step of the generation. Everything beyond the text is present only
+// on the chunks that have it, so a plain text delta is unchanged in size by their existence.
+func DeltaFrame(content, reasoning string, toolCalls []openai.ToolCall, logprobs *openai.ChoiceLogprobs) []byte {
 	var m []byte
 	m = appendString(m, deltaContent, content)
 	m = appendString(m, deltaReasoning, reasoning)
+
+	for _, tc := range toolCalls {
+		var fn []byte
+		fn = appendString(fn, functionName, tc.Function.Name)
+		fn = appendString(fn, functionArguments, tc.Function.Arguments)
+
+		var call []byte
+		call = appendString(call, toolCallID, tc.ID)
+		call = appendUint(call, toolCallIndex, uint64(max(tc.Index, 0)))
+		call = appendString(call, toolCallType, tc.Type)
+		if len(fn) > 0 {
+			call = appendMessage(call, toolCallFunction, fn)
+		}
+		m = appendMessage(m, deltaToolCalls, call)
+	}
+
+	if logprobs != nil {
+		for _, lp := range logprobs.Content {
+			var entry []byte
+			entry = appendMessage(entry, logprobToken, tokenLogprob(lp.TokenLogprob))
+			for _, top := range lp.TopLogprobs {
+				entry = appendMessage(entry, logprobTopLogprobs, tokenLogprob(top))
+			}
+			m = appendMessage(m, deltaLogprobs, entry)
+		}
+	}
+
 	return frame(frameDelta, m)
+}
+
+func tokenLogprob(t api.TokenLogprob) []byte {
+	var b []byte
+	b = appendString(b, tokenLogprobToken, t.Token)
+	b = appendDouble(b, tokenLogprobLogprob, t.Logprob)
+	for _, v := range t.Bytes {
+		// Packed would be smaller, but a token is a handful of bytes and unpacked is what
+		// a hand-written encoder can be trusted to get right.
+		b = appendUint(b, tokenLogprobBytes, uint64(max(v, 0)))
+	}
+	return b
 }
 
 // EndFrame closes the stream, replacing both the finish chunk and "data: [DONE]".
@@ -135,7 +202,7 @@ func EndFrame(finishReason string, prompt, completion int) []byte {
 	return frame(frameEnd, m)
 }
 
-// deltaOf pulls the two fields a Delta carries out of a chunk, so the streaming path does
+// deltaOf pulls the text fields a Delta carries out of a chunk, so the streaming path does
 // not have to know the shape of either encoding.
 // Content is typed any because the OpenAI schema allows a string or a parts array; only the
 // string form carries streamed text, and anything else is left to the JSON encoding.

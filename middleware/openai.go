@@ -138,10 +138,13 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 					}
 					for _, choice := range c.Choices {
 						content, reasoning := deltaOf(choice)
-						if content == "" && reasoning == "" {
+						if content == "" && reasoning == "" &&
+							len(choice.Delta.ToolCalls) == 0 && choice.Logprobs == nil {
 							continue
 						}
-						if _, err := w.ResponseWriter.Write(DeltaFrame(content, reasoning)); err != nil {
+						if _, err := w.ResponseWriter.Write(DeltaFrame(
+							content, reasoning, choice.Delta.ToolCalls, choice.Logprobs,
+						)); err != nil {
 							return 0, err
 						}
 					}

@@ -2327,7 +2327,16 @@ func (s *Server) processResponse() *api.ProcessResponse {
 			// Still loading, so nothing but its identity is known yet. Reporting it is
 			// what lets a client tell "a model is arriving" from "nothing is happening";
 			// the alternative is an empty list for the whole load.
-			models = append(models, api.ProcessModelResponse{Name: v.name, Model: v.name, State: "loading"})
+			//
+			// Named the same way a loaded row is named. The runner's own name is the
+			// request's reference, still fully qualified, so building the row from it
+			// spelled one model two ways depending on its state -- and a single response
+			// could carry both spellings at once.
+			name := model.ParseName(v.name).DisplayShortest()
+			if name == "" {
+				name = v.name
+			}
+			models = append(models, api.ProcessModelResponse{Name: name, Model: name, State: "loading"})
 			continue
 		}
 		m := v.model

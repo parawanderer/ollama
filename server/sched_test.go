@@ -2238,3 +2238,67 @@ func TestSchedulerTracksMultipleLoadedRunners(t *testing.T) {
 }
 
 func (s *mockLlm) SetOnWeightsLoaded(func(time.Time, uint64)) {}
+
+// TestLoadedModelsDoesNotReportAResidentModelAsLoading reproduces a wrong reading caught in
+// the field: a fully loaded, serving model was reported as state "loading" with size_vram 0
+// and no devices, while the same response's vram_used still said 94 GB was resident. It
+// alternated with correct readings a couple of milliseconds apart.
+//
+// The cause was that "loading" meant "refMu was busy when I looked", and refMu is taken by
+// ordinary traffic -- a request finishing, an expiry being reset, another model being
+// admitted. A resident model's figures do not change while its lock is held, so the last
+// complete reading is still true and is what gets reported.
+func TestLoadedModelsDoesNotReportAResidentModelAsLoading(t *testing.T) {
+	s := InitScheduler(t.Context())
+	resident := &runnerRef{
+		name:      "registry.ollama.ai/library/qwen3.8-flash-next:vision",
+		modelKey:  "resident",
+		model:     &Model{Name: "qwen3.8-flash-next:vision", ShortName: "qwen3.8-flash-next:vision"},
+		vramSize:  94171928982,
+		totalSize: 94171928982,
+		expiresAt: time.Now().Add(time.Hour),
+	}
+	resident.stillLoading.Store(false)
+	s.loaded["resident"] = resident
+
+	// One clean reading, which is what a client would already have seen.
+	first := s.loadedModels()
+	if len(first) != 1 || first[0].loading {
+		t.Fatalf("a resident model did not read cleanly: %+v", first)
+	}
+	if first[0].sizeVRAM != 94171928982 {
+		t.Fatalf("size_vram = %d before contention", first[0].sizeVRAM)
+	}
+
+	// Now hold the lock, exactly as a request in flight or a concurrent admission does.
+	resident.refMu.Lock()
+	defer resident.refMu.Unlock()
+
+	contended := s.loadedModels()
+	if len(contended) != 1 {
+		t.Fatalf("got %d rows while the lock was held, want 1", len(contended))
+	}
+	if contended[0].loading {
+		t.Error("a resident, serving model was reported as loading because its lock was busy")
+	}
+	if contended[0].sizeVRAM != 94171928982 {
+		t.Errorf("size_vram = %d while contended, want the 94171928982 last read -- "+
+			"reporting zero contradicts the same response's vram_used", contended[0].sizeVRAM)
+	}
+}
+
+// A model that genuinely has no runner yet must still be reported as loading, since that is
+// what lets a client tell "a model is arriving" from "nothing is happening".
+func TestLoadedModelsStillReportsAGenuineLoad(t *testing.T) {
+	s := InitScheduler(t.Context())
+	arriving := &runnerRef{name: "registry.ollama.ai/library/gemma4:e2b", modelKey: "arriving"}
+	arriving.stillLoading.Store(true)
+	arriving.refMu.Lock() // a load holds refMu for its whole duration
+	defer arriving.refMu.Unlock()
+	s.loaded["arriving"] = arriving
+
+	got := s.loadedModels()
+	if len(got) != 1 || !got[0].loading {
+		t.Fatalf("a model with no runner yet was not reported as loading: %+v", got)
+	}
+}

@@ -1260,6 +1260,7 @@ iGPUScan:
 		trainContext:    trainContext,
 	}
 	runner.name = req.model.Name
+	runner.stillLoading.Store(true)
 	runner.numParallel = numParallel
 	runner.calibrationKey = calibrationKey
 	runner.calibrationCtx = predictedCtx
@@ -1308,6 +1309,7 @@ iGPUScan:
 			s.publishEvent(api.ModelEvent{Type: EventBusyStart, Model: req.model.Name})
 		}
 		runner.loading = false
+		runner.stillLoading.Store(false)
 		// The load has finished, so llama-server has reported every buffer it allocated.
 		// Remember what it came to: the next load of this model made from the same inputs
 		// is predicted from this rather than from metadata.
@@ -1974,7 +1976,17 @@ type runnerRef struct {
 	// it took rather than only that it finished.
 	loadStarted time.Time
 
-	loading      bool          // True only during initial load, then false forever
+	loading bool // True only during initial load, then false forever
+
+	// stillLoading mirrors loading for readers that cannot take refMu. A load holds that
+	// lock for its whole duration, so the only way to ask "is this one still arriving?"
+	// without blocking is a field that does not need it.
+	stillLoading atomic.Bool
+
+	// lastReported is the most recent complete reading of this runner, kept so a reader
+	// that finds refMu busy can report what was true a moment ago instead of reporting
+	// zeros. A resident model's figures do not change while its lock is held.
+	lastReported atomic.Pointer[loadedModel]
 	gpus         []ml.DeviceID // Recorded at time of provisioning
 	discreteGPUs bool          // True if all devices are discrete GPUs - used to skip VRAM recovery check for iGPUs
 	vramSize     uint64
@@ -2412,7 +2424,18 @@ func (s *Scheduler) loadedModels() []loadedModel {
 		// that the model is loading instead. The name is read from a field fixed at
 		// construction rather than from r.model, which is only safe under the lock.
 		if !r.refMu.TryLock() {
-			models = append(models, loadedModel{name: r.name, loading: true})
+			// The lock being busy is not the same as the model still loading, and
+			// conflating them reported a resident, serving model as "loading" with zeroed
+			// size and no devices -- while the same response's vram_used still said 94 GB
+			// was held. refMu is taken by ordinary traffic: a request finishing, an
+			// expiry being reset, another model being admitted.
+			switch snapshot := r.lastReported.Load(); {
+			case r.stillLoading.Load():
+				models = append(models, loadedModel{name: r.name, loading: true})
+			case snapshot != nil:
+				// Resident, merely contended. What was last read is still true.
+				models = append(models, *snapshot)
+			}
 			continue
 		}
 		if r.model == nil {
@@ -2449,6 +2472,9 @@ func (s *Scheduler) loadedModels() []loadedModel {
 			lm.expiresAt = time.Now().Add(r.sessionDuration)
 		}
 		r.refMu.Unlock()
+
+		// Kept for the next reader that finds this runner's lock busy.
+		r.lastReported.Store(&lm)
 		models = append(models, lm)
 	}
 	return models

@@ -376,6 +376,31 @@ func vramCalibrationKey(req *LlmRequest, gpus []ml.DeviceInfo, numParallel int) 
 	}
 }
 
+// modelNeedsMeasurement reports whether this load holds something the estimate cannot
+// describe, so a measurement is worth its half-second.
+//
+// The metadata answers for attention. It cannot answer for a projector: what one reserves is
+// sized for the largest image it will accept and what its encoder reserves is a graph, and
+// neither follows from the weights or the context. Measured on qwen2.5vl:3b at 8k, those two
+// were 2916 MiB of a 5207 MiB load.
+//
+// A projector is found three ways because it is declared three ways, and no one of them
+// covers the models on a single host. Some carry a separate projector file, and then the
+// model's own metadata holds no vision keys at all. Some carry the vision tensors inline,
+// and then there is no projector path. Only the third names it in the metadata.
+func modelNeedsMeasurement(f *ggml.GGML, projectorPaths []string) bool {
+	if f == nil {
+		return false
+	}
+	if !f.KV().KVCacheModelIsComplete() {
+		return true
+	}
+	if len(projectorPaths) > 0 {
+		return true
+	}
+	return len(f.Tensors().Items("v.")) > 0
+}
+
 // warnIfPredictionIsALowerBound reports a placement being decided from an estimate that
 // cannot account for this architecture, and that has no measurement to fall back on.
 //
@@ -417,7 +442,7 @@ var probeContexts = [2]int{8192, 131072}
 // within 0.01 GiB. That equivalence is the whole reason this is worth doing, and it is
 // entirely dependent on the invocation being identical -- see ProbeFitVRAM.
 func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey, req *LlmRequest, f *ggml.GGML, launchOpts api.Options, gpus []ml.DeviceInfo, numParallel int, numCtx int) bool {
-	if f.KV().KVCacheModelIsComplete() {
+	if !modelNeedsMeasurement(f, req.model.ProjectorPaths) {
 		return false
 	}
 	// Two distinct samples are what it takes to stop consulting the metadata: below that

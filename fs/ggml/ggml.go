@@ -181,6 +181,12 @@ func (kv KV) KVCacheModelIsComplete() bool {
 		// do not describe.
 		"attention.key_length_mla",
 		"attention.value_length_mla",
+		// The same compression, named differently. DeepSeek-V2 publishes only the rank of
+		// the latent it compresses into, and the published head lengths then describe
+		// dimensions the cache does not hold. Measured on deepseek-v2:16b at 128k, the
+		// per-token figure is 17.63 GiB low over the load -- and low is the direction that
+		// overcommits a device, unlike the sliding-window case, which is high.
+		"attention.kv_lora_rank",
 		// NOTE: full_attention_interval and ssm.* were listed here and have been removed
 		// again. They do describe an architecture this cannot model -- qwen3.8:27b at 128k
 		// predicts 49.01 GiB against 26.35 used -- but the measurement they routed to is

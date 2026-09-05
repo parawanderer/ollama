@@ -455,6 +455,31 @@ func repeatRatios(blocks, interval int) []int32 {
 // full width. On gemma4:12b at 128k that is 89.02 GiB predicted against 9.98 GiB used --
 // not an imprecision but a different model of the architecture. Reporting the estimate as
 // incomplete is what sends the caller to measure instead.
+// TestKVCacheModelIsCompleteRejectsLatentAttention covers both spellings of the same
+// mechanism. An architecture that compresses K and V into a latent does not hold a cache of
+// the published head dimensions, and the two families in circulation say so differently:
+// one publishes key_length_mla, the other only the rank it compresses into. Missing the
+// second was worth 17.63 GiB of under-prediction on deepseek-v2:16b at 128k.
+func TestKVCacheModelIsCompleteRejectsLatentAttention(t *testing.T) {
+	for name, key := range map[string]string{
+		"explicit mla dimensions": "deepseek2.attention.key_length_mla",
+		"latent rank only":        "deepseek2.attention.kv_lora_rank",
+	} {
+		t.Run(name, func(t *testing.T) {
+			kv := KV{
+				"general.architecture":             "deepseek2",
+				"deepseek2.attention.head_count":   uint32(16),
+				"deepseek2.attention.key_length":   uint32(192),
+				"deepseek2.attention.value_length": uint32(128),
+				key:                                uint32(512),
+			}
+			if kv.KVCacheModelIsComplete() {
+				t.Error("a latent-attention model was treated as described by the published head lengths")
+			}
+		})
+	}
+}
+
 func TestKVCacheModelIsCompleteRejectsSlidingWindow(t *testing.T) {
 	full := KV{
 		"general.architecture":          "gemma4",

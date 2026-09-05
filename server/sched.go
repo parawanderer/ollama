@@ -94,6 +94,11 @@ type Scheduler struct {
 	events *eventBus
 	ring   *frameRing
 
+	// samplerWake carries a nudge from anything that moved memory to the sampler, so the
+	// first reading after an edge does not wait for the next tick. Buffered by one and
+	// written non-blocking; see wakeSampler.
+	samplerWake chan struct{}
+
 	// psFn and infoFn build the bodies the stream embeds. They are supplied by the server
 	// rather than reached for, so the scheduler does not depend on the HTTP layer and the
 	// sampler stays testable.
@@ -139,16 +144,26 @@ func InitScheduler(ctx context.Context) *Scheduler {
 		vramCalibration: llm.NewVRAMCalibration(),
 		events:          newEventBus(),
 		ring:            newFrameRing(retainedWindow),
+		samplerWake:     make(chan struct{}, 1),
 		deviceCacheTTL:  2 * time.Second,
 	}
 	sched.loadFn = sched.load
 	return sched
 }
 
-// publishEvent emits a lifecycle event and drops the cached capacity snapshot, since every
-// event this publishes is something that changed how much device memory is free.
+// publishEvent emits a lifecycle event and brings the cached capacity snapshot up to date,
+// since every event this publishes is something that changed how much device memory is free.
+//
+// Updating beats invalidating here. Dropping the cache makes the next reader re-run
+// discovery, which costs a subprocess whenever a device has no runner to ask -- and the
+// next reader is the sampler, woken by this very event, so the reading that should be the
+// promptest of the load was instead the slowest: measured at 840ms after load.start.
+// Refreshing free memory from the driver is microseconds and is the only field an event
+// can have changed; the device set itself is not affected by a model loading or leaving.
 func (s *Scheduler) publishEvent(ev api.ModelEvent) {
-	s.invalidateDeviceCache()
+	if !s.refreshFreeMemory() {
+		s.invalidateDeviceCache()
+	}
 
 	// The body is deliberately NOT built here. publishEvent is called from goroutines that
 	// hold a runner's refMu for the duration of a load, and building the body takes that
@@ -159,6 +174,27 @@ func (s *Scheduler) publishEvent(ev api.ModelEvent) {
 	}
 	s.ring.add(retainedFrame{at: ev.At, kind: ev.Type, model: ev.Model, reason: ev.Reason})
 	s.events.Publish(ev)
+	s.wakeSampler()
+}
+
+// wakeSampler asks the sampler to take a reading now rather than at its next tick.
+//
+// The cadence alone is not enough. It is chosen when a tick fires, so a load that starts
+// and finishes inside one idle interval is never seen: measured here, weights landed at
+// t=3.0s and the first sample of that load arrived at t=6.0s, by which point the memory
+// had already been there for three seconds. Every edge that moves memory publishes an
+// event, so the events are what should drive the first reading after something happens.
+//
+// The send is non-blocking and the channel holds one, so a burst of edges coalesces into a
+// single extra reading and no publisher ever waits on the sampler.
+func (s *Scheduler) wakeSampler() {
+	if s.samplerWake == nil {
+		return
+	}
+	select {
+	case s.samplerWake <- struct{}{}:
+	default:
+	}
 }
 
 // publishExpiry reports a keep-alive deadline moving, which happens only as a request
@@ -213,9 +249,8 @@ func encodeForCompare(ps *api.ProcessResponse) string {
 func (s *Scheduler) cachedDevices(ctx context.Context) []ml.DeviceInfo {
 	s.deviceCacheMu.Lock()
 	if s.deviceCache != nil && time.Since(s.deviceCacheAt) < s.deviceCacheTTL {
-		devices := s.deviceCache
 		s.deviceCacheMu.Unlock()
-		return devices
+		return s.devicesWithLiveFreeMemory()
 	}
 	s.deviceCacheMu.Unlock()
 
@@ -225,7 +260,74 @@ func (s *Scheduler) cachedDevices(ctx context.Context) []ml.DeviceInfo {
 	s.deviceCache = devices
 	s.deviceCacheAt = time.Now()
 	s.deviceCacheMu.Unlock()
-	return devices
+	return s.devicesWithLiveFreeMemory()
+}
+
+// devicesWithLiveFreeMemory returns the cached devices with free memory read from the
+// driver, and is what every reported figure goes through.
+//
+// It is on the read path rather than only on the paths that care about liveness, because
+// the two sources do not agree: discovery's free memory and the driver's differ by the
+// memory the driver reserves for itself, about 1.1 GiB across two cards here. Refreshing
+// only sometimes made a series that switched sources mid-flight, which drew a step of that
+// size at every lifecycle event -- a change in where the number came from, rendered as if
+// memory had moved. One source for every reading is worth more than the microseconds.
+func (s *Scheduler) devicesWithLiveFreeMemory() []ml.DeviceInfo {
+	s.refreshFreeMemory()
+
+	s.deviceCacheMu.Lock()
+	defer s.deviceCacheMu.Unlock()
+	return s.deviceCache
+}
+
+// refreshFreeMemory updates the free-memory figure on the cached devices, in place, from
+// the driver.
+//
+// This is deliberately not a discovery refresh. Discovery enumerates devices and costs a
+// subprocess whenever any of them lacks a runner to ask, which during a load is all of
+// them -- the runner being loaded is not serving yet. Re-running it at a sampling cadence
+// would spawn a probe every tick. Reading free memory alone is a handful of microseconds
+// and answers the only question that moves during a load.
+//
+// The device list itself is left alone: nothing is added, removed or reordered, so a
+// caller holding the cache sees the same devices with a newer number. If the driver cannot
+// be read the cached figures stand, which is the pre-existing behaviour.
+// It reports whether the cached figures were actually updated, so a caller that needs them
+// current can fall back to dropping the cache when the driver cannot be read.
+func (s *Scheduler) refreshFreeMemory() bool {
+	s.deviceCacheMu.Lock()
+	devices := s.deviceCache
+	s.deviceCacheMu.Unlock()
+	if len(devices) == 0 {
+		return false
+	}
+
+	ids := make([]string, 0, len(devices))
+	for _, d := range devices {
+		if d.PCIID != "" {
+			ids = append(ids, d.PCIID)
+		}
+	}
+
+	free := discover.FreeMemoryByPCI(ids)
+	if len(free) == 0 {
+		return false
+	}
+
+	s.deviceCacheMu.Lock()
+	defer s.deviceCacheMu.Unlock()
+	// The cache may have been dropped or replaced while the driver was being read; the
+	// figures below describe the list that was read, so only apply them to that list.
+	if len(s.deviceCache) != len(devices) {
+		return false
+	}
+	for i := range s.deviceCache {
+		if got, ok := free[s.deviceCache[i].PCIID]; ok {
+			s.deviceCache[i].FreeMemory = got
+		}
+	}
+	s.deviceCacheAt = time.Now()
+	return true
 }
 
 // invalidateDeviceCache drops the cached discovery so the next reader re-reads. Called
@@ -742,15 +844,18 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 					runnersSnapshot = append(runnersSnapshot, r)
 				}
 				finished := s.waitForVRAMRecovery(runner, runnersSnapshot)
+				// unload() clears runner.model, so the name has to be taken before it.
+				// Read afterwards it is always empty, and an unload frame naming no model
+				// cannot be attributed to anything by a client watching memory.
+				name := ""
+				if runner.model != nil {
+					name = runner.model.Name
+				}
 				runner.unload()
 				delete(s.loaded, runner.modelKey)
 				s.loadedMu.Unlock()
 				slog.Debug("runner terminated and removed from list, blocking for VRAM recovery", "runner", runner)
 				<-finished
-				name := ""
-				if runner.model != nil {
-					name = runner.model.Name
-				}
 				runner.refMu.Unlock()
 				s.publishEvent(api.ModelEvent{Type: EventUnload, Model: name})
 				slog.Debug("sending an unloaded event", "runner", runner)
@@ -921,13 +1026,14 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			// compute buffers -- is built afterwards in one step, and on a long-context
 			// model that step is most of what the model ends up holding. Reporting the
 			// boundary lets a client say which half it is waiting on.
-			onWeights := func(at time.Time) {
+			onWeights := func(at time.Time, weights uint64) {
 				weightsLoadedAt = at
 				s.publishEvent(api.ModelEvent{
 					Type:       EventLoadWeights,
 					Model:      req.model.Name,
 					At:         at,
 					DurationMs: at.Sub(loadStartedAt).Milliseconds(),
+					SizeVRAM:   int64(weights),
 				})
 			}
 

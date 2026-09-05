@@ -2237,4 +2237,4 @@ func TestSchedulerTracksMultipleLoadedRunners(t *testing.T) {
 	require.Equal(t, expectedFree, gpus[0].FreeMemory)
 }
 
-func (s *mockLlm) SetOnWeightsLoaded(func(time.Time)) {}
+func (s *mockLlm) SetOnWeightsLoaded(func(time.Time, uint64)) {}

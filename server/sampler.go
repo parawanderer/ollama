@@ -18,6 +18,13 @@ const (
 	// second forever is a lot of traffic describing nothing.
 	sampleIdleInterval = 15 * time.Second
 
+	// sampleLoadingInterval is used while a load is in flight. A load is the only time
+	// device memory moves by tens of gigabytes, and it moves in two steps -- the weights,
+	// then the context -- about a second apart on a warm load. Sampling at one second can
+	// land between them and render that as a single jump, so the interval that matters for
+	// drawing the climb is shorter than the one that matters for everything else.
+	sampleLoadingInterval = 250 * time.Millisecond
+
 	// retainedWindow is how much history is kept for a client that reconnects. A dropped
 	// stream is total blindness until reconnect, unlike a failed poll which loses one
 	// sample, so some backfill is the difference between a gap and a hole.
@@ -100,6 +107,15 @@ func (s *Scheduler) startSampler(done <-chan struct{}) {
 			case <-done:
 				return
 			case <-timer.C:
+			case <-s.samplerWake:
+				// Something moved memory. Read it now; the cadence below still decides
+				// when the reading after this one happens.
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
 			}
 
 			interval := sampleIdleInterval
@@ -109,8 +125,9 @@ func (s *Scheduler) startSampler(done <-chan struct{}) {
 					lastPS = encoded
 					interval = sampleFastInterval
 				}
-				if s.anyRunnerLoading() {
-					interval = sampleFastInterval
+				loading := s.anyRunnerLoading()
+				if loading {
+					interval = sampleLoadingInterval
 				}
 
 				// Capacity is sent when it has moved. During a load the model list does
@@ -118,6 +135,9 @@ func (s *Scheduler) startSampler(done <-chan struct{}) {
 				// the only thing that shows the memory arriving.
 				var info *api.InfoResponse
 				if s.infoFn != nil {
+					// No refresh here: every reported figure goes through
+					// devicesWithLiveFreeMemory, so a fast tick already reads the driver
+					// rather than restating a cached number.
 					if candidate := s.infoFn(); encodeInfoForCompare(candidate) != lastInfo {
 						lastInfo = encodeInfoForCompare(candidate)
 						info = candidate

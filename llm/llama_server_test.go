@@ -3943,11 +3943,15 @@ func TestPredictServerVRAMCountsProjectors(t *testing.T) {
 // once, at the right moment, and that it survives the race between the process starting
 // and the caller getting a handle to register on.
 func TestOnWeightsLoadedFiresOnFirstRealModelBuffer(t *testing.T) {
-	runner := &llamaServerRunner{}
+	runner := &llamaServerRunner{deviceLogNames: []string{"CUDA0", "CUDA1"}}
 	w := &memoryParsingWriter{inner: io.Discard, runner: runner}
 
 	var fired []time.Time
-	runner.SetOnWeightsLoaded(func(at time.Time) { fired = append(fired, at) })
+	var firedVRAM []uint64
+	runner.SetOnWeightsLoaded(func(at time.Time, vram uint64) {
+		fired = append(fired, at)
+		firedVRAM = append(firedVRAM, vram)
+	})
 
 	// The fit probe reports the same lines at zero: it measures without loading, so
 	// nothing has reached device memory yet and the edge must not fire.
@@ -3967,17 +3971,29 @@ func TestOnWeightsLoadedFiresOnFirstRealModelBuffer(t *testing.T) {
 	if _, err := w.Write([]byte("load_tensors:        CUDA0 model buffer size = 39013.35 MiB\n")); err != nil {
 		t.Fatal(err)
 	}
+	// One card of a two-card load is not the weights. Announcing here would report half.
+	if len(fired) != 0 {
+		t.Fatalf("announced the weights with only one of two devices reported: %v", firedVRAM)
+	}
+	if _, err := w.Write([]byte("load_tensors:        CUDA1 model buffer size = 37000.00 MiB\n")); err != nil {
+		t.Fatal(err)
+	}
 	if len(fired) != 1 {
 		t.Fatalf("got %d notifications for one load, want 1", len(fired))
+	}
+	perMiB := float64(mib)
+	want := uint64(39013.35*perMiB) + uint64(37000.00*perMiB)
+	if !withinMiB(firedVRAM[0], want, 1) {
+		t.Errorf("reported %d bytes of weights, want about %d", firedVRAM[0], want)
 	}
 	if fired[0].Before(before) {
 		t.Errorf("reported a time from before the buffer was seen: %v < %v", fired[0], before)
 	}
 
-	// Weights land once. Later buffers, including the second device's, must not re-fire.
+	// Weights land once; the context buffers that follow must not re-fire.
 	for _, line := range []string{
-		"load_tensors:        CUDA1 model buffer size = 37000.00 MiB\n",
 		"llama_kv_cache:      CUDA0 KV buffer size = 10000.00 MiB\n",
+		"sched_reserve:       CUDA0 compute buffer size = 500.00 MiB\n",
 	} {
 		if _, err := w.Write([]byte(line)); err != nil {
 			t.Fatal(err)
@@ -3989,7 +4005,7 @@ func TestOnWeightsLoadedFiresOnFirstRealModelBuffer(t *testing.T) {
 }
 
 func TestOnWeightsLoadedRegisteredAfterTheFact(t *testing.T) {
-	runner := &llamaServerRunner{}
+	runner := &llamaServerRunner{deviceLogNames: []string{"CUDA0"}}
 	w := &memoryParsingWriter{inner: io.Discard, runner: runner}
 
 	// This is the real ordering: the runner's process starts inside its constructor, so
@@ -4005,7 +4021,7 @@ func TestOnWeightsLoadedRegisteredAfterTheFact(t *testing.T) {
 	}
 
 	var got []time.Time
-	runner.SetOnWeightsLoaded(func(at time.Time) { got = append(got, at) })
+	runner.SetOnWeightsLoaded(func(at time.Time, _ uint64) { got = append(got, at) })
 	if len(got) != 1 {
 		t.Fatalf("got %d notifications, want 1", len(got))
 	}

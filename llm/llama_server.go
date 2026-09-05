@@ -150,8 +150,9 @@ type llamaServerRunner struct {
 	// most of what the model ends up holding. weightsLoadedAt records that moment even
 	// when nothing is listening yet, because the process starts before the caller gets a
 	// handle to set the callback on -- without it the notification is lost to that race.
-	onWeightsLoaded func(time.Time)
+	onWeightsLoaded func(time.Time, uint64)
 	weightsLoadedAt time.Time
+	weightsVRAM     uint64
 
 	// System-reported free VRAM per device at model load time, parsed from
 	// "using device CUDA0 ... - 15221 MiB free" log lines. This reflects
@@ -2813,6 +2814,51 @@ type memoryParsingWriter struct {
 	// attribution is made once both are known.
 	clipBackend string
 	mmprojBytes uint64
+
+	// weightsSeenAt is when the first real model buffer was reported and weightsDevices
+	// are the devices that have reported one. The edge is dated from the first, because
+	// that is when the weights reached memory, but it is not published until every device
+	// expected to hold weights has reported -- otherwise a two-card load announces one
+	// card's worth. See weightsCompleteLocked.
+	weightsSeenAt  time.Time
+	weightsDevices map[string]bool
+}
+
+// weightsCompleteLocked reports whether every device that will hold weights has said how
+// much it holds.
+//
+// The reliable end-of-run marker is the first non-model buffer, but on a large model that
+// arrives about five seconds later -- the gap between the weights landing and the context
+// being constructed -- and waiting for it would make a liveness signal five seconds stale.
+// So the common case is settled early: when every device assigned to this runner has
+// reported, there is nothing further to wait for. A partial offload, where some device
+// never reports, still falls back to the late-but-certain marker.
+func (w *memoryParsingWriter) weightsCompleteLocked(currentKind string) bool {
+	if w.weightsSeenAt.IsZero() {
+		return false
+	}
+	if currentKind != "model" {
+		return true
+	}
+	for _, name := range w.runner.deviceLogNames {
+		if !w.weightsDevices[name] {
+			return false
+		}
+	}
+	return len(w.runner.deviceLogNames) > 0
+}
+
+// gpuModelBytesLocked sums what the devices hold of the weights themselves, excluding the
+// mmap'd host view of the same bytes, which mirrors the device copy rather than adding to
+// it.
+func (w *memoryParsingWriter) gpuModelBytesLocked() uint64 {
+	var total uint64
+	for key, buffer := range w.buffers {
+		if key.kind == "model" && isGPUBuffer(key.backend) {
+			total += buffer.bytes
+		}
+	}
+	return total
 }
 
 // noteProjectorLocked attributes the projector's memory to the device holding it, once both
@@ -2927,8 +2973,9 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
 
 		// Fired below, after memoryMu is released: the callback publishes an event and
 		// must not run under a lock the publisher's own readers may want.
-		var notifyWeightsLoaded func(time.Time)
+		var notifyWeightsLoaded func(time.Time, uint64)
 		var weightsLoadedAt time.Time
+		var weightsVRAM uint64
 
 		func() {
 			w.runner.memoryMu.Lock()
@@ -2988,10 +3035,16 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
 						// A real allocation is the signal that the weights arrived. The
 						// fit probe reports the same lines at 0.00 because it measures
 						// without loading, so size is what separates the two passes.
-						if mib > 0 && w.runner.weightsLoadedAt.IsZero() {
-							weightsLoadedAt = time.Now().UTC()
-							w.runner.weightsLoadedAt = weightsLoadedAt
-							notifyWeightsLoaded, w.runner.onWeightsLoaded = w.runner.onWeightsLoaded, nil
+						if mib > 0 {
+							if w.weightsSeenAt.IsZero() {
+								w.weightsSeenAt = time.Now().UTC()
+							}
+							if isGPUBuffer(backendName) {
+								if w.weightsDevices == nil {
+									w.weightsDevices = make(map[string]bool)
+								}
+								w.weightsDevices[deviceName(backendName)] = true
+							}
 						}
 					} else {
 						w.sawNonModelBuffer = true
@@ -3017,12 +3070,20 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
 						kind:      string(match[3]),
 					}] = memoryBuffer{bytes: uint64(mib * 1024 * 1024)}
 					w.updateRunnerMemoryLocked()
+
+					if w.runner.weightsLoadedAt.IsZero() && w.weightsCompleteLocked(slot.kind) {
+						weightsLoadedAt = w.weightsSeenAt
+						weightsVRAM = w.gpuModelBytesLocked()
+						w.runner.weightsLoadedAt = weightsLoadedAt
+						w.runner.weightsVRAM = weightsVRAM
+						notifyWeightsLoaded, w.runner.onWeightsLoaded = w.runner.onWeightsLoaded, nil
+					}
 				}
 			}
 		}()
 
 		if notifyWeightsLoaded != nil {
-			notifyWeightsLoaded(weightsLoadedAt)
+			notifyWeightsLoaded(weightsLoadedAt, weightsVRAM)
 		}
 	}
 	return w.inner.Write(b)
@@ -3092,15 +3153,15 @@ func (s *llamaServerRunner) VRAMByGPU(id ml.DeviceID) uint64 {
 // so on a small model the weights can land before the caller has a handle to register on;
 // in that case the callback runs immediately, with the time the weights actually arrived
 // rather than the time it was registered.
-func (s *llamaServerRunner) SetOnWeightsLoaded(fn func(time.Time)) {
+func (s *llamaServerRunner) SetOnWeightsLoaded(fn func(time.Time, uint64)) {
 	s.memoryMu.Lock()
-	already := s.weightsLoadedAt
+	already, vram := s.weightsLoadedAt, s.weightsVRAM
 	if already.IsZero() {
 		s.onWeightsLoaded = fn
 	}
 	s.memoryMu.Unlock()
 
 	if !already.IsZero() && fn != nil {
-		fn(already)
+		fn(already, vram)
 	}
 }

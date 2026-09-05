@@ -152,11 +152,12 @@ static int ollama_call_nvml_device_get_compute_procs(void * fn, void * device, u
 	return (int) count;
 }
 
-static int ollama_call_nvml_device_get_memory_info(void * fn, void * device, unsigned long long * total) {
+static int ollama_call_nvml_device_get_memory_info(void * fn, void * device, unsigned long long * total, unsigned long long * free) {
 	ollama_nvml_memory_t memory = {0};
 	int ret = ((ollama_nvml_device_get_memory_info_fn) fn)(device, &memory);
 	if (ret == 0) {
 		*total = memory.total;
+		*free = memory.free;
 	}
 	return ret;
 }
@@ -172,6 +173,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"unsafe"
 
 	"github.com/ollama/ollama/ml"
@@ -609,14 +611,132 @@ func nvmlPhysicalMemoryByPCI(pciIDs []string) map[string]uint64 {
 			continue
 		}
 
-		var total C.ulonglong
-		if ret := C.ollama_call_nvml_device_get_memory_info(memoryFn, handle, &total); ret != 0 {
+		var total, free C.ulonglong
+		if ret := C.ollama_call_nvml_device_get_memory_info(memoryFn, handle, &total, &free); ret != 0 {
 			slog.Debug("nvmlDeviceGetMemoryInfo failed", "pci_id", pci, "status", int(ret))
 			continue
 		}
 		out[pci] = uint64(total)
 	}
 	return out
+}
+
+// FreeMemoryByPCI reports how much memory each device has free, read straight from NVML.
+//
+// It exists because the ordinary way to answer that question is device discovery, which
+// costs a subprocess whenever any device lacks a runner to ask -- and during a load that is
+// every device, since the runner being loaded is not serving yet. That is exactly the
+// moment a client most wants the number: a load is the only time free memory moves by tens
+// of gigabytes, and it moves in two steps a second or so apart. This call is a handful of
+// microseconds, so it can be read as fast as anyone cares to sample it.
+//
+// It reports only what the driver says is free, so it is not a substitute for discovery: it
+// cannot enumerate devices, and it says nothing about which process holds what. Callers use
+// it to refresh a figure on devices they already know about.
+func FreeMemoryByPCI(pciIDs []string) map[string]uint64 {
+	if len(pciIDs) == 0 {
+		return nil
+	}
+
+	session := liveMemorySession()
+	if session == nil {
+		return nil
+	}
+
+	out := make(map[string]uint64, len(pciIDs))
+	for _, pci := range pciIDs {
+		if pci == "" {
+			continue
+		}
+
+		handle, ok := session.handle(pci)
+		if !ok {
+			continue
+		}
+
+		var total, free C.ulonglong
+		if ret := C.ollama_call_nvml_device_get_memory_info(session.memoryFn, handle, &total, &free); ret != 0 {
+			continue
+		}
+		out[pci] = uint64(free)
+	}
+	return out
+}
+
+// nvmlLiveSession keeps NVML loaded and initialised, with a device handle per PCI address.
+//
+// Opening the library, resolving symbols and calling nvmlInit on every read costs about
+// 28ms, which is nothing against the 574ms subprocess this exists to avoid but is 25x the
+// 1.1ms that serving a cached figure costs -- and this is now on the read path for every
+// reported figure, so that would be a regression on the common case to fix the rare one.
+// Held open, a read is a handful of microseconds.
+//
+// nvmlShutdown is deliberately never called. NVML reference-counts init, the session lives
+// as long as the process, and there is no teardown point that is not simply exit.
+type nvmlLiveSession struct {
+	memoryFn unsafe.Pointer
+	handleFn unsafe.Pointer
+
+	mu      sync.Mutex
+	handles map[string]unsafe.Pointer
+}
+
+var (
+	liveMemoryOnce         sync.Once
+	liveMemorySessionValue *nvmlLiveSession
+)
+
+func liveMemorySession() *nvmlLiveSession {
+	liveMemoryOnce.Do(func() {
+		nvml, err := dlopenFirst([]string{"libnvidia-ml.so.1", "libnvidia-ml.so"}, false)
+		if err != nil {
+			slog.Debug("NVML unavailable, live free memory will fall back to discovery", "error", err)
+			return
+		}
+
+		initFn, initErr := dlsym(nvml, "nvmlInit_v2")
+		handleFn, handleErr := dlsym(nvml, "nvmlDeviceGetHandleByPciBusId_v2")
+		memoryFn, memoryErr := dlsym(nvml, "nvmlDeviceGetMemoryInfo")
+		if err := cmp.Or(initErr, handleErr, memoryErr); err != nil {
+			slog.Debug("NVML missing a required symbol", "error", err)
+			return
+		}
+		if ret := C.ollama_call_nvml_init(initFn); ret != 0 {
+			slog.Debug("nvmlInit_v2 failed", "status", int(ret))
+			return
+		}
+
+		liveMemorySessionValue = &nvmlLiveSession{
+			memoryFn: memoryFn,
+			handleFn: handleFn,
+			handles:  make(map[string]unsafe.Pointer),
+		}
+	})
+	return liveMemorySessionValue
+}
+
+// handle resolves and remembers a device handle. Handles are stable for the life of the
+// NVML session, so the lookup is done once per device rather than once per read.
+func (s *nvmlLiveSession) handle(pci string) (unsafe.Pointer, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if h, ok := s.handles[pci]; ok {
+		return h, h != nil
+	}
+
+	cpci := C.CString(pci)
+	var h unsafe.Pointer
+	ret := C.ollama_call_nvml_device_get_handle_by_pci_bus_id(s.handleFn, cpci, &h)
+	C.free(unsafe.Pointer(cpci))
+	if ret != 0 {
+		// Remembered as absent so a device NVML does not know is not re-resolved on
+		// every read.
+		s.handles[pci] = nil
+		return nil, false
+	}
+	s.handles[pci] = h
+	return h, true
 }
 
 func cudaDeviceAttribute(fn unsafe.Pointer, attr int, device C.int) int {

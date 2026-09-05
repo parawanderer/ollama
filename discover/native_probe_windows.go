@@ -464,3 +464,6 @@ func byteCString(data []byte) string {
 	}
 	return string(data)
 }
+
+// FreeMemoryByPCI is unavailable here; callers fall back to cached discovery.
+func FreeMemoryByPCI([]string) map[string]uint64 { return nil }

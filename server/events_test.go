@@ -149,6 +149,7 @@ func TestEventFrameCopiesEveryCommonField(t *testing.T) {
 		DurationMs: 8000,
 		WeightsMs:  2000,
 		ContextMs:  6000,
+		SizeVRAM:   86 << 30,
 		Dropped:    3,
 		ExpiresAt:  &expires,
 		PS:         &api.ProcessResponse{},
@@ -175,13 +176,25 @@ func TestEventFrameCopiesEveryCommonField(t *testing.T) {
 	renamed := map[string]string{"type": "kind"}
 	frameFields := jsonNames(frame)
 
+	// A field the frame does not have is the failure this test missed once already:
+	// SizeVRAM was set on every load.complete and reached no client, because the frame had
+	// no such field and this loop read that as "not meant for the wire". Anything genuinely
+	// internal has to be named here, so adding one is a decision rather than an oversight.
+	eventOnly := map[string]bool{
+		"at":   true, // the wire carries a per-connection offset, t, instead
+		"gpus": true, // placement is served through the ps body
+	}
+
 	for name, evField := range jsonNames(ev) {
 		if r, ok := renamed[name]; ok {
 			name = r
 		}
 		frameField, ok := frameFields[name]
 		if !ok {
-			continue // event-only field, not meant for the wire
+			if !eventOnly[name] {
+				t.Errorf("%s exists on the event but not on the frame, so it can never reach a client; add it to the frame, or to eventOnly if that is deliberate", name)
+			}
+			continue
 		}
 		if evField.IsZero() {
 			t.Fatalf("%s: the fixture left this zero, so the test cannot detect a dropped copy", name)

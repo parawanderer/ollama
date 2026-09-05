@@ -1463,6 +1463,12 @@ type EventFrame struct {
 	WeightsMs int64 `json:"weights_ms,omitempty"`
 	ContextMs int64 `json:"context_ms,omitempty"`
 
+	// SizeVRAM is device memory this frame is reporting: on load.weights what the weights
+	// alone occupy, on load.complete what the finished model holds. A load arrives in two
+	// steps and this is what makes both of them visible as numbers rather than only as
+	// timestamps.
+	SizeVRAM int64 `json:"size_vram,omitempty"`
+
 	// PS is the /api/ps body, byte-identical to what that endpoint serves, so one piece of
 	// client code reads model placement everywhere. Info is the /api/info body, sent on
 	// the first sample and whenever it changes. Both are pointers: absent means "this

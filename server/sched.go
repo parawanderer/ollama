@@ -477,6 +477,19 @@ func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey
 	return true
 }
 
+// predictionSource names where a prediction came from, which is the difference between a
+// number that was measured and one that was inferred from metadata.
+func predictionSource(calibrated, probed bool) string {
+	switch {
+	case probed:
+		return "probe"
+	case calibrated:
+		return "calibration"
+	default:
+		return "metadata"
+	}
+}
+
 // predictLlamaServerVRAM estimates VRAM for a llama-server load, preferring a measurement
 // of an earlier load made from the same inputs over the metadata estimate.
 func predictLlamaServerVRAM(cal *llm.VRAMCalibration, key llm.CalibrationKey, req *LlmRequest, f *ggml.GGML, numCtx int) uint64 {
@@ -974,11 +987,36 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			// will actually run, and the measurement it produces is filed where the next
 			// prediction for the same invocation will look.
 			calibrationKey = vramCalibrationKey(req, loadGpus, numParallel)
-			if s.probeCalibration(req.ctx, calibrationKey, req, f, loadGpus, numParallel, predictedCtx) {
+			probed := s.probeCalibration(req.ctx, calibrationKey, req, f, loadGpus, numParallel, predictedCtx)
+			if probed {
 				predicted = predictLlamaServerVRAM(s.vramCalibration, calibrationKey, req, f, predictedCtx)
 			}
+
+			// The prediction is logged whether or not anything goes wrong with it. It is
+			// the input to every placement decision and, until it is written down next to
+			// the load it described, the only way to tell a good estimate from a lucky one
+			// is to have been watching. Recorded against the settled key, so it can be
+			// compared with the sample this load will file under that same key.
 			s.warnIfPredictionIsALowerBound(calibrationKey, f, req.model.ModelPath, predictedCtx, predicted)
 			predictedForLoad := predicted + generationBatchSurchargeForCompletion(completion, launchOpts.NumBatch)
+
+			// Both figures are logged because only one of them is the prediction. The
+			// calibration models what a load holds; the surcharge on top is what the
+			// generation batch will additionally need, which the fit decision must cover
+			// but which no sample of a loaded model contains. Comparing the bare figure
+			// against a completed load makes the predictor look systematically low by the
+			// surcharge, and comparing the total against a sample makes it look high.
+			_, calibrated := s.vramCalibration.Predict(calibrationKey, predictedCtx, 0, 0)
+			slog.Info("predicted llama-server VRAM",
+				"model", req.model.ModelPath,
+				"architecture", f.KV().Architecture(),
+				"num_ctx", predictedCtx,
+				"num_batch", launchOpts.NumBatch,
+				"num_gpu", len(loadGpus),
+				"predicted", predicted,
+				"predicted_for_load", predictedForLoad,
+				"source", predictionSource(calibrated, probed),
+				"metadata_complete", f.KV().KVCacheModelIsComplete())
 
 			// Pre-flight check: estimate whether the model fits in remaining memory.
 			// llama-server auto-detects layers based on available VRAM, so if

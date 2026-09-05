@@ -475,3 +475,33 @@ func TestKVCacheModelIsCompleteRejectsSlidingWindow(t *testing.T) {
 		t.Error("sliding-window attention was treated as fully described by the per-token estimate")
 	}
 }
+
+// TestKVCacheModelIsCompleteAcceptsHybridRecurrent records a known over-prediction that is
+// deliberately left uncorrected, so that re-discovering it does not cost another session.
+//
+// A hybrid attention/SSM stack runs attention on a fraction of its layers and a recurrent
+// state on the rest, and that state does not grow with context -- but the per-token figure
+// charges every layer a cache that does. On qwen3.8:27b at 128k that is 49.01 GiB predicted
+// against 26.35 GiB used.
+//
+// Reporting it incomplete would route it to the fit probe, which is the right answer in
+// principle and the wrong one today: these models carry an MTP draft head, the fit pass
+// then describes two models, and the probe cannot yet total them -- it read the draft's
+// 16635 MiB as the cost of a load that used 26982. That trades a safe over-prediction for
+// an unsafe under-prediction, so the marker is not set. Set it once ErrFitProbeDraftModel
+// is no longer needed.
+func TestKVCacheModelIsCompleteAcceptsHybridRecurrent(t *testing.T) {
+	kv := KV{
+		"general.architecture":           "qwen35",
+		"qwen35.attention.head_count":    uint32(24),
+		"qwen35.attention.key_length":    uint32(256),
+		"qwen35.attention.value_length":  uint32(256),
+		"qwen35.full_attention_interval": uint32(4),
+		"qwen35.ssm.conv_kernel":         uint32(4),
+		"qwen35.ssm.state_size":          uint32(128),
+	}
+	if !kv.KVCacheModelIsComplete() {
+		t.Fatal("hybrid recurrent models are now reported incomplete; if the probe can read a " +
+			"draft model's breakdown, this test should assert that instead")
+	}
+}

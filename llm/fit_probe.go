@@ -72,6 +72,10 @@ const fitProbeTimeout = 30 * time.Second
 // a gigabyte as the cost of a hundred-gigabyte model, and persists it.
 var ErrFitProbeWouldNotFit = errors.New("model does not fit in the memory free right now, so it cannot be measured")
 
+// ErrFitProbeDraftModel reports a load whose fit pass describes more than one model, which
+// this cannot yet total correctly. See ProbeFitVRAM.
+var ErrFitProbeDraftModel = errors.New("a draft model's memory cannot be separated from the main model's in a fit probe")
+
 // ProbeFitVRAM reports what a model would occupy at numCtx, by running llama-server's fit
 // pass and killing it as soon as it has answered. Nothing is loaded and no memory is
 // reserved, so this is safe to run against a device that is already full.
@@ -117,6 +121,16 @@ func ProbeFitVRAM(
 	launch, err := newLlamaServerLaunchConfig(gpus, modelPath, f, adapters, projectors, opts, numParallel, kvCacheType, config, newLlamaServerMediaMarker())
 	if err != nil {
 		return 0, err
+	}
+
+	// A draft model makes the fit pass describe two models, one breakdown each, and this
+	// cannot yet tell what their totals mean together: they share the weights, so the
+	// figures do not add, and the draft carries its own small context, so neither is the
+	// answer on its own. Measured on qwen3.8:27b at 128k -- main 25279 MiB, draft 16635,
+	// the load itself 26982. Refusing is the safe reading: the caller falls back to the
+	// metadata estimate, which for these over-predicts, where a wrong probe under-predicts.
+	if launch.draftType != "" {
+		return 0, ErrFitProbeDraftModel
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, fitProbeTimeout)
@@ -169,7 +183,7 @@ func ProbeFitVRAM(
 		return 0, ErrFitProbeWouldNotFit
 	}
 
-	slog.Debug("probed model memory without loading it", "model", modelPath, "num_ctx", numCtx, "vram", total)
+	slog.Debug("probed model memory without loading it", "model", modelPath, "num_ctx", numCtx, "vram", total, "cmd", cmd)
 	return total, nil
 }
 
@@ -201,8 +215,10 @@ func scanFitBreakdown(r io.Reader) (total uint64, clean bool) {
 		}
 		if sawRow {
 			// The rows of one breakdown are consecutive, so the first line that is not a
-			// row ends it.
-			total, sawRow = current, false
+			// row ends it. The largest is kept rather than the latest: a later breakdown
+			// is not necessarily a better one, and taking the last silently reported a
+			// draft model's 16635 MiB as the cost of a load that used 26982.
+			total, sawRow = max(total, current), false
 		}
 		switch {
 		case fitTooSmallRegex.MatchString(line):

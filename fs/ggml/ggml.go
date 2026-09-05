@@ -181,6 +181,22 @@ func (kv KV) KVCacheModelIsComplete() bool {
 		// do not describe.
 		"attention.key_length_mla",
 		"attention.value_length_mla",
+		// NOTE: full_attention_interval and ssm.* were listed here and have been removed
+		// again. They do describe an architecture this cannot model -- qwen3.8:27b at 128k
+		// predicts 49.01 GiB against 26.35 used -- but the measurement they routed to is
+		// itself wrong for these models, because they carry an MTP draft head whose fit
+		// output the probe cannot yet total (see ErrFitProbeDraftModel). Marking them
+		// incomplete traded a safe over-prediction for an unsafe under-prediction. Restore
+		// this once a draft model's breakdown can be read.
+		//
+		// A hybrid attention/SSM stack runs attention on only some of its layers and a
+		// recurrent state on the rest, and the recurrent state does not grow with context
+		// at all. full_attention_interval says how sparse the attention is; the per-token
+		// figure below has no way to express "and the other layers cost nothing per
+		// token", so it charges every layer. Measured on qwen3.8:27b at 128k -- 65 layers,
+		// attention every 4th -- 49.01 GiB predicted against 26.35 GiB used.
+		// The same stack seen from the other side: ssm.* means recurrent layers are
+		// present, whether or not the interval is published.
 		// Sliding-window attention holds a fixed window on most layers instead of the
 		// whole context, and often at a narrower head width than the published one. The
 		// per-token figure below charges every attention layer full context at full width,

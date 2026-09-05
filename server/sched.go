@@ -416,7 +416,7 @@ var probeContexts = [2]int{8192, 131072}
 // real invocation with only the context changed reproduced two real measurements to
 // within 0.01 GiB. That equivalence is the whole reason this is worth doing, and it is
 // entirely dependent on the invocation being identical -- see ProbeFitVRAM.
-func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey, req *LlmRequest, f *ggml.GGML, gpus []ml.DeviceInfo, numParallel int, numCtx int) bool {
+func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey, req *LlmRequest, f *ggml.GGML, launchOpts api.Options, gpus []ml.DeviceInfo, numParallel int, numCtx int) bool {
 	if f.KV().KVCacheModelIsComplete() {
 		return false
 	}
@@ -442,8 +442,13 @@ func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey
 	started := time.Now()
 	var recorded int
 	for _, probeCtx := range contexts {
+		// launchOpts, not req.opts: the placement decision writes the split mode, the main
+		// device and the offload count into it, and those are part of the invocation being
+		// measured. Probing with the request's own options measures a load that was never
+		// going to run -- on qwen3.8:27b at 128k that reported 15.86 GiB against 23.86 for
+		// the same model probed as it would actually be launched.
 		vram, err := llm.ProbeFitVRAM(ctx, gpus, req.model.ModelPath, f, req.model.AdapterPaths, req.model.ProjectorPaths,
-			req.opts, numParallel, envconfig.KvCacheType(), llamaServerConfigForModel(req.model), probeCtx)
+			launchOpts, numParallel, envconfig.KvCacheType(), llamaServerConfigForModel(req.model), probeCtx)
 		if err != nil {
 			// Not fitting is worth saying out loud: it is the reason this load is about
 			// to be placed from a lower bound, and it is recoverable -- the probe runs
@@ -991,7 +996,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			// will actually run, and the measurement it produces is filed where the next
 			// prediction for the same invocation will look.
 			calibrationKey = vramCalibrationKey(req, loadGpus, numParallel)
-			probed := s.probeCalibration(req.ctx, calibrationKey, req, f, loadGpus, numParallel, predictedCtx)
+			probed := s.probeCalibration(req.ctx, calibrationKey, req, f, launchOpts, loadGpus, numParallel, predictedCtx)
 
 			// Unconditionally, not only when the probe ran. The first prediction was made
 			// from a key built before the batch was settled, which addresses a different

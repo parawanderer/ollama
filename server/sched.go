@@ -1286,9 +1286,22 @@ iGPUScan:
 		// The load has finished, so llama-server has reported every buffer it allocated.
 		// Remember what it came to: the next load of this model made from the same inputs
 		// is predicted from this rather than from metadata.
-		_, loadedVRAM := llama.MemorySize()
-		if loadedVRAM > 0 {
-			s.vramCalibration.Record(runner.calibrationKey, runner.calibrationCtx, loadedVRAM)
+		loadedTotal, loadedVRAM := llama.MemorySize()
+
+		// The total, not the device figure. They are the same number for a load that fit
+		// entirely on the GPU -- MemorySize collapses them -- and they differ exactly when
+		// it did not, which is the case that matters. llama-server re-fits at load time
+		// against the memory actually free, so a load this predicted too low for does not
+		// fail: it quietly offloads fewer layers. Recording the device figure then files
+		// the spilled fraction as though it were the model's cost, which is wrong in the
+		// direction that causes the next load to spill too -- measured on mistral:7b at 8k,
+		// 1.45 GiB recorded for a model that needs 5.23.
+		//
+		// The total is what the load would have taken with room for it: 5.37 GiB against
+		// 5.23 actually measured on a full offload, 2.7% apart. So a spill is not a lost
+		// sample but a good one, taken at the moment memory ran out.
+		if loadedTotal > 0 {
+			s.vramCalibration.Record(runner.calibrationKey, runner.calibrationCtx, loadedTotal)
 			if s.vramCalibrationPath != "" {
 				go s.vramCalibration.Persist(s.vramCalibrationPath)
 			}

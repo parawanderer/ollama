@@ -4029,3 +4029,59 @@ func TestOnWeightsLoadedRegisteredAfterTheFact(t *testing.T) {
 		t.Errorf("reported the registration time %v, not the arrival time %v", got[0], landed)
 	}
 }
+
+// TestMemorySizeSeparatesSpilledFromResident pins the invariant the calibration depends on:
+// the two figures a finished load reports are equal when it fit on the GPU and differ
+// exactly when it did not.
+//
+// This matters because llama-server re-fits against the memory actually free, so a load
+// whose prediction was too low does not fail -- it offloads fewer layers and runs the rest
+// on the CPU. The device figure then describes the fraction that fit rather than the model,
+// and a caller recording it as the model's cost makes its next prediction lower still.
+func TestMemorySizeSeparatesSpilledFromResident(t *testing.T) {
+	// Buffers as llama-server reports them for a load pushed onto the CPU: 8 of 33 layers
+	// on the device. Sizes are mistral:7b's at 8k context.
+	spilled := &llamaServerRunner{modelPath: "/models/absent.gguf", totalLayers: 33, gpuLayers: 8}
+	w := &memoryParsingWriter{inner: io.Discard, runner: spilled}
+	for _, line := range []string{
+		"load_tensors:        CUDA0 model buffer size =  1100.00 MiB\n",
+		"load_tensors:   CPU_REPACK model buffer size =  3000.00 MiB\n",
+		"llama_kv_cache:      CUDA0 KV buffer size =   380.00 MiB\n",
+		"sched_reserve:      CUDA0 compute buffer size =   105.00 MiB\n",
+		"llm_load_tensors: offloaded 8/33 layers to GPU\n",
+	} {
+		if _, err := w.Write([]byte(line)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	total, vram := spilled.MemorySize()
+	if total <= vram {
+		t.Fatalf("a load that spilled to the CPU reported total %d and device %d; they must differ, "+
+			"or a caller cannot tell a spill from a fit", total, vram)
+	}
+	if want := uint64(1585) * mib; !withinMiB(vram, want, 1) {
+		t.Errorf("device figure = %d MiB, want %d: only the buffers actually on the device", vram/mib, want/mib)
+	}
+	if want := uint64(4585) * mib; !withinMiB(total, want, 1) {
+		t.Errorf("total = %d MiB, want %d: what the load needed, wherever it ended up", total/mib, want/mib)
+	}
+
+	// The same buffers with every layer offloaded: the two figures collapse, so a caller
+	// that always records the total is recording the device figure whenever it applies.
+	fitted := &llamaServerRunner{modelPath: "/models/absent.gguf", totalLayers: 33, gpuLayers: 33}
+	w = &memoryParsingWriter{inner: io.Discard, runner: fitted}
+	for _, line := range []string{
+		"load_tensors:        CUDA0 model buffer size =  4100.00 MiB\n",
+		"llama_kv_cache:      CUDA0 KV buffer size =   380.00 MiB\n",
+		"sched_reserve:      CUDA0 compute buffer size =   105.00 MiB\n",
+		"llm_load_tensors: offloaded 33/33 layers to GPU\n",
+	} {
+		if _, err := w.Write([]byte(line)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if total, vram := fitted.MemorySize(); total != vram {
+		t.Errorf("a load that fit reported total %d and device %d; they must be equal", total, vram)
+	}
+}

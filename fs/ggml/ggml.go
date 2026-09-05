@@ -181,6 +181,15 @@ func (kv KV) KVCacheModelIsComplete() bool {
 		// do not describe.
 		"attention.key_length_mla",
 		"attention.value_length_mla",
+		// Sliding-window attention holds a fixed window on most layers instead of the
+		// whole context, and often at a narrower head width than the published one. The
+		// per-token figure below charges every attention layer full context at full width,
+		// which for these architectures is not slightly high but wrong by orders of
+		// magnitude: measured on gemma4:12b at 128k, 89.02 GiB predicted against 9.98 GiB
+		// actually used. Modelling it needs the layer pattern, which is not reliably
+		// published; saying the estimate is incomplete routes the caller to measurement,
+		// which gets it right.
+		"attention.sliding_window",
 	} {
 		if _, ok := kv[arch+"."+key]; ok {
 			return false

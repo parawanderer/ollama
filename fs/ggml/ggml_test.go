@@ -448,3 +448,30 @@ func repeatRatios(blocks, interval int) []int32 {
 	}
 	return out
 }
+
+// TestKVCacheModelIsCompleteRejectsSlidingWindow guards the largest prediction error this
+// has produced. Sliding-window attention holds a fixed window on most layers, and often at
+// a narrower head width; KVCacheBytesPerToken charges every attention layer full context at
+// full width. On gemma4:12b at 128k that is 89.02 GiB predicted against 9.98 GiB used --
+// not an imprecision but a different model of the architecture. Reporting the estimate as
+// incomplete is what sends the caller to measure instead.
+func TestKVCacheModelIsCompleteRejectsSlidingWindow(t *testing.T) {
+	full := KV{
+		"general.architecture":          "gemma4",
+		"gemma4.attention.head_count":   uint32(16),
+		"gemma4.attention.key_length":   uint32(512),
+		"gemma4.attention.value_length": uint32(512),
+	}
+	if !full.KVCacheModelIsComplete() {
+		t.Fatal("an architecture with nothing unusual in its metadata was reported incomplete")
+	}
+
+	// The keys gemma4 actually publishes, from a real model on a two-card host.
+	swa := maps.Clone(full)
+	swa["gemma4.attention.sliding_window"] = uint32(1024)
+	swa["gemma4.attention.key_length_swa"] = uint32(256)
+	swa["gemma4.attention.value_length_swa"] = uint32(256)
+	if swa.KVCacheModelIsComplete() {
+		t.Error("sliding-window attention was treated as fully described by the per-token estimate")
+	}
+}

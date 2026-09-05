@@ -420,7 +420,11 @@ func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey
 	if f.KV().KVCacheModelIsComplete() {
 		return false
 	}
-	if _, calibrated := s.vramCalibration.Predict(key, numCtx, 0, 0); calibrated {
+	// Two distinct samples are what it takes to stop consulting the metadata: below that
+	// the slope still comes from the prior, and for these architectures the prior slope is
+	// the broken part. So the bar is a fitted line, not merely a calibrated answer -- one
+	// sample plus a wrong slope measured worse than no samples at all.
+	if s.vramCalibration.SampleCount(key) >= 2 {
 		return false
 	}
 
@@ -988,9 +992,17 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			// prediction for the same invocation will look.
 			calibrationKey = vramCalibrationKey(req, loadGpus, numParallel)
 			probed := s.probeCalibration(req.ctx, calibrationKey, req, f, loadGpus, numParallel, predictedCtx)
-			if probed {
-				predicted = predictLlamaServerVRAM(s.vramCalibration, calibrationKey, req, f, predictedCtx)
-			}
+
+			// Unconditionally, not only when the probe ran. The first prediction was made
+			// from a key built before the batch was settled, which addresses a different
+			// bucket -- so leaving it in place when the probe is skipped means the load is
+			// placed from a key that has no samples while the samples sit under the key it
+			// will record to. That is the same defect this reordering exists to fix, and
+			// it hid behind a source label taken from the settled key: the log read
+			// "calibration" about a number that never consulted it. Measured on
+			// gemma4:26b at 32k, 32.06 GiB placed against 18.40 GiB used, with two good
+			// samples in the store.
+			predicted = predictLlamaServerVRAM(s.vramCalibration, calibrationKey, req, f, predictedCtx)
 
 			// The prediction is logged whether or not anything goes wrong with it. It is
 			// the input to every placement decision and, until it is written down next to
@@ -1015,6 +1027,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 				"num_gpu", len(loadGpus),
 				"predicted", predicted,
 				"predicted_for_load", predictedForLoad,
+				"samples", s.vramCalibration.SampleCount(calibrationKey),
 				"source", predictionSource(calibrated, probed),
 				"metadata_complete", f.KV().KVCacheModelIsComplete())
 

@@ -201,6 +201,23 @@ func clampFloat(v float64) uint64 {
 	}
 }
 
+// SampleCount reports how many distinct context lengths have been measured for a key.
+//
+// Callers use it to tell a prediction that has a measured slope from one that does not.
+// Predict reports "calibrated" from a single sample, which fixes the intercept but takes
+// the slope from the prior -- and for an architecture whose metadata is known incomplete,
+// the prior slope is precisely the part that is wrong. Measured on gemma4:12b at 32k, that
+// combination predicted 27.52 GiB against 8.69 GiB used, worse than either a fresh
+// measurement or the raw prior.
+func (c *VRAMCalibration) SampleCount(key CalibrationKey) int {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.samples[key])
+}
+
 // Forget discards every sample for a key. It exists for the case where samples were
 // gathered but turned out to be unusable as a set -- a single point, say, which fixes an
 // intercept but leaves the slope coming from a prior that is the known-wrong part.

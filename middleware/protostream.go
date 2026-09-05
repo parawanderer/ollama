@@ -59,6 +59,7 @@ const (
 	deltaReasoning = 2
 	deltaToolCalls = 3
 	deltaLogprobs  = 4
+	deltaIndex     = 5
 
 	toolCallID       = 1
 	toolCallIndex    = 2
@@ -147,10 +148,11 @@ func StartFrame(id, model, fingerprint, role string, created int64) []byte {
 
 // DeltaFrame carries one step of the generation. Everything beyond the text is present only
 // on the chunks that have it, so a plain text delta is unchanged in size by their existence.
-func DeltaFrame(content, reasoning string, toolCalls []openai.ToolCall, logprobs *openai.ChoiceLogprobs) []byte {
+func DeltaFrame(index int, content, reasoning string, toolCalls []openai.ToolCall, logprobs *openai.ChoiceLogprobs) []byte {
 	var m []byte
 	m = appendString(m, deltaContent, content)
 	m = appendString(m, deltaReasoning, reasoning)
+	m = appendUint(m, deltaIndex, uint64(max(index, 0)))
 
 	for _, tc := range toolCalls {
 		var fn []byte

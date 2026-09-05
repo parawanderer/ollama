@@ -143,7 +143,7 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 							continue
 						}
 						if _, err := w.ResponseWriter.Write(DeltaFrame(
-							content, reasoning, choice.Delta.ToolCalls, choice.Logprobs,
+							choice.Index, content, reasoning, choice.Delta.ToolCalls, choice.Logprobs,
 						)); err != nil {
 							return 0, err
 						}

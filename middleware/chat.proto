@@ -24,6 +24,12 @@ message Delta {
   string content = 1;
   string reasoning = 2;
 
+  // Which choice this belongs to, for a request that asked for more than one. Zero costs
+  // nothing to carry -- proto3 omits it -- and its absence would make several interleaved
+  // choices indistinguishable. ollama does not implement `n` today and every chunk it sends
+  // is index 0; this is here so that stops being load-bearing.
+  uint32 index = 5;
+
   // Present only on the chunks that carry them. A tool call arrives in pieces: the first
   // chunk for an index names the function, later ones append to arguments.
   repeated ToolCall tool_calls = 3;

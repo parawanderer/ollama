@@ -293,9 +293,12 @@ func TestMaxContextForInvertsPredict(t *testing.T) {
 	key := testKey()
 
 	for name, setup := range map[string]func(*VRAMCalibration){
-		"no samples":     func(c *VRAMCalibration) {},
-		"one sample":     func(c *VRAMCalibration) { c.Record(key, 8192, 20*gib) },
-		"fitted line":    func(c *VRAMCalibration) { c.Record(key, 8192, 20*gib+8192*2048); c.Record(key, 32768, 20*gib+32768*2048) },
+		"no samples": func(c *VRAMCalibration) {},
+		"one sample": func(c *VRAMCalibration) { c.Record(key, 8192, 20*gib) },
+		"fitted line": func(c *VRAMCalibration) {
+			c.Record(key, 8192, 20*gib+8192*2048)
+			c.Record(key, 32768, 20*gib+32768*2048)
+		},
 		"negative slope": func(c *VRAMCalibration) { c.Record(key, 8192, 40*gib); c.Record(key, 32768, 30*gib) },
 	} {
 		t.Run(name, func(t *testing.T) {

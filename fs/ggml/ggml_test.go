@@ -530,3 +530,27 @@ func TestKVCacheModelIsCompleteAcceptsHybridRecurrent(t *testing.T) {
 			"draft model's breakdown, this test should assert that instead")
 	}
 }
+
+// TestKVCacheModelIsCompleteRejectsVision covers the largest term the estimate omits for the
+// models this box cares most about. A vision model reserves memory for its projector, sized
+// for the largest image it accepts, and a graph for the encoder; neither is a function of the
+// weights or the context, so neither appears in a per-token figure plus a tensor sum.
+// Measured on qwen2.5vl:3b at 8k: 2211 MiB of projector reservation and 705 of encoder graph
+// against a 2291 MiB estimate, so more than half the load was outside the model.
+func TestKVCacheModelIsCompleteRejectsVision(t *testing.T) {
+	text := KV{
+		"general.architecture":            "qwen25vl",
+		"qwen25vl.attention.head_count":   uint32(16),
+		"qwen25vl.attention.key_length":   uint32(128),
+		"qwen25vl.attention.value_length": uint32(128),
+	}
+	if !text.KVCacheModelIsComplete() {
+		t.Fatal("a model with no vision tower was reported incomplete")
+	}
+
+	vision := maps.Clone(text)
+	vision["qwen25vl.vision.block_count"] = uint32(32)
+	if vision.KVCacheModelIsComplete() {
+		t.Error("a vision model was treated as described by weights and per-token cost alone")
+	}
+}

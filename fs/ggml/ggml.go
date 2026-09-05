@@ -173,6 +173,21 @@ func (kv KV) AttentionLayerCount() (n uint64) {
 // than knowing the first is incomplete, because a caller that knows can measure instead.
 func (kv KV) KVCacheModelIsComplete() bool {
 	arch := kv.Architecture()
+
+	// A vision model reserves memory for its projector -- worst-case for the largest image
+	// it accepts -- and a graph for the encoder, and neither is a function of the weights
+	// or the context. The per-token figure below describes neither, and the tensor sum it
+	// accompanies counts the projector's weights but not what running it costs. Measured on
+	// qwen2.5vl:3b at 8k, that is 2211 MiB of reservation and 705 of encoder graph against
+	// a 2291 MiB estimate: more than half the load is outside the model.
+	if kv.Uint("vision.block_count") > 0 {
+		return false
+	}
+
+	return kvCacheAttentionIsComplete(kv, arch)
+}
+
+func kvCacheAttentionIsComplete(kv KV, arch string) bool {
 	for _, key := range []string{
 		// A sparse-attention indexer keeps a cache of its own, sized independently.
 		"attention.indexer.head_count",

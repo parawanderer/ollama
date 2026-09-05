@@ -35,7 +35,7 @@ const fitProbeTooSmallLog = `0.00.645.129 I common_memory_breakdown_print: |   -
 `
 
 func TestScanFitBreakdownSumsDevices(t *testing.T) {
-	total, clean := scanFitBreakdown(strings.NewReader(fitProbeCleanLog))
+	total, clean := scanFitBreakdown(strings.NewReader(fitProbeCleanLog), false)
 	if !clean {
 		t.Error("rejected a fit the log says needed no changes")
 	}
@@ -50,7 +50,7 @@ func TestScanFitBreakdownSumsDevices(t *testing.T) {
 // fallback nobody asked for, and the smallest of them reports about a gigabyte for a
 // hundred-gigabyte model -- a figure that would otherwise be recorded and persisted.
 func TestScanFitBreakdownRejectsAModelThatDoesNotFit(t *testing.T) {
-	_, clean := scanFitBreakdown(strings.NewReader(fitProbeTooSmallLog))
+	_, clean := scanFitBreakdown(strings.NewReader(fitProbeTooSmallLog), false)
 	if clean {
 		t.Fatal("accepted a probe of a model llama-server was busy moving to system memory")
 	}
@@ -68,7 +68,7 @@ common_params_fit_impl: some future wording for giving up
 common_memory_breakdown_print: |   - CUDA0 (GPU) | 97249 = 96688 + ( 1053 = 0 + 0 + 1053) + -492 |
 common_params_fit_impl: id=0, n_layer= 0, n_part= 0, overflow_type=4, mem=  1053 MiB
 `
-	if _, clean := scanFitBreakdown(strings.NewReader(log)); clean {
+	if _, clean := scanFitBreakdown(strings.NewReader(log), false); clean {
 		t.Error("accepted a degraded pass because it did not recognise the giving-up message")
 	}
 }
@@ -78,7 +78,7 @@ func TestScanFitBreakdownSingleDevice(t *testing.T) {
 0.00.585.057 I common_memory_breakdown_print: |   - Host                                               |                  28137 = 28110 +       0 +      27                |
 0.00.621.366 I common_params_fit_impl: will leave 17886 >= 1024 MiB of free device memory, no changes needed
 `
-	total, clean := scanFitBreakdown(strings.NewReader(log))
+	total, clean := scanFitBreakdown(strings.NewReader(log), false)
 	if !clean {
 		t.Error("rejected a clean single-device fit")
 	}
@@ -93,7 +93,7 @@ func TestScanFitBreakdownSingleDevice(t *testing.T) {
 func TestScanFitBreakdownRequiresAVerdict(t *testing.T) {
 	log := `0.00.585.056 I common_memory_breakdown_print: |   - CUDA0 (GPU) | 97249 = 96574 + (78688 = 78056 + 376 + 255) + -78012 |
 `
-	if _, clean := scanFitBreakdown(strings.NewReader(log)); clean {
+	if _, clean := scanFitBreakdown(strings.NewReader(log), false); clean {
 		t.Error("accepted a breakdown the fit pass never reached a verdict on")
 	}
 }
@@ -110,7 +110,7 @@ func TestScanFitBreakdownAcceptsEveryVerdictPhrasing(t *testing.T) {
 		"cpu only":     "common_params_fit_impl: will leave 123126 >= 1024 MiB of system memory, no changes needed",
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, clean := scanFitBreakdown(strings.NewReader(row + verdict + "\n")); !clean {
+			if _, clean := scanFitBreakdown(strings.NewReader(row+verdict+"\n"), false); !clean {
 				t.Errorf("rejected a fit the log says needed no changes: %q", verdict)
 			}
 		})
@@ -118,7 +118,47 @@ func TestScanFitBreakdownAcceptsEveryVerdictPhrasing(t *testing.T) {
 }
 
 func TestScanFitBreakdownWithoutABreakdown(t *testing.T) {
-	if total, _ := scanFitBreakdown(strings.NewReader("nothing to see here\n")); total != 0 {
+	if total, _ := scanFitBreakdown(strings.NewReader("nothing to see here\n"), false); total != 0 {
 		t.Errorf("invented a total of %d from a log with no breakdown", total)
+	}
+}
+
+// A vision model, transcribed from qwen2.5vl:3b at 8k. Two of the three things it holds are
+// outside the breakdown: the projector's worst-case reservation is printed before the fit
+// verdict, and the vision encoder's graph is reserved afterwards. Reading only the breakdown
+// gives 2291 MiB for a load that used 5207.
+const fitProbeVisionLog = `0.00.353.024 I srv    load_model: [mtmd] estimated worst-case memory usage of mmproj is 2211.44 MiB (took 51.65 ms)
+0.00.486.599 I common_memory_breakdown_print: |   - CUDA0 (RTX PRO 6000 Blackwell Workstation Edition) | 97249 = 91836 + (2291 =  1834 +     288 +     169) +        3120 |
+0.00.486.599 I common_memory_breakdown_print: |   - Host                                               |                   275 =   243 +       0 +      32                |
+0.00.570.000 I common_params_fit_impl: will leave 89545 >= 1024 MiB of free device memory, no changes needed
+0.00.856.041 I clip_ctx: CLIP using CUDA0 backend
+0.01.030.317 I reserve_compute_meta:      CUDA0 compute buffer size =   704.79 MiB
+0.01.030.323 I reserve_compute_meta:        CPU compute buffer size =   292.41 MiB
+`
+
+func TestScanFitBreakdownCountsTheProjectorAndItsGraph(t *testing.T) {
+	total, clean := scanFitBreakdown(strings.NewReader(fitProbeVisionLog), true)
+	if !clean {
+		t.Fatal("rejected a fit the log says needed no changes")
+	}
+
+	// 2291 breakdown + 2211.44 projector + 704.79 encoder graph. The CPU-side
+	// reserve_compute_meta is excluded for the same reason every host row is: it is not
+	// device memory.
+	perMiB := float64(mib)
+	want := uint64(2291)*mib + uint64(2211.44*perMiB) + uint64(704.79*perMiB)
+	if !withinMiB(total, want, 1) {
+		t.Errorf("total = %d MiB, want %d MiB (%d MiB was reported by /api/ps for this load)",
+			total/mib, want/mib, 5207)
+	}
+}
+
+// Without a projector the scan must still stop at the verdict rather than waiting for lines
+// that will never come -- a text model prints no clip reservation, and waiting for one would
+// hang every probe until the timeout.
+func TestScanFitBreakdownDoesNotWaitForAProjectorThatIsAbsent(t *testing.T) {
+	total, clean := scanFitBreakdown(strings.NewReader(fitProbeCleanLog), false)
+	if !clean || total != uint64(79169)*mib {
+		t.Errorf("total = %d MiB clean = %v; want 79169 MiB and clean", total/mib, clean)
 	}
 }

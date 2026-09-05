@@ -47,6 +47,19 @@ var fitBreakdownRegex = regexp.MustCompile(`memory_breakdown_print:.*\|\s+-\s+\S
 //
 // Matching the multi-device wording alone rejected every single-device probe, which is the
 // common case here, so key on the part that does not vary.
+// A vision model holds two things the breakdown does not describe, and both are printed
+// elsewhere in the same log. Together they are most of what such a model costs: on
+// qwen2.5vl:3b at 8k the breakdown is 2291 MiB against 5207 actually used.
+var (
+	// The projector's worst-case reservation, sized for the largest image it will accept.
+	// Printed before the fit verdict and never inside the breakdown.
+	mmprojWorstCaseRegex = regexp.MustCompile(`worst-case memory usage of mmproj is\s+([0-9.]+)\s+MiB`)
+
+	// The vision encoder's graph, reserved after the fit pass has already reported. This
+	// is why a probe of a vision model has to keep reading past the verdict.
+	reserveComputeMetaRegex = regexp.MustCompile(`reserve_compute_meta:\s+(\S+)\s+compute buffer size\s+=\s+([0-9.]+)\s+MiB`)
+)
+
 var (
 	fitCleanRegex = regexp.MustCompile(`common_params_fit_impl:.*no changes needed`)
 	// Singular and plural both occur -- "cannot meet free memory target of 90000 MiB" on
@@ -167,7 +180,7 @@ func ProbeFitVRAM(
 		}
 	}()
 
-	total, clean := scanFitBreakdown(out)
+	total, clean := scanFitBreakdown(out, len(launch.projectors) > 0)
 	close(done)
 	_ = cmd.Process.Kill()
 	_, _ = io.Copy(io.Discard, out)
@@ -194,14 +207,32 @@ func ProbeFitVRAM(
 // be replaced by each new breakdown rather than added to. Scanning stops at the verdict,
 // which is what makes the figure correspond to the configuration that was requested rather
 // than to whichever fallback was printed last.
-func scanFitBreakdown(r io.Reader) (total uint64, clean bool) {
+func scanFitBreakdown(r io.Reader, hasProjector bool) (total uint64, clean bool) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
-	var current uint64
-	var sawRow bool
+	var current, projector, clipCompute uint64
+	var sawRow, verdict, sawClip bool
 	for scanner.Scan() {
 		line := scanner.Text()
+
+		if match := mmprojWorstCaseRegex.FindStringSubmatch(line); match != nil {
+			if mib, err := strconv.ParseFloat(match[1], 64); err == nil {
+				projector = uint64(mib * 1024 * 1024)
+			}
+		}
+		if match := reserveComputeMetaRegex.FindStringSubmatch(line); match != nil {
+			if mib, err := strconv.ParseFloat(match[2], 64); err == nil && isGPUBuffer(match[1]) {
+				clipCompute += uint64(mib * 1024 * 1024)
+				sawClip = true
+			}
+		}
+		// A vision model is only fully described once the encoder has reserved its graph,
+		// which happens after the fit pass has reported. Everything else stops at the
+		// verdict, so this costs about half a second and only for such models.
+		if verdict && (!hasProjector || sawClip) {
+			return total + projector + clipCompute, clean
+		}
 
 		if match := fitBreakdownRegex.FindStringSubmatch(line); match != nil {
 			if !sawRow {
@@ -224,11 +255,16 @@ func scanFitBreakdown(r io.Reader) (total uint64, clean bool) {
 		case fitTooSmallRegex.MatchString(line):
 			return total, false
 		case fitCleanRegex.MatchString(line):
-			return total, total > 0
+			// Not returned here when a projector is configured: the figures that make up a
+			// vision model's total are still to come.
+			verdict, clean = true, total > 0
+			if !hasProjector {
+				return total, clean
+			}
 		}
 	}
 	if sawRow {
 		total = current
 	}
-	return total, false
+	return total + projector + clipCompute, clean && verdict
 }

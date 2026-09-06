@@ -1469,6 +1469,11 @@ type EventFrame struct {
 	// timestamps.
 	SizeVRAM int64 `json:"size_vram,omitempty"`
 
+	// Estimate is the placement decision this load was made from, on an estimate frame.
+	// It is emitted before load.start, because the decision is what selects the devices the
+	// load then runs on.
+	Estimate *LoadEstimate `json:"estimate,omitempty"`
+
 	// SizeTotal is what the load holds everywhere, device and host together. It equals
 	// SizeVRAM when the model fit on the GPU and exceeds it when it did not: llama-server
 	// re-fits against the memory actually free, so a load that was predicted too low does
@@ -1495,6 +1500,37 @@ type EventFrame struct {
 // another is replaced between polls, and a load lasting tens of seconds is invisible for
 // all of them. Anything counting loads or evictions, or placing them on a timeline, needs
 // the moments.
+// LoadEstimate is how much memory a load was predicted to need, and what that prediction was
+// based on. It is reported because a placement that later spills, or that declines to use a
+// second device, is otherwise unattributable: the number that decided it was only ever in a
+// log line.
+//
+// Source names where the figure came from and is the field to read first, because the same
+// error means different things from each: "metadata" is an estimate from the GGUF, which for
+// some architectures is a known lower bound; "calibration" is a line fitted through loads that
+// actually happened; "probe" is a measurement taken before this load, without loading it.
+type LoadEstimate struct {
+	// Predicted is what the model itself was expected to hold. PredictedForLoad adds the
+	// generation batch's surcharge and is the figure the fit decision was made against, so a
+	// comparison with what the load reports must use the first and a comparison with free
+	// memory must use the second.
+	Predicted        int64  `json:"predicted"`
+	PredictedForLoad int64  `json:"predicted_for_load"`
+	Source           string `json:"source"`
+
+	// NumCtx is the context the estimate was made at, which is not always the context that
+	// was asked for: it is clamped to what the model was trained on and multiplied by the
+	// parallel slot count.
+	NumCtx   int `json:"num_ctx"`
+	NumGPU   int `json:"num_gpu"`
+	NumBatch int `json:"num_batch"`
+
+	// MetadataComplete is false when the architecture holds something the per-token estimate
+	// cannot describe -- sliding-window or latent attention, a vision tower. False is not a
+	// failure; it is why Source is likely to say "probe".
+	MetadataComplete bool `json:"metadata_complete"`
+}
+
 type ModelEvent struct {
 	// Type is one of load.start, load.complete, load.failed, evict, unload.
 	Type string `json:"type"`
@@ -1515,6 +1551,9 @@ type ModelEvent struct {
 	// buffers -- so which half is running is what a progress display wants to say.
 	WeightsMs int64 `json:"weights_ms,omitempty"`
 	ContextMs int64 `json:"context_ms,omitempty"`
+
+	// Estimate is the placement decision, on an estimate event. See LoadEstimate.
+	Estimate *LoadEstimate `json:"estimate,omitempty"`
 
 	// SizeTotal is what the load holds everywhere. It exceeds SizeVRAM exactly when the
 	// load spilled to the host, which is the only signal that a prediction was too low --

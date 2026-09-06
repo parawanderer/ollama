@@ -2305,6 +2305,7 @@ func (s *Server) eventFrame(ev api.ModelEvent, started time.Time) api.EventFrame
 		ContextMs:  ev.ContextMs,
 		SizeVRAM:   ev.SizeVRAM,
 		SizeTotal:  ev.SizeTotal,
+		Estimate:   ev.Estimate,
 		Dropped:    ev.Dropped,
 		T:          ev.At.Sub(started).Milliseconds(),
 	}

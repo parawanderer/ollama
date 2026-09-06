@@ -21,8 +21,10 @@ const (
 	// across the load, and on a long-context model most of what the model ends up holding.
 	EventLoadWeights = "load.weights"
 	EventLoadFailed  = "load.failed"
-	EventEvict       = "evict"
-	EventUnload      = "unload"
+	// EventEstimate reports the placement decision, ahead of the load it decided.
+	EventEstimate = "estimate"
+	EventEvict    = "evict"
+	EventUnload   = "unload"
 
 	// EventExpires reports a keep-alive deadline moving. It is emitted when the deadline
 	// is written, which happens only as a request finishes -- so a client that draws a

@@ -1049,6 +1049,19 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			// against a completed load makes the predictor look systematically low by the
 			// surcharge, and comparing the total against a sample makes it look high.
 			_, calibrated := s.vramCalibration.Predict(calibrationKey, predictedCtx, 0, 0)
+			estimate := &api.LoadEstimate{
+				Predicted:        int64(predicted),
+				PredictedForLoad: int64(predictedForLoad),
+				Source:           predictionSource(calibrated, probed),
+				NumCtx:           predictedCtx,
+				NumGPU:           len(loadGpus),
+				NumBatch:         launchOpts.NumBatch,
+				MetadataComplete: f.KV().KVCacheModelIsComplete(),
+			}
+			// Emitted before load.start, because this is the decision that chose the
+			// devices the load is about to run on. A placement that later spills, or that
+			// leaves a second card idle, is otherwise unattributable from the stream.
+			s.publishEvent(api.ModelEvent{Type: EventEstimate, Model: req.model.Name, Estimate: estimate})
 			slog.Info("predicted llama-server VRAM",
 				"model", req.model.ModelPath,
 				"architecture", f.KV().Architecture(),

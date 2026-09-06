@@ -2774,6 +2774,20 @@ func PredictServerVRAMParts(modelPath string, projectorPaths []string, f *ggml.G
 		}
 	}
 
+	// The per-token figure is the only architecture-specific arithmetic in this estimate,
+	// and it is a reimplementation of what llama.cpp computes exactly. Setting
+	// OLLAMA_NO_ARCH_ESTIMATE drops it, leaving a weights-only prior and forcing every
+	// context-dependent number to come from measurement.
+	//
+	// It exists to make a design claim falsifiable rather than to be used in production:
+	// the mechanism here is meant to place models correctly without any hand-written
+	// architecture knowledge, and the way to find out is to remove the knowledge and
+	// measure. Summing tensors is not architecture knowledge -- it reads what the file
+	// contains -- so a weights-only prior is still a real lower bound.
+	if envconfig.NoArchEstimate() {
+		return weights, 0
+	}
+
 	return weights, f.KV().KVCacheBytesPerToken()
 }
 

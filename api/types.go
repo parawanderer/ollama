@@ -865,6 +865,17 @@ type ProcessModelResponse struct {
 	SizeVRAM      int64        `json:"size_vram"`
 	ContextLength int          `json:"context_length"`
 
+	// Memory splits SizeVRAM by what the memory holds, summed across every device this
+	// model sits on. Its fields sum to SizeVRAM. Absent while a model is still loading,
+	// and on a runner that reported no buffer sizes.
+	Memory *MemoryBreakdown `json:"memory,omitempty"`
+
+	// WeightsOnDisk is the size of the files the model was loaded from -- the quantized
+	// blob plus any projector. Read against Memory.Weights it says what the load cost
+	// over the file itself; the two are close but never equal, because the device copy is
+	// padded and a partial offload leaves some of the file on the host.
+	WeightsOnDisk int64 `json:"weights_on_disk,omitempty"`
+
 	// GPUs lists the devices this model was placed on, with per-device VRAM,
 	// in the same terms /api/info reports them. Empty when the model is
 	// running on the CPU.
@@ -874,6 +885,70 @@ type ProcessModelResponse struct {
 // ProcessGPU reports one device a loaded model occupies and how much VRAM it
 // uses there. The id/runner pair matches GPUInfo's, since an id is only unique
 // within its runner.
+// MemoryBreakdown splits what a load holds by what the memory is *for*, rather than by
+// which device it sits on. Every field is bytes.
+//
+// The engine labels each allocation itself, so this needs no per-architecture knowledge:
+// llama-server reports one line per buffer naming its kind, and these fields are those
+// kinds. Summed, they equal the SizeVRAM of whatever carries them -- exactly, because the
+// mmap'd host view of the weights that complicates a *total* is a host buffer and so takes
+// no part in a device figure.
+//
+// Read Weights against KVCache to tell the two questions apart that a single total cannot:
+// whether a model is large, and whether its context is. They move independently -- weights
+// are fixed once quantization is chosen, and the cache is linear in context length.
+type MemoryBreakdown struct {
+	// Weights is the model's tensors.
+	Weights int64 `json:"weights"`
+
+	// KVCache is the attention cache. It is the term that grows with context length, and
+	// on a long-context load it can exceed the weights several times over.
+	KVCache int64 `json:"kv_cache"`
+
+	// RecurrentState is the per-sequence state of a recurrent or hybrid architecture --
+	// Mamba-style layers keep one instead of a KV cache. It is reported separately rather
+	// than folded into KVCache because there are no keys or values in such a layer, but it
+	// answers the same question: together the two are what the context costs. Not small
+	// enough to ignore -- 748 MiB on granite at 8k.
+	RecurrentState int64 `json:"recurrent_state,omitempty"`
+
+	// Compute is the scratch space for the forward pass. It is neither weights nor cache
+	// and it is not a rounding error -- 1752 MiB on qwen3.8:27b -- so a two-way split that
+	// omitted it would not add up.
+	Compute int64 `json:"compute"`
+
+	// Output is the logits buffer.
+	Output int64 `json:"output,omitempty"`
+
+	// Projector is a vision model's image encoder, reported by the engine as a worst-case
+	// reservation sized for the largest image it will accept rather than what it holds
+	// with no image loaded.
+	Projector int64 `json:"projector,omitempty"`
+
+	// Other is any buffer kind not named above. It exists so that a kind the engine adds
+	// later becomes visible rather than silently vanishing from the breakdown while still
+	// counting toward the total -- the parts must always sum to the whole, and a fixed set
+	// of fields with no catch-all is how that invariant breaks quietly.
+	Other int64 `json:"other,omitempty"`
+}
+
+// Total is the sum of every field, which equals the SizeVRAM (or host total) it was
+// derived from.
+func (m MemoryBreakdown) Total() int64 {
+	return m.Weights + m.KVCache + m.RecurrentState + m.Compute + m.Output + m.Projector + m.Other
+}
+
+// Add accumulates another breakdown, for summing across devices.
+func (m *MemoryBreakdown) Add(o MemoryBreakdown) {
+	m.Weights += o.Weights
+	m.KVCache += o.KVCache
+	m.RecurrentState += o.RecurrentState
+	m.Compute += o.Compute
+	m.Output += o.Output
+	m.Projector += o.Projector
+	m.Other += o.Other
+}
+
 type ProcessGPU struct {
 	ID     string `json:"gpu_id"`
 	Runner string `json:"runner,omitempty"`
@@ -882,6 +957,10 @@ type ProcessGPU struct {
 	// compute buffers. Backends with a single device report the whole figure
 	// here, so it equals the model's total.
 	SizeVRAM int64 `json:"size_vram"`
+
+	// Memory splits SizeVRAM by what the memory holds. Its fields sum to SizeVRAM.
+	// Absent when the runner reported no buffer sizes to split.
+	Memory *MemoryBreakdown `json:"memory,omitempty"`
 }
 
 type TokenResponse struct {
@@ -1469,6 +1548,17 @@ type EventFrame struct {
 	// timestamps.
 	SizeVRAM int64 `json:"size_vram,omitempty"`
 
+	// Memory splits SizeVRAM by what the memory holds; MemoryHost does the same for
+	// whatever spilled to the host. See the fields of the same name on ModelEvent.
+	Memory     *MemoryBreakdown `json:"memory,omitempty"`
+	MemoryHost *MemoryBreakdown `json:"memory_host,omitempty"`
+
+	// WeightsOnDisk is the size of the files the model was loaded from -- the quantized
+	// blob plus any projector. Read against Memory.Weights it says what the load cost
+	// over the file itself; the two are close but never equal, because the device copy is
+	// padded and a partial offload leaves some of the file on the host.
+	WeightsOnDisk int64 `json:"weights_on_disk,omitempty"`
+
 	// Estimate is the placement decision this load was made from, on an estimate frame.
 	// It is emitted before load.start, because the decision is what selects the devices the
 	// load then runs on.
@@ -1529,6 +1619,18 @@ type LoadEstimate struct {
 	// cannot describe -- sliding-window or latent attention, a vision tower. False is not a
 	// failure; it is why Source is likely to say "probe".
 	MetadataComplete bool `json:"metadata_complete"`
+
+	// Breakdown is how the metadata model expects this load to divide, in the same fields
+	// load.complete reports it measured, so the two can be compared term by term rather
+	// than only as totals. That comparison separates "this model is bigger than we
+	// thought" from "its context is", which a single number cannot.
+	//
+	// Two cautions. Only Weights and KVCache are populated: the estimate has no per-kind
+	// view of the compute buffers. And this is always the *metadata* split even when
+	// Source says "probe" or "calibration" -- those measure a total and do not divide it
+	// -- so Breakdown.Total() does not equal Predicted and must not be presented as
+	// though it did. Compare the fields against what was measured; do not sum them.
+	Breakdown *MemoryBreakdown `json:"breakdown,omitempty"`
 }
 
 type ModelEvent struct {
@@ -1564,6 +1666,22 @@ type ModelEvent struct {
 	// matching the fields of the same name on /api/ps.
 	SizeVRAM int64        `json:"size_vram,omitempty"`
 	GPUs     []ProcessGPU `json:"gpus,omitempty"`
+
+	// Memory splits SizeVRAM by what the memory holds, and MemoryHost does the same for
+	// the part that did not fit on a device. On load.weights only Weights is populated,
+	// because nothing else has been allocated yet.
+	//
+	// MemoryHost is what makes a spill actionable rather than merely visible: SizeTotal
+	// exceeding SizeVRAM says how much went to the host, and this says what went. Weights
+	// spilling and a KV cache spilling are different problems with different fixes.
+	Memory     *MemoryBreakdown `json:"memory,omitempty"`
+	MemoryHost *MemoryBreakdown `json:"memory_host,omitempty"`
+
+	// WeightsOnDisk is the size of the files the model was loaded from -- the quantized
+	// blob plus any projector. Read against Memory.Weights it says what the load cost
+	// over the file itself; the two are close but never equal, because the device copy is
+	// padded and a partial offload leaves some of the file on the host.
+	WeightsOnDisk int64 `json:"weights_on_disk,omitempty"`
 
 	// Reason carries why an eviction or failure happened, where one is known.
 	Reason string `json:"reason,omitempty"`

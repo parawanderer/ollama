@@ -109,11 +109,91 @@ func TestPsHandlerOmitsDevicesOnCPU(t *testing.T) {
 // memory accessors. Everything else panics if the handler ever grows a call.
 type fakeRunner struct {
 	llm.LlamaServer
-	vram     map[ml.DeviceID]uint64
-	total    uint64
-	gpuTotal uint64
+	vram          map[ml.DeviceID]uint64
+	total         uint64
+	gpuTotal      uint64
+	memVRAM       api.MemoryBreakdown
+	memHost       api.MemoryBreakdown
+	memByGPU      map[ml.DeviceID]api.MemoryBreakdown
+	weightsOnDisk int64
 }
 
 func (f *fakeRunner) MemorySize() (uint64, uint64)    { return f.total, f.gpuTotal }
 func (f *fakeRunner) VRAMByGPU(id ml.DeviceID) uint64 { return f.vram[id] }
 func (f *fakeRunner) ContextLength() int              { return 4096 }
+
+func (f *fakeRunner) MemoryBreakdownTotals() (vram, host api.MemoryBreakdown) {
+	return f.memVRAM, f.memHost
+}
+
+func (f *fakeRunner) MemoryBreakdownByGPU(id ml.DeviceID) api.MemoryBreakdown {
+	return f.memByGPU[id]
+}
+
+func (f *fakeRunner) WeightsOnDisk() int64 { return f.weightsOnDisk }
+
+// The split is reported per device and in aggregate, and both sum to the size_vram they
+// sit beside. That property is the whole reason a client can trust the breakdown: a UI
+// drawing weights-vs-cache as parts of a bar needs the parts to fill it.
+func TestPsHandlerReportsMemoryBreakdown(t *testing.T) {
+	dev0 := ml.DeviceID{ID: "0", Library: "CUDA"}
+	dev1 := ml.DeviceID{ID: "1", Library: "CUDA"}
+
+	perGPU := map[ml.DeviceID]api.MemoryBreakdown{
+		dev0: {Weights: 20 * format.GigaByte, KVCache: 4 * format.GigaByte, Compute: format.GigaByte},
+		dev1: {Weights: 12 * format.GigaByte, KVCache: 2 * format.GigaByte, Compute: format.GigaByte},
+	}
+	total := api.MemoryBreakdown{
+		Weights: 32 * format.GigaByte, KVCache: 6 * format.GigaByte, Compute: 2 * format.GigaByte,
+	}
+
+	got, body := psResponse(t, &runnerRef{
+		model:     &Model{ShortName: "llama3:70b"},
+		gpus:      []ml.DeviceID{dev0, dev1},
+		totalSize: 40 * format.GigaByte,
+		vramSize:  40 * format.GigaByte,
+		expiresAt: time.Now().Add(5 * time.Minute),
+		llama: &fakeRunner{
+			vram: map[ml.DeviceID]uint64{
+				dev0: 25 * format.GigaByte,
+				dev1: 15 * format.GigaByte,
+			},
+			total: 40 * format.GigaByte, gpuTotal: 40 * format.GigaByte,
+			memVRAM: total, memByGPU: perGPU,
+			weightsOnDisk: 38 * format.GigaByte,
+		},
+	})
+
+	if len(got.Models) != 1 {
+		t.Fatalf("expected 1 model, got %d", len(got.Models))
+	}
+	m := got.Models[0]
+
+	if m.Memory == nil {
+		t.Fatalf("no aggregate breakdown on the model row; body %s", body)
+	}
+	if m.Memory.Total() != m.SizeVRAM {
+		t.Errorf("aggregate breakdown totals %d but size_vram is %d", m.Memory.Total(), m.SizeVRAM)
+	}
+	if m.WeightsOnDisk != 38*format.GigaByte {
+		t.Errorf("weights_on_disk = %d, want %d", m.WeightsOnDisk, 38*format.GigaByte)
+	}
+
+	for _, g := range m.GPUs {
+		if g.Memory == nil {
+			t.Fatalf("device %s carries no breakdown; body %s", g.ID, body)
+		}
+		if g.Memory.Total() != g.SizeVRAM {
+			t.Errorf("device %s: breakdown totals %d but size_vram is %d",
+				g.ID, g.Memory.Total(), g.SizeVRAM)
+		}
+	}
+
+	// The field has to reach the wire under the name a client reads, not merely exist on
+	// the struct: a breakdown that marshals to nothing is invisible however correct it is.
+	for _, want := range []string{`"memory"`, `"weights"`, `"kv_cache"`, `"weights_on_disk"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("%s missing from the response body: %s", want, body)
+		}
+	}
+}

@@ -1058,6 +1058,19 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 				NumBatch:         launchOpts.NumBatch,
 				MetadataComplete: f.KV().KVCacheModelIsComplete(),
 			}
+			// The metadata model's view of how the prediction divides, published whatever
+			// Source says. That is deliberate: when the total came from a probe or a
+			// fitted line the total is measured but the split is not, and it is exactly
+			// then that comparing this against what load.complete measured is worth
+			// doing. An architecture whose cache the metadata cannot describe shows up as
+			// a Weights that matches beside a KVCache that does not -- which a single
+			// total can never distinguish from the model simply being bigger than thought.
+			if weights, bytesPerToken := llm.PredictServerVRAMParts(req.model.ModelPath, req.model.ProjectorPaths, f); weights > 0 {
+				estimate.Breakdown = &api.MemoryBreakdown{
+					Weights: int64(weights),
+					KVCache: int64(bytesPerToken * uint64(max(predictedCtx, 0))),
+				}
+			}
 			// Emitted before load.start, because this is the decision that chose the
 			// devices the load is about to run on. A placement that later spills, or that
 			// leaves a second card idle, is otherwise unattributable from the stream.
@@ -1122,13 +1135,24 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			// boundary lets a client say which half it is waiting on.
 			onWeights := func(at time.Time, weights uint64) {
 				weightsLoadedAt = at
-				s.publishEvent(api.ModelEvent{
+				ev := api.ModelEvent{
 					Type:       EventLoadWeights,
 					Model:      req.model.Name,
 					At:         at,
 					DurationMs: at.Sub(loadStartedAt).Milliseconds(),
 					SizeVRAM:   int64(weights),
-				})
+				}
+				// The breakdown at this instant holds weights and nothing else, which is
+				// the point: a client can show the cache arriving afterwards rather than
+				// having to infer it from two totals.
+				if llama != nil {
+					vram, _ := llama.MemoryBreakdownTotals()
+					if vram.Total() > 0 {
+						ev.Memory = &vram
+					}
+					ev.WeightsOnDisk = llama.WeightsOnDisk()
+				}
+				s.publishEvent(ev)
 			}
 
 			llama, err = s.newServerFn(systemInfo, loadGpus, req.model.ModelPath, f, req.model.AdapterPaths, req.model.ProjectorPaths, launchOpts, numParallel, config)
@@ -1369,6 +1393,16 @@ iGPUScan:
 			SizeVRAM:   int64(loadedVRAM),
 			SizeTotal:  int64(loadedTotal),
 		}
+		// What the load holds, split by what the memory is for. The host side is only
+		// non-empty on a spill, and it is what makes one actionable: SizeTotal exceeding
+		// SizeVRAM says how much went to the host, and this says what did.
+		if vram, host := llama.MemoryBreakdownTotals(); vram.Total() > 0 {
+			complete.Memory = &vram
+			if host.Total() > 0 {
+				complete.MemoryHost = &host
+			}
+		}
+		complete.WeightsOnDisk = llama.WeightsOnDisk()
 		if !runner.weightsLoaded.IsZero() && !runner.loadStarted.IsZero() {
 			complete.WeightsMs = runner.weightsLoaded.Sub(runner.loadStarted).Milliseconds()
 			complete.ContextMs = complete.DurationMs - complete.WeightsMs
@@ -2418,6 +2452,13 @@ type loadedModel struct {
 	expiresAt     time.Time
 	gpus          []ml.DeviceID
 	vramByGPU     map[ml.DeviceID]uint64
+
+	// memVRAM splits sizeVRAM by what the memory holds, and memByGPU does the same per
+	// device. weightsOnDisk is the size of the files loaded from, which is not memory and
+	// so is kept beside the breakdown rather than inside it.
+	memVRAM       api.MemoryBreakdown
+	memByGPU      map[ml.DeviceID]api.MemoryBreakdown
+	weightsOnDisk int64
 }
 
 // loadedModels returns a snapshot of the currently loaded models for status
@@ -2497,9 +2538,13 @@ func (r *runnerRef) reportLocked() loadedModel {
 		// figure for it; one whose device names don't map back reports zero
 		// rather than guessing.
 		lm.vramByGPU = make(map[ml.DeviceID]uint64, len(lm.gpus))
+		lm.memByGPU = make(map[ml.DeviceID]api.MemoryBreakdown, len(lm.gpus))
 		for _, dev := range lm.gpus {
 			lm.vramByGPU[dev] = r.llama.VRAMByGPU(dev)
+			lm.memByGPU[dev] = r.llama.MemoryBreakdownByGPU(dev)
 		}
+		lm.memVRAM, _ = r.llama.MemoryBreakdownTotals()
+		lm.weightsOnDisk = r.llama.WeightsOnDisk()
 	}
 	// The scheduler waits to set expiresAt, so a model that is still loading may have the
 	// zero value. Estimate expiration from the session duration instead.

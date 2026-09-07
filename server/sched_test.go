@@ -2069,6 +2069,11 @@ func TestSchedLlamaServerEvictsExistingOnPending(t *testing.T) {
 }
 
 type mockLlm struct {
+	memVRAM       api.MemoryBreakdown
+	memHost       api.MemoryBreakdown
+	memByGPU      map[ml.DeviceID]api.MemoryBreakdown
+	weightsOnDisk int64
+
 	modelPath         string
 	pingResp          error
 	waitResp          error
@@ -2149,8 +2154,18 @@ func (s *mockLlm) Close() error {
 	return s.closeResp
 }
 
-func (s *mockLlm) MemorySize() (uint64, uint64)                       { return s.totalSize, s.vramSize }
-func (s *mockLlm) VRAMByGPU(id ml.DeviceID) uint64                    { return s.vramByGPU[id] }
+func (s *mockLlm) MemorySize() (uint64, uint64)    { return s.totalSize, s.vramSize }
+func (s *mockLlm) VRAMByGPU(id ml.DeviceID) uint64 { return s.vramByGPU[id] }
+
+func (s *mockLlm) MemoryBreakdownTotals() (vram, host api.MemoryBreakdown) {
+	return s.memVRAM, s.memHost
+}
+
+func (s *mockLlm) MemoryBreakdownByGPU(id ml.DeviceID) api.MemoryBreakdown {
+	return s.memByGPU[id]
+}
+
+func (s *mockLlm) WeightsOnDisk() int64                               { return s.weightsOnDisk }
 func (s *mockLlm) Pid() int                                           { return -1 }
 func (s *mockLlm) GetPort() int                                       { return -1 }
 func (s *mockLlm) GetDeviceInfos(ctx context.Context) []ml.DeviceInfo { return nil }

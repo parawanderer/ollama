@@ -151,11 +151,16 @@ func TestEventFrameCopiesEveryCommonField(t *testing.T) {
 		ContextMs:  6000,
 		SizeVRAM:   86 << 30,
 		SizeTotal:  88 << 30,
-		Estimate:   &api.LoadEstimate{Predicted: 86 << 30, Source: "probe"},
-		Dropped:    3,
-		ExpiresAt:  &expires,
-		PS:         &api.ProcessResponse{},
-		Info:       &api.InfoResponse{},
+		Memory: &api.MemoryBreakdown{
+			Weights: 70 << 30, KVCache: 14 << 30, Compute: 2 << 30, Output: 1 << 20,
+		},
+		MemoryHost:    &api.MemoryBreakdown{Weights: 2 << 30},
+		WeightsOnDisk: 69 << 30,
+		Estimate:      &api.LoadEstimate{Predicted: 86 << 30, Source: "probe"},
+		Dropped:       3,
+		ExpiresAt:     &expires,
+		PS:            &api.ProcessResponse{},
+		Info:          &api.InfoResponse{},
 	}
 
 	frame := (&Server{}).eventFrame(ev, at)

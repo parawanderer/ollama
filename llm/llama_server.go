@@ -130,11 +130,20 @@ type llamaServerRunner struct {
 	memGPU             uint64 // actual GPU buffer size parsed from llama-server logs (bytes)
 	memModelFileBacked uint64 // model weight bytes whose buffers mirror the on-disk file (mmap views + direct device copies); excludes repacked copies like CPU_REPACK
 	memCPUMappedModel  uint64 // model weight bytes in mmap-backed CPU buffers (e.g. CPU_Mapped), parsed from llama-server logs
-	gpuLayers          uint64 // model layers loaded on GPU, parsed from llama-server logs
-	gpuLayerOverflow   int    // number of GPU-selected layers partially overflowed to CPU
-	status             *StatusWriter
-	options            api.Options
-	modelPath          string
+
+	// memVRAMBreakdown and memHostBreakdown split memGPU and the host remainder by what
+	// each buffer is for, and memBreakdownByDevice does the same per device. The engine
+	// names the kind of every buffer it allocates, so this costs no architecture knowledge
+	// -- it is the same parse that already produces the totals, kept rather than summed
+	// away. Keys of memBreakdownByDevice match vramByDevice (e.g. "CUDA0").
+	memVRAMBreakdown     api.MemoryBreakdown
+	memHostBreakdown     api.MemoryBreakdown
+	memBreakdownByDevice map[string]api.MemoryBreakdown
+	gpuLayers            uint64 // model layers loaded on GPU, parsed from llama-server logs
+	gpuLayerOverflow     int    // number of GPU-selected layers partially overflowed to CPU
+	status               *StatusWriter
+	options              api.Options
+	modelPath            string
 	// mediaMarker must match the LLAMA_MEDIA_MARKER value passed to llama-server.
 	// llama.cpp randomizes this by default; Ollama renders stable [img-N] markers
 	// and rewrites them before forwarding the request.
@@ -997,21 +1006,22 @@ func NewLlamaServerRunner(
 	memWriter := &memoryParsingWriter{inner: status}
 
 	s := &llamaServerRunner{
-		client:           newLlamaServerHTTPClient(),
-		status:           status,
-		options:          opts,
-		modelPath:        modelPath,
-		mediaMarker:      mediaMarker,
-		vramByDevice:     make(map[string]uint64),
-		systemFreeAtLoad: make(map[string]uint64),
-		gpus:             gpus,
-		deviceLogNames:   ml.RunnerDeviceNames(gpus),
-		ggml:             f,
-		totalLayers:      f.KV().BlockCount() + 1,
-		rawEmbeddings:    legacyEmbeddingsWereRaw(f.KV()),
-		sem:              semaphore.NewWeighted(int64(numParallel)),
-		launch:           launch,
-		output:           memWriter,
+		client:               newLlamaServerHTTPClient(),
+		status:               status,
+		options:              opts,
+		modelPath:            modelPath,
+		mediaMarker:          mediaMarker,
+		vramByDevice:         make(map[string]uint64),
+		memBreakdownByDevice: make(map[string]api.MemoryBreakdown),
+		systemFreeAtLoad:     make(map[string]uint64),
+		gpus:                 gpus,
+		deviceLogNames:       ml.RunnerDeviceNames(gpus),
+		ggml:                 f,
+		totalLayers:          f.KV().BlockCount() + 1,
+		rawEmbeddings:        legacyEmbeddingsWereRaw(f.KV()),
+		sem:                  semaphore.NewWeighted(int64(numParallel)),
+		launch:               launch,
+		output:               memWriter,
 	}
 	// Point the memory parsing writer at this runner so values are updated as logs stream in
 	memWriter.runner = s
@@ -1174,6 +1184,11 @@ func (s *llamaServerRunner) resetLoadAccounting() {
 	s.memGPU = 0
 	s.memModelFileBacked = 0
 	s.memCPUMappedModel = 0
+	s.memVRAMBreakdown = api.MemoryBreakdown{}
+	s.memHostBreakdown = api.MemoryBreakdown{}
+	for k := range s.memBreakdownByDevice {
+		delete(s.memBreakdownByDevice, k)
+	}
 	s.gpuLayers = 0
 	s.gpuLayerOverflow = 0
 	for k := range s.vramByDevice {
@@ -2684,6 +2699,100 @@ func (s *llamaServerRunner) GetDeviceInfos(ctx context.Context) []ml.DeviceInfo 
 	return infos
 }
 
+// mmapOverlap is the host-side model memory that mirrors bytes already counted on a
+// device, and so must not be added to a total.
+//
+// With mmap, llama-server reports each CPU_Mapped model buffer as the file-offset span of
+// its CPU-resident tensors. During partial offload that span covers nearly the whole file
+// (the first and last tensors stay on CPU), re-counting weights already held in device
+// buffers. Only buffers that mirror the on-disk file can overlap this way; repacked copies
+// such as CPU_REPACK are separate real allocations and must be left intact. Weights cannot
+// exceed the model file on disk, so the excess over the file size is the overlap.
+//
+// This is shared by MemorySize and MemoryBreakdownTotals rather than written twice,
+// because the breakdown's whole value rests on its parts summing to the totals reported
+// beside it -- and two copies of a correction like this drift.
+func (s *llamaServerRunner) mmapOverlap(memModelFileBacked, memCPUMappedModel uint64) uint64 {
+	if memCPUMappedModel == 0 {
+		return 0
+	}
+	info, err := os.Stat(s.modelPath)
+	if err != nil || memModelFileBacked <= uint64(info.Size()) {
+		return 0
+	}
+	return min(memCPUMappedModel, memModelFileBacked-uint64(info.Size()))
+}
+
+// fullyOffloaded reports that every layer reached a device, in which case host buffers
+// mirror device memory rather than adding to it and the total collapses onto the VRAM
+// figure.
+func fullyOffloaded(totalLayers, gpuLayers uint64, gpuLayerOverflow int) bool {
+	return totalLayers > 0 && gpuLayers >= totalLayers && gpuLayerOverflow == 0
+}
+
+// MemoryBreakdownTotals splits what the load holds by what the memory is for: vram sums to
+// the same figure MemorySize reports as vram, and host to the remainder of its total.
+//
+// The device split needs no correction -- the mmap view that complicates a total is a host
+// buffer, so it takes no part in a device figure, and the per-kind sums equal size_vram
+// exactly. Only the host side is adjusted, by the same overlap MemorySize removes and in
+// the same place, so that vram.Total()+host.Total() equals MemorySize's total.
+func (s *llamaServerRunner) MemoryBreakdownTotals() (vram, host api.MemoryBreakdown) {
+	s.memoryMu.RLock()
+	defer s.memoryMu.RUnlock()
+
+	if s.memTotal == 0 {
+		return api.MemoryBreakdown{}, api.MemoryBreakdown{}
+	}
+	vram, host = s.memVRAMBreakdown, s.memHostBreakdown
+	if fullyOffloaded(s.totalLayers, s.gpuLayers, s.gpuLayerOverflow) {
+		// Nothing is really on the host: what is reported there mirrors the device copy.
+		return vram, api.MemoryBreakdown{}
+	}
+	overlap := int64(s.mmapOverlap(s.memModelFileBacked, s.memCPUMappedModel))
+	host.Weights = max(0, host.Weights-overlap)
+	return vram, host
+}
+
+// WeightsOnDisk is the size of the files this model was loaded from -- the quantized
+// blob, plus a projector where one is configured.
+//
+// It is reported beside the memory breakdown rather than inside it, because it is not
+// resident memory: putting it in MemoryBreakdown would break the one property that makes
+// that type worth trusting, that its fields sum to the figure reported next to it.
+//
+// Read against the breakdown's Weights it says what the load cost over the file itself.
+// The two are close but never equal: the device copy is padded and aligned, and a partial
+// offload leaves some of the file on the host.
+func (s *llamaServerRunner) WeightsOnDisk() int64 {
+	var total int64
+	seen := make(map[string]bool, 2)
+	for _, path := range append([]string{s.modelPath}, s.launch.projectors...) {
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		if info, err := os.Stat(path); err == nil {
+			total += info.Size()
+		}
+	}
+	return total
+}
+
+// MemoryBreakdownByGPU splits this runner's VRAM on one device by what it holds. Its
+// fields sum to VRAMByGPU for the same device.
+func (s *llamaServerRunner) MemoryBreakdownByGPU(id ml.DeviceID) api.MemoryBreakdown {
+	s.memoryMu.RLock()
+	defer s.memoryMu.RUnlock()
+
+	for i, gpu := range s.gpus {
+		if gpu.DeviceID == id {
+			return s.memBreakdownByDevice[s.deviceLogName(i)]
+		}
+	}
+	return api.MemoryBreakdown{}
+}
+
 // MemorySize returns total and GPU memory usage parsed from llama-server's
 // post-load log output. Full model-layer offload is reported as 100% GPU.
 func (s *llamaServerRunner) MemorySize() (total, vram uint64) {
@@ -2699,20 +2808,8 @@ func (s *llamaServerRunner) MemorySize() (total, vram uint64) {
 
 	if memTotal > 0 {
 		total, vram = memTotal, memGPU
-		// With mmap, llama-server reports each CPU_Mapped model buffer as the
-		// file-offset span of its CPU-resident tensors. During partial offload
-		// that span covers nearly the whole file (the first and last tensors
-		// stay on CPU), re-counting weights already held in device buffers.
-		// Only buffers that mirror the on-disk file can overlap this way;
-		// repacked copies such as CPU_REPACK are separate real allocations and
-		// must be left intact. Weights cannot exceed the model file on disk, so
-		// trim that overlap from the mmap-backed (reclaimable page cache) portion.
-		if memCPUMappedModel > 0 {
-			if info, err := os.Stat(s.modelPath); err == nil && memModelFileBacked > uint64(info.Size()) {
-				total -= min(memCPUMappedModel, memModelFileBacked-uint64(info.Size()))
-			}
-		}
-		if totalLayers > 0 && gpuLayers >= totalLayers && gpuLayerOverflow == 0 {
+		total -= s.mmapOverlap(memModelFileBacked, memCPUMappedModel)
+		if fullyOffloaded(totalLayers, gpuLayers, gpuLayerOverflow) {
 			total = vram
 		}
 		return total, vram
@@ -3103,9 +3200,38 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
 	return w.inner.Write(b)
 }
 
+// addToBreakdown files a buffer under the field its kind describes.
+//
+// An unrecognised kind goes to Other rather than being dropped. That matters more than it
+// looks: the engine adds buffer kinds over time (RS, for the recurrent state of a hybrid
+// architecture, is one such and is 748 MiB on granite at 8k), and a switch with no default
+// would leave a new kind counted in the total but missing from the split -- the parts
+// quietly ceasing to sum to the whole, with nothing to say so.
+func addToBreakdown(b *api.MemoryBreakdown, kind string, bytes uint64) {
+	n := int64(bytes)
+	switch kind {
+	case "model":
+		b.Weights += n
+	case "KV":
+		b.KVCache += n
+	case "RS":
+		b.RecurrentState += n
+	case "compute":
+		b.Compute += n
+	case "output":
+		b.Output += n
+	case "mmproj":
+		b.Projector += n
+	default:
+		b.Other += n
+	}
+}
+
 func (w *memoryParsingWriter) updateRunnerMemoryLocked() {
 	var total, gpu, modelFileBacked, cpuMappedModel uint64
 	byDevice := make(map[string]uint64)
+	var vramBreakdown, hostBreakdown api.MemoryBreakdown
+	breakdownByDevice := make(map[string]api.MemoryBreakdown)
 
 	for key, buffer := range w.buffers {
 		total += buffer.bytes
@@ -3126,6 +3252,13 @@ func (w *memoryParsingWriter) updateRunnerMemoryLocked() {
 		if isGPUBuffer(key.backend) {
 			gpu += buffer.bytes
 			byDevice[deviceName(key.backend)] += buffer.bytes
+			addToBreakdown(&vramBreakdown, key.kind, buffer.bytes)
+			dev := deviceName(key.backend)
+			b := breakdownByDevice[dev]
+			addToBreakdown(&b, key.kind, buffer.bytes)
+			breakdownByDevice[dev] = b
+		} else {
+			addToBreakdown(&hostBreakdown, key.kind, buffer.bytes)
 		}
 	}
 
@@ -3134,6 +3267,9 @@ func (w *memoryParsingWriter) updateRunnerMemoryLocked() {
 	w.runner.memModelFileBacked = modelFileBacked
 	w.runner.memCPUMappedModel = cpuMappedModel
 	w.runner.vramByDevice = byDevice
+	w.runner.memVRAMBreakdown = vramBreakdown
+	w.runner.memHostBreakdown = hostBreakdown
+	w.runner.memBreakdownByDevice = breakdownByDevice
 }
 
 // VRAMByGPU returns the VRAM used by this runner on the specified device.

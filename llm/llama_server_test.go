@@ -4085,3 +4085,158 @@ func TestMemorySizeSeparatesSpilledFromResident(t *testing.T) {
 		t.Errorf("a load that fit reported total %d and device %d; they must be equal", total, vram)
 	}
 }
+
+// TestMemoryBreakdownPartitionsVRAM is the property the whole breakdown rests on: its
+// fields sum to exactly the size_vram reported beside them. If that ever stops holding, a
+// client showing the split is showing something that does not add up to the total it is
+// shown against, and nothing else would say so.
+//
+// The lines are transcribed from this box's own llama-server output, not written from
+// memory -- a fixture recalled rather than copied once encoded log wording the tool never
+// emits, so the matcher under test matched nothing and the test passed anyway.
+func TestMemoryBreakdownPartitionsVRAM(t *testing.T) {
+	tests := []struct {
+		name  string
+		lines []string
+		want  api.MemoryBreakdown // MiB, rounded
+	}{
+		{
+			// granite4.1:3b at 8k, single device. Verified against a live load: the
+			// GPU buckets summed to 2780.86 MiB against a reported size_vram of
+			// 2780.86 MiB, a difference of zero.
+			name: "single device, hybrid model",
+			lines: []string{
+				"load_tensors:   CPU_Mapped model buffer size =   200.98 MiB\n",
+				"load_tensors:        CUDA0 model buffer size =  1998.84 MiB\n",
+				"llama_kv_cache:      CUDA0 KV buffer size =   640.00 MiB\n",
+				"sched_reserve:      CUDA0 compute buffer size =   142.02 MiB\n",
+				"sched_reserve:  CUDA_Host compute buffer size =    36.02 MiB\n",
+				"sched_reserve:  CUDA_Host  output buffer size =     0.38 MiB\n",
+			},
+			want: api.MemoryBreakdown{Weights: 1998, KVCache: 640, Compute: 142},
+		},
+		{
+			// A recurrent/hybrid architecture keeps per-sequence state instead of a KV
+			// cache for some layers. It is reported under its own kind and is far too
+			// large to leave uncategorised.
+			name: "recurrent state is its own bucket",
+			lines: []string{
+				"load_tensors:        CUDA0 model buffer size =  1998.84 MiB\n",
+				"llama_memory_recurrent:      CUDA0 RS buffer size =   748.12 MiB\n",
+				"sched_reserve:      CUDA0 compute buffer size =   142.02 MiB\n",
+			},
+			want: api.MemoryBreakdown{Weights: 1998, RecurrentState: 748, Compute: 142},
+		},
+		{
+			// Two devices, and a draft model contributing a second KV buffer on the
+			// same device. Both must be summed rather than one replacing the other.
+			name: "two devices and two KV buffers",
+			lines: []string{
+				"load_tensors:        CUDA0 model buffer size =   852.89 MiB\n",
+				"load_tensors:        CUDA1 model buffer size =  1065.46 MiB\n",
+				"llama_kv_cache:      CUDA0 KV buffer size =  1920.00 MiB\n",
+				"llama_kv_cache:      CUDA0 KV buffer size =   240.00 MiB\n",
+				"sched_reserve:      CUDA1 compute buffer size =   408.55 MiB\n",
+			},
+			// 852.89 + 1065.46 = 1918.35 MiB. The sum is rounded, not the terms.
+			want: api.MemoryBreakdown{Weights: 1918, KVCache: 1920 + 240, Compute: 408},
+		},
+	}
+
+	const mib = 1024 * 1024
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &llamaServerRunner{
+				vramByDevice:         make(map[string]uint64),
+				memBreakdownByDevice: make(map[string]api.MemoryBreakdown),
+			}
+			w := &memoryParsingWriter{inner: io.Discard, runner: runner}
+			for _, line := range tt.lines {
+				w.Write([]byte(line))
+			}
+
+			vram, _ := runner.MemoryBreakdownTotals()
+			round := func(n int64) int64 { return n / mib }
+			got := api.MemoryBreakdown{
+				Weights:        round(vram.Weights),
+				KVCache:        round(vram.KVCache),
+				RecurrentState: round(vram.RecurrentState),
+				Compute:        round(vram.Compute),
+				Output:         round(vram.Output),
+				Projector:      round(vram.Projector),
+				Other:          round(vram.Other),
+			}
+			if got != tt.want {
+				t.Errorf("breakdown = %+v MiB, want %+v MiB", got, tt.want)
+			}
+
+			// The invariant. Anything the parse recognised but the breakdown failed to
+			// file would show up here as a shortfall, whatever the fields say.
+			_, gpuTotal := runner.MemorySize()
+			if vram.Total() != int64(gpuTotal) {
+				t.Errorf("breakdown totals %d bytes but size_vram is %d: the parts must sum to the whole",
+					vram.Total(), gpuTotal)
+			}
+		})
+	}
+}
+
+// TestMemoryBreakdownUnknownKindGoesToOther pins the reason Other exists. llama.cpp adds
+// buffer kinds over time; a switch without a catch-all would leave a new one counted in
+// size_vram but missing from the split, so the parts would silently stop summing to the
+// whole. Failing closed here costs a label. Failing open costs the invariant.
+func TestMemoryBreakdownUnknownKindGoesToOther(t *testing.T) {
+	var b api.MemoryBreakdown
+	addToBreakdown(&b, "model", 100)
+	addToBreakdown(&b, "some_future_kind", 40)
+
+	if b.Other != 40 {
+		t.Errorf("Other = %d, want 40: an unrecognised kind must be kept, not dropped", b.Other)
+	}
+	if b.Total() != 140 {
+		t.Errorf("Total = %d, want 140", b.Total())
+	}
+}
+
+// TestMemoryBreakdownHostMatchesMemorySize checks the one place the breakdown needs a
+// correction. With mmap, a CPU_Mapped model buffer is the file-offset span of the tensors
+// left on the host, and on partial offload that span re-counts weights already held on a
+// device. MemorySize trims that overlap out of its total; the host breakdown has to trim
+// the same amount, or the two disagree about the same load.
+func TestMemoryBreakdownHostMatchesMemorySize(t *testing.T) {
+	// A model file smaller than the sum of the buffers claiming to mirror it is exactly
+	// the overlap this trims.
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "model.gguf")
+	if err := os.WriteFile(modelPath, make([]byte, 1500*1024*1024), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	runner := &llamaServerRunner{
+		modelPath:            modelPath,
+		vramByDevice:         make(map[string]uint64),
+		memBreakdownByDevice: make(map[string]api.MemoryBreakdown),
+		totalLayers:          32,
+		gpuLayers:            20, // partial offload, so nothing collapses
+	}
+	w := &memoryParsingWriter{inner: io.Discard, runner: runner}
+	for _, line := range []string{
+		"load_tensors:        CUDA0 model buffer size =  1000.00 MiB\n",
+		"load_tensors:   CPU_Mapped model buffer size =  1400.00 MiB\n",
+		"llama_kv_cache:      CUDA0 KV buffer size =   400.00 MiB\n",
+		"sched_reserve:      CUDA0 compute buffer size =   100.00 MiB\n",
+	} {
+		w.Write([]byte(line))
+	}
+
+	total, gpuTotal := runner.MemorySize()
+	vram, host := runner.MemoryBreakdownTotals()
+
+	if vram.Total() != int64(gpuTotal) {
+		t.Errorf("vram breakdown totals %d, want size_vram %d", vram.Total(), gpuTotal)
+	}
+	if got := vram.Total() + host.Total(); got != int64(total) {
+		t.Errorf("vram+host = %d but MemorySize total = %d: the breakdown and the total "+
+			"disagree about the same load", got, total)
+	}
+}

@@ -2297,17 +2297,20 @@ func (s *Server) PsHandler(c *gin.Context) {
 // client that could not see something the server was already reporting.
 func (s *Server) eventFrame(ev api.ModelEvent, started time.Time) api.EventFrame {
 	f := api.EventFrame{
-		Kind:       ev.Type,
-		Model:      ev.Model,
-		Reason:     ev.Reason,
-		DurationMs: ev.DurationMs,
-		WeightsMs:  ev.WeightsMs,
-		ContextMs:  ev.ContextMs,
-		SizeVRAM:   ev.SizeVRAM,
-		SizeTotal:  ev.SizeTotal,
-		Estimate:   ev.Estimate,
-		Dropped:    ev.Dropped,
-		T:          ev.At.Sub(started).Milliseconds(),
+		Kind:          ev.Type,
+		Model:         ev.Model,
+		Reason:        ev.Reason,
+		DurationMs:    ev.DurationMs,
+		WeightsMs:     ev.WeightsMs,
+		ContextMs:     ev.ContextMs,
+		SizeVRAM:      ev.SizeVRAM,
+		SizeTotal:     ev.SizeTotal,
+		Memory:        ev.Memory,
+		MemoryHost:    ev.MemoryHost,
+		WeightsOnDisk: ev.WeightsOnDisk,
+		Estimate:      ev.Estimate,
+		Dropped:       ev.Dropped,
+		T:             ev.At.Sub(started).Milliseconds(),
 	}
 	// Bodies come from the event where it carried them -- a sample measured them at its
 	// own instant, and re-reading here would report a later moment under an earlier
@@ -2352,14 +2355,21 @@ func (s *Server) processResponse() *api.ProcessResponse {
 
 		gpus := make([]api.ProcessGPU, 0, len(v.gpus))
 		for _, dev := range v.gpus {
-			gpus = append(gpus, api.ProcessGPU{
+			g := api.ProcessGPU{
 				ID:       dev.ID,
 				Runner:   dev.Library,
 				SizeVRAM: int64(v.vramByGPU[dev]),
-			})
+			}
+			// Absent rather than zeroed when the runner could not split the figure: a
+			// client reads absence as "not reported", where an all-zero breakdown beside
+			// a non-zero size_vram reads as a contradiction.
+			if b, ok := v.memByGPU[dev]; ok && b.Total() > 0 {
+				g.Memory = &b
+			}
+			gpus = append(gpus, g)
 		}
 
-		models = append(models, api.ProcessModelResponse{
+		row := api.ProcessModelResponse{
 			GPUs:          gpus,
 			Model:         displayName,
 			Name:          displayName,
@@ -2370,7 +2380,13 @@ func (s *Server) processResponse() *api.ProcessResponse {
 			ExpiresAt:     v.expiresAt,
 			Busy:          v.busy,
 			ContextLength: v.contextLength,
-		})
+			WeightsOnDisk: v.weightsOnDisk,
+		}
+		if v.memVRAM.Total() > 0 {
+			breakdown := v.memVRAM
+			row.Memory = &breakdown
+		}
+		models = append(models, row)
 	}
 
 	slices.SortStableFunc(models, func(i, j api.ProcessModelResponse) int {

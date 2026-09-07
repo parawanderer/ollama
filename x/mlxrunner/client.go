@@ -507,6 +507,30 @@ func (c *Client) VRAMByGPU(id ml.DeviceID) uint64 {
 	return c.currentMemory()
 }
 
+// MemoryBreakdownTotals implements llm.LlamaServer.
+//
+// The MLX runner reports one total and does not name what its allocations are for, so
+// there is nothing to split. An empty breakdown is returned rather than filing the whole
+// figure under Weights: a client reads absent as "this runner cannot say", where a
+// confident wrong attribution would read as fact.
+func (c *Client) MemoryBreakdownTotals() (vram, host api.MemoryBreakdown) {
+	return api.MemoryBreakdown{}, api.MemoryBreakdown{}
+}
+
+// MemoryBreakdownByGPU implements llm.LlamaServer. See MemoryBreakdownTotals.
+func (c *Client) MemoryBreakdownByGPU(id ml.DeviceID) api.MemoryBreakdown {
+	return api.MemoryBreakdown{}
+}
+
+// WeightsOnDisk implements llm.LlamaServer.
+func (c *Client) WeightsOnDisk() int64 {
+	info, err := os.Stat(c.ModelPath())
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
 var _ llm.LlamaServer = (*Client)(nil)
 
 // setEnv sets or replaces an environment variable in cmd.Env.

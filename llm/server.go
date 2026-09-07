@@ -70,6 +70,21 @@ type LlamaServer interface {
 	Close() error
 	MemorySize() (total, vram uint64)
 
+	// MemoryBreakdownTotals splits what the load holds by what the memory is for rather
+	// than by where it sits: vram sums to MemorySize's vram, host to the rest of its
+	// total. The engine names the kind of every buffer it allocates, so this is the same
+	// parse that produces the totals, kept instead of summed away.
+	MemoryBreakdownTotals() (vram, host api.MemoryBreakdown)
+
+	// MemoryBreakdownByGPU splits one device's VRAM the same way; its fields sum to
+	// VRAMByGPU for that device.
+	MemoryBreakdownByGPU(id ml.DeviceID) api.MemoryBreakdown
+
+	// WeightsOnDisk is the size of the files the model was loaded from. Reported beside
+	// the breakdown rather than within it: it is not resident memory, and including it
+	// would break the invariant that a breakdown's fields sum to the figure beside them.
+	WeightsOnDisk() int64
+
 	// SetOnWeightsLoaded registers a callback fired when the model's weights reach device
 	// memory, which happens partway through a load rather than at its end. It is passed
 	// the moment the weights arrived, which may predate the call itself, and how much

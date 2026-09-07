@@ -116,6 +116,7 @@ type fakeRunner struct {
 	memHost       api.MemoryBreakdown
 	memByGPU      map[ml.DeviceID]api.MemoryBreakdown
 	weightsOnDisk int64
+	placement     *api.ModelPlacement
 }
 
 func (f *fakeRunner) MemorySize() (uint64, uint64)    { return f.total, f.gpuTotal }
@@ -131,6 +132,8 @@ func (f *fakeRunner) MemoryBreakdownByGPU(id ml.DeviceID) api.MemoryBreakdown {
 }
 
 func (f *fakeRunner) WeightsOnDisk() int64 { return f.weightsOnDisk }
+
+func (f *fakeRunner) LayerPlacement() *api.ModelPlacement { return f.placement }
 
 // The split is reported per device and in aggregate, and both sum to the size_vram they
 // sit beside. That property is the whole reason a client can trust the breakdown: a UI

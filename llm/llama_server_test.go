@@ -4240,3 +4240,107 @@ func TestMemoryBreakdownHostMatchesMemorySize(t *testing.T) {
 			"disagree about the same load", got, total)
 	}
 }
+
+// TestLayerPlacementBuildsRuns pins how the per-layer assignment is turned into ranges.
+//
+// The interesting case is the last one. In practice llama.cpp gives each device one
+// unbroken run -- it assigns by upper_bound over a cumulative split -- so it is tempting to
+// report each device's lowest and highest layer as its span. That would turn an
+// interleaved assignment into a pair of overlapping ranges that both claim layers they do
+// not hold, and it would look perfectly reasonable. Scanning for runs cannot do that.
+func TestLayerPlacementBuildsRuns(t *testing.T) {
+	tests := []struct {
+		name  string
+		lines []string
+		want  api.ModelPlacement
+	}{
+		{
+			name: "two devices, contiguous",
+			lines: []string{
+				"load_tensors: layer   0 assigned to device CUDA0, is_swa = 0\n",
+				"load_tensors: layer   1 assigned to device CUDA0, is_swa = 0\n",
+				"load_tensors: layer   2 assigned to device CUDA1, is_swa = 0\n",
+			},
+			want: api.ModelPlacement{NumLayers: 3, Devices: []api.PlacementRange{
+				{Device: "CUDA0", FirstLayer: 0, LastLayer: 1, Layers: 2},
+				{Device: "CUDA1", FirstLayer: 2, LastLayer: 2, Layers: 1},
+			}},
+		},
+		{
+			// gemma2 alternates 1:1; the pattern is the point, so it is reported per
+			// layer rather than as a count.
+			name: "sliding-window layers are listed",
+			lines: []string{
+				"load_tensors: layer   0 assigned to device CUDA0, is_swa = 1\n",
+				"load_tensors: layer   1 assigned to device CUDA0, is_swa = 0\n",
+				"load_tensors: layer   2 assigned to device CUDA0, is_swa = 1\n",
+			},
+			want: api.ModelPlacement{NumLayers: 3, SWALayers: []int{0, 2},
+				Devices: []api.PlacementRange{
+					{Device: "CUDA0", FirstLayer: 0, LastLayer: 2, Layers: 3},
+				}},
+		},
+		{
+			// The guard that a run only extends across *consecutive* layers. If a layer
+			// line is missing -- a dropped chunk, a future log change -- merging on the
+			// device name alone would silently claim the absent layer as held. This is
+			// the case the interleaved test below does NOT cover, because there the
+			// previous entry is always a different device.
+			name: "a gap does not extend a run",
+			lines: []string{
+				"load_tensors: layer   0 assigned to device CUDA0, is_swa = 0\n",
+				"load_tensors: layer   1 assigned to device CUDA0, is_swa = 0\n",
+				"load_tensors: layer   3 assigned to device CUDA0, is_swa = 0\n",
+			},
+			want: api.ModelPlacement{NumLayers: 3, Devices: []api.PlacementRange{
+				{Device: "CUDA0", FirstLayer: 0, LastLayer: 1, Layers: 2},
+				{Device: "CUDA0", FirstLayer: 3, LastLayer: 3, Layers: 1},
+			}},
+		},
+		{
+			name: "interleaved is reported as the runs it is, not one span per device",
+			lines: []string{
+				"load_tensors: layer   0 assigned to device CUDA0, is_swa = 0\n",
+				"load_tensors: layer   1 assigned to device CUDA1, is_swa = 0\n",
+				"load_tensors: layer   2 assigned to device CUDA0, is_swa = 0\n",
+			},
+			want: api.ModelPlacement{NumLayers: 3, Devices: []api.PlacementRange{
+				{Device: "CUDA0", FirstLayer: 0, LastLayer: 0, Layers: 1},
+				{Device: "CUDA1", FirstLayer: 1, LastLayer: 1, Layers: 1},
+				{Device: "CUDA0", FirstLayer: 2, LastLayer: 2, Layers: 1},
+			}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &llamaServerRunner{
+				vramByDevice:         make(map[string]uint64),
+				memBreakdownByDevice: make(map[string]api.MemoryBreakdown),
+				layerDevice:          make(map[int]string),
+				layerSWA:             make(map[int]bool),
+			}
+			w := &memoryParsingWriter{inner: io.Discard, runner: runner}
+			for _, line := range tt.lines {
+				w.Write([]byte(line))
+			}
+			got := runner.LayerPlacement()
+			if got == nil {
+				t.Fatal("no placement reported")
+			}
+			if !reflect.DeepEqual(*got, tt.want) {
+				t.Errorf("placement =\n  %+v\nwant\n  %+v", *got, tt.want)
+			}
+		})
+	}
+}
+
+// TestLayerPlacementAbsentWhenNotCollected: nil means "not reported", which is different
+// from a model that ran entirely on one device. A caller must be able to tell them apart,
+// so an empty map returns nil rather than an empty placement.
+func TestLayerPlacementAbsentWhenNotCollected(t *testing.T) {
+	runner := &llamaServerRunner{layerDevice: make(map[int]string), layerSWA: make(map[int]bool)}
+	if got := runner.LayerPlacement(); got != nil {
+		t.Errorf("placement = %+v, want nil when nothing was parsed", got)
+	}
+}

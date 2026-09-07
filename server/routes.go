@@ -2308,6 +2308,7 @@ func (s *Server) eventFrame(ev api.ModelEvent, started time.Time) api.EventFrame
 		Memory:        ev.Memory,
 		MemoryHost:    ev.MemoryHost,
 		WeightsOnDisk: ev.WeightsOnDisk,
+		Placement:     ev.Placement,
 		Estimate:      ev.Estimate,
 		Dropped:       ev.Dropped,
 		T:             ev.At.Sub(started).Milliseconds(),
@@ -2381,6 +2382,7 @@ func (s *Server) processResponse() *api.ProcessResponse {
 			Busy:          v.busy,
 			ContextLength: v.contextLength,
 			WeightsOnDisk: v.weightsOnDisk,
+			Placement:     v.placement,
 		}
 		if v.memVRAM.Total() > 0 {
 			breakdown := v.memVRAM

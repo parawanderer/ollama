@@ -1403,6 +1403,7 @@ iGPUScan:
 			}
 		}
 		complete.WeightsOnDisk = llama.WeightsOnDisk()
+		complete.Placement = llama.LayerPlacement()
 		if !runner.weightsLoaded.IsZero() && !runner.loadStarted.IsZero() {
 			complete.WeightsMs = runner.weightsLoaded.Sub(runner.loadStarted).Milliseconds()
 			complete.ContextMs = complete.DurationMs - complete.WeightsMs
@@ -2459,6 +2460,7 @@ type loadedModel struct {
 	memVRAM       api.MemoryBreakdown
 	memByGPU      map[ml.DeviceID]api.MemoryBreakdown
 	weightsOnDisk int64
+	placement     *api.ModelPlacement
 }
 
 // loadedModels returns a snapshot of the currently loaded models for status
@@ -2545,6 +2547,7 @@ func (r *runnerRef) reportLocked() loadedModel {
 		}
 		lm.memVRAM, _ = r.llama.MemoryBreakdownTotals()
 		lm.weightsOnDisk = r.llama.WeightsOnDisk()
+		lm.placement = r.llama.LayerPlacement()
 	}
 	// The scheduler waits to set expiresAt, so a model that is still loading may have the
 	// zero value. Estimate expiration from the session duration instead.

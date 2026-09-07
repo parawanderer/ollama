@@ -876,6 +876,10 @@ type ProcessModelResponse struct {
 	// padded and a partial offload leaves some of the file on the host.
 	WeightsOnDisk int64 `json:"weights_on_disk,omitempty"`
 
+	// Placement says which layers landed on which device. Absent unless the server was
+	// started with OLLAMA_LAYER_PLACEMENT.
+	Placement *ModelPlacement `json:"placement,omitempty"`
+
 	// GPUs lists the devices this model was placed on, with per-device VRAM,
 	// in the same terms /api/info reports them. Empty when the model is
 	// running on the CPU.
@@ -885,6 +889,45 @@ type ProcessModelResponse struct {
 // ProcessGPU reports one device a loaded model occupies and how much VRAM it
 // uses there. The id/runner pair matches GPUInfo's, since an id is only unique
 // within its runner.
+// ModelPlacement says which part of a model went where, for a load split across devices.
+//
+// A memory breakdown says how much each device holds; this says *what* it holds. They
+// answer different questions and disagree in a way that is correct: on a model split
+// evenly, one card can hold more layers and less memory, because the output layer is large
+// and carries no KV cache. Do not present layer counts as a proxy for bytes.
+//
+// Absent unless the server was started with OLLAMA_LAYER_PLACEMENT -- the engine states the
+// assignment only in its log, at a level that also emits a line per tensor.
+type ModelPlacement struct {
+	// NumLayers counts every layer the engine assigned, including the output layer.
+	NumLayers int `json:"num_layers"`
+
+	// Devices are the runs of consecutive layers, in layer order.
+	//
+	// llama.cpp assigns layers by upper_bound over a cumulative split of the per-device
+	// shares, so in practice each device gets one unbroken run and this holds one entry
+	// per device. It is built by scanning for runs rather than by taking each device's
+	// first and last layer, so an assignment that was *not* contiguous would show as
+	// several entries instead of being silently misreported as one span.
+	Devices []PlacementRange `json:"devices"`
+
+	// SWALayers are the layers using sliding-window attention, from the engine's own
+	// hparams.is_swa. Omitted when the architecture has none. It is a list rather than a
+	// count because the pattern matters and is not always regular -- gemma2 alternates
+	// 1:1, command-r7b runs three sliding layers to each full one.
+	SWALayers []int `json:"swa_layers,omitempty"`
+}
+
+// PlacementRange is one unbroken run of layers on one device.
+type PlacementRange struct {
+	// Device is the engine's name for it ("CUDA0"), which matches the keys used in the
+	// per-device memory breakdown. It is not the ollama device id.
+	Device     string `json:"device"`
+	FirstLayer int    `json:"first_layer"`
+	LastLayer  int    `json:"last_layer"`
+	Layers     int    `json:"layers"`
+}
+
 // MemoryBreakdown splits what a load holds by what the memory is *for*, rather than by
 // which device it sits on. Every field is bytes.
 //
@@ -1559,6 +1602,10 @@ type EventFrame struct {
 	// padded and a partial offload leaves some of the file on the host.
 	WeightsOnDisk int64 `json:"weights_on_disk,omitempty"`
 
+	// Placement says which layers landed on which device. Absent unless the server was
+	// started with OLLAMA_LAYER_PLACEMENT.
+	Placement *ModelPlacement `json:"placement,omitempty"`
+
 	// Estimate is the placement decision this load was made from, on an estimate frame.
 	// It is emitted before load.start, because the decision is what selects the devices the
 	// load then runs on.
@@ -1682,6 +1729,10 @@ type ModelEvent struct {
 	// over the file itself; the two are close but never equal, because the device copy is
 	// padded and a partial offload leaves some of the file on the host.
 	WeightsOnDisk int64 `json:"weights_on_disk,omitempty"`
+
+	// Placement says which layers landed on which device. Absent unless the server was
+	// started with OLLAMA_LAYER_PLACEMENT.
+	Placement *ModelPlacement `json:"placement,omitempty"`
 
 	// Reason carries why an eviction or failure happened, where one is known.
 	Reason string `json:"reason,omitempty"`

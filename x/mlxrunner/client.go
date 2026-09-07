@@ -531,6 +531,10 @@ func (c *Client) WeightsOnDisk() int64 {
 	return info.Size()
 }
 
+// LayerPlacement implements llm.LlamaServer. The MLX runner does not report a per-layer
+// device assignment, and nil says so rather than claiming everything is on one device.
+func (c *Client) LayerPlacement() *api.ModelPlacement { return nil }
+
 var _ llm.LlamaServer = (*Client)(nil)
 
 // setEnv sets or replaces an environment variable in cmd.Env.

@@ -156,11 +156,19 @@ func TestEventFrameCopiesEveryCommonField(t *testing.T) {
 		},
 		MemoryHost:    &api.MemoryBreakdown{Weights: 2 << 30},
 		WeightsOnDisk: 69 << 30,
-		Estimate:      &api.LoadEstimate{Predicted: 86 << 30, Source: "probe"},
-		Dropped:       3,
-		ExpiresAt:     &expires,
-		PS:            &api.ProcessResponse{},
-		Info:          &api.InfoResponse{},
+		Placement: &api.ModelPlacement{
+			NumLayers: 4,
+			Devices: []api.PlacementRange{
+				{Device: "CUDA0", FirstLayer: 0, LastLayer: 1, Layers: 2},
+				{Device: "CUDA1", FirstLayer: 2, LastLayer: 3, Layers: 2},
+			},
+			SWALayers: []int{1, 3},
+		},
+		Estimate:  &api.LoadEstimate{Predicted: 86 << 30, Source: "probe"},
+		Dropped:   3,
+		ExpiresAt: &expires,
+		PS:        &api.ProcessResponse{},
+		Info:      &api.InfoResponse{},
 	}
 
 	frame := (&Server{}).eventFrame(ev, at)

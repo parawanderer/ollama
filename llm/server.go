@@ -85,6 +85,10 @@ type LlamaServer interface {
 	// would break the invariant that a breakdown's fields sum to the figure beside them.
 	WeightsOnDisk() int64
 
+	// LayerPlacement reports which device each layer landed on, or nil when the runner
+	// was not asked to collect it (see envconfig.LayerPlacement).
+	LayerPlacement() *api.ModelPlacement
+
 	// SetOnWeightsLoaded registers a callback fired when the model's weights reach device
 	// memory, which happens partway through a load rather than at its end. It is passed
 	// the moment the weights arrived, which may predate the call itself, and how much

@@ -316,6 +316,18 @@ var SingleGPUFitPercent = Uint("OLLAMA_SINGLE_GPU_FIT_PERCENT", 80)
 // happens to be right.
 var NoArchEstimate = Bool("OLLAMA_NO_ARCH_ESTIMATE")
 
+// LayerPlacement reports which device each of a model's layers landed on, and which layers
+// are sliding-window, on /api/ps and load.complete.
+//
+// It is opt-in because of what it costs, not because it is experimental. The engine states
+// the assignment in its log (`load_tensors: layer N assigned to device X, is_swa = B`) and
+// nowhere else -- /props, /slots and /metrics carry no device or layer topology, all
+// checked -- and those lines are LLAMA_LOG_DEBUG, which is a level the runner is otherwise
+// not run at. Raising it emits roughly one `create_tensor` line per tensor as well: 1284 of
+// the 1399 extra lines on a 41-layer model, and it scales with tensor count. That is a lot
+// of log to carry for a display feature, so it is asked for rather than assumed.
+var LayerPlacement = Bool("OLLAMA_LAYER_PLACEMENT")
+
 type EnvVar struct {
 	Name        string
 	Value       any
@@ -332,6 +344,7 @@ func AsMap() map[string]EnvVar {
 		"OLLAMA_GPU_OVERHEAD":           {"OLLAMA_GPU_OVERHEAD", GpuOverhead(), "Reserve a portion of VRAM per GPU (bytes)"},
 		"OLLAMA_SINGLE_GPU_FIT_PERCENT": {"OLLAMA_SINGLE_GPU_FIT_PERCENT", SingleGPUFitPercent(), "Max % of one GPU's free VRAM a model may use and still be packed onto a single GPU (default 80)"},
 		"OLLAMA_NO_ARCH_ESTIMATE":       {"OLLAMA_NO_ARCH_ESTIMATE", NoArchEstimate(), "Drop per-architecture KV arithmetic from the VRAM prior and measure instead (test switch)"},
+		"OLLAMA_LAYER_PLACEMENT":        {"OLLAMA_LAYER_PLACEMENT", LayerPlacement(), "Report per-layer device placement and sliding-window layers (costs ~1 log line per tensor)"},
 		"OLLAMA_IGPU_ENABLE":            {"OLLAMA_IGPU_ENABLE", String("OLLAMA_IGPU_ENABLE")(), "Enable integrated GPUs"},
 		"LLAMA_ARG_FIT":                 {"LLAMA_ARG_FIT", String("LLAMA_ARG_FIT")(), "Enable llama.cpp automatic fit of unset memory options (default \"on\")"},
 		"LLAMA_ARG_FIT_TARGET":          {"LLAMA_ARG_FIT_TARGET", String("LLAMA_ARG_FIT_TARGET")(), "Target free VRAM margin per device for llama.cpp fit (MiB)"},

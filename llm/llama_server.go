@@ -139,11 +139,18 @@ type llamaServerRunner struct {
 	memVRAMBreakdown     api.MemoryBreakdown
 	memHostBreakdown     api.MemoryBreakdown
 	memBreakdownByDevice map[string]api.MemoryBreakdown
-	gpuLayers            uint64 // model layers loaded on GPU, parsed from llama-server logs
-	gpuLayerOverflow     int    // number of GPU-selected layers partially overflowed to CPU
-	status               *StatusWriter
-	options              api.Options
-	modelPath            string
+
+	// layerDevice is the device each layer landed on and layerSWA which layers are
+	// sliding-window, indexed by layer. Empty unless envconfig.LayerPlacement is set,
+	// because the lines that fill it are only emitted at a log level the runner is
+	// otherwise not run at.
+	layerDevice      map[int]string
+	layerSWA         map[int]bool
+	gpuLayers        uint64 // model layers loaded on GPU, parsed from llama-server logs
+	gpuLayerOverflow int    // number of GPU-selected layers partially overflowed to CPU
+	status           *StatusWriter
+	options          api.Options
+	modelPath        string
 	// mediaMarker must match the LLAMA_MEDIA_MARKER value passed to llama-server.
 	// llama.cpp randomizes this by default; Ollama renders stable [img-N] markers
 	// and rewrites them before forwarding the request.
@@ -606,7 +613,7 @@ func embeddingBatchSize(opts api.Options, numParallel int) int {
 func appendLlamaServerLogArgs(params []string) []string {
 	// Keep startup memory/offload lines visible for scheduler accounting.
 	return append(params,
-		"--log-verbosity", "4",
+		"--log-verbosity", logVerbosity(),
 		"--no-log-prefix",
 		"--no-log-timestamps",
 	)
@@ -1013,6 +1020,8 @@ func NewLlamaServerRunner(
 		mediaMarker:          mediaMarker,
 		vramByDevice:         make(map[string]uint64),
 		memBreakdownByDevice: make(map[string]api.MemoryBreakdown),
+		layerDevice:          make(map[int]string),
+		layerSWA:             make(map[int]bool),
 		systemFreeAtLoad:     make(map[string]uint64),
 		gpus:                 gpus,
 		deviceLogNames:       ml.RunnerDeviceNames(gpus),
@@ -1188,6 +1197,12 @@ func (s *llamaServerRunner) resetLoadAccounting() {
 	s.memHostBreakdown = api.MemoryBreakdown{}
 	for k := range s.memBreakdownByDevice {
 		delete(s.memBreakdownByDevice, k)
+	}
+	for k := range s.layerDevice {
+		delete(s.layerDevice, k)
+	}
+	for k := range s.layerSWA {
+		delete(s.layerSWA, k)
 	}
 	s.gpuLayers = 0
 	s.gpuLayerOverflow = 0
@@ -2754,6 +2769,43 @@ func (s *llamaServerRunner) MemoryBreakdownTotals() (vram, host api.MemoryBreakd
 	return vram, host
 }
 
+// LayerPlacement reports which device each layer landed on and which layers are
+// sliding-window, or nil when the runner was not asked to collect it.
+//
+// The device runs are built by scanning consecutive layers rather than by taking each
+// device's lowest and highest, so a non-contiguous assignment is reported as the several
+// runs it is instead of being flattened into one span that never existed.
+func (s *llamaServerRunner) LayerPlacement() *api.ModelPlacement {
+	s.memoryMu.RLock()
+	defer s.memoryMu.RUnlock()
+
+	if len(s.layerDevice) == 0 {
+		return nil
+	}
+	layers := make([]int, 0, len(s.layerDevice))
+	for l := range s.layerDevice {
+		layers = append(layers, l)
+	}
+	slices.Sort(layers)
+
+	out := &api.ModelPlacement{NumLayers: len(layers)}
+	for _, l := range layers {
+		dev := s.layerDevice[l]
+		if n := len(out.Devices); n > 0 && out.Devices[n-1].Device == dev && out.Devices[n-1].LastLayer == l-1 {
+			out.Devices[n-1].LastLayer = l
+			out.Devices[n-1].Layers++
+		} else {
+			out.Devices = append(out.Devices, api.PlacementRange{
+				Device: dev, FirstLayer: l, LastLayer: l, Layers: 1,
+			})
+		}
+		if s.layerSWA[l] {
+			out.SWALayers = append(out.SWALayers, l)
+		}
+	}
+	return out
+}
+
 // WeightsOnDisk is the size of the files this model was loaded from -- the quantized
 // blob, plus a projector where one is configured.
 //
@@ -3022,6 +3074,28 @@ type memoryBuffer struct {
 //	using device ROCm0 (AMD Radeon RX 6800) (0000:06:00.0) - 16196 MiB free
 var deviceFreeRegex = regexp.MustCompile(`using device (\S+)\s+\(.*\)\s+-\s+(\d+)\s+MiB free`)
 
+// logVerbosity is the level the runner is asked to log at.
+//
+// 4 is the working default. 5 additionally emits the per-layer device assignment, which is
+// the only place the engine states it -- and roughly one `create_tensor` line per tensor
+// alongside, which is why it is not the default. See envconfig.LayerPlacement.
+func logVerbosity() string {
+	if envconfig.LayerPlacement() {
+		return "5"
+	}
+	return "4"
+}
+
+// layerAssignedRegex captures the engine's own statement of where each layer went, and
+// whether that layer uses sliding-window attention:
+//
+//	load_tensors: layer  21 assigned to device CUDA1, is_swa = 0
+//
+// is_swa comes from hparams.is_swa(il), so it is authoritative about a pattern that
+// metadata markers only approximate -- gemma2 alternates 1:1, command-r7b runs 3:1.
+var layerAssignedRegex = regexp.MustCompile(
+	`load_tensors: layer\s+(\d+) assigned to device (\S+?), is_swa = ([01])`)
+
 // bufferSizeRegex matches llama-server buffer size lines and captures the
 // component so repeated fit/probe values can be replaced by the final load.
 var bufferSizeRegex = regexp.MustCompile(`(?m)(?:^|\n)[^\n:]*?([A-Za-z_][A-Za-z0-9_]*):\s+(\S+)\s+(model|KV|compute|output|RS)\s+buffer size\s*=\s*([\d.]+)\s*MiB`)
@@ -3121,6 +3195,18 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
 					w.mmprojBytes = uint64(mib * 1024 * 1024)
 					w.noteProjectorLocked()
 				}
+			}
+			for _, match := range layerAssignedRegex.FindAllSubmatch(b, -1) {
+				layer, err := strconv.Atoi(string(match[1]))
+				if err != nil {
+					continue
+				}
+				if w.runner.layerDevice == nil {
+					w.runner.layerDevice = make(map[int]string)
+					w.runner.layerSWA = make(map[int]bool)
+				}
+				w.runner.layerDevice[layer] = string(match[2])
+				w.runner.layerSWA[layer] = string(match[3]) == "1"
 			}
 			for _, match := range bufferSizeRegex.FindAllSubmatch(b, -1) {
 				backendName := string(match[2])

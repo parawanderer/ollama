@@ -2073,6 +2073,7 @@ type mockLlm struct {
 	memHost       api.MemoryBreakdown
 	memByGPU      map[ml.DeviceID]api.MemoryBreakdown
 	weightsOnDisk int64
+	placement     *api.ModelPlacement
 
 	modelPath         string
 	pingResp          error
@@ -2165,7 +2166,9 @@ func (s *mockLlm) MemoryBreakdownByGPU(id ml.DeviceID) api.MemoryBreakdown {
 	return s.memByGPU[id]
 }
 
-func (s *mockLlm) WeightsOnDisk() int64                               { return s.weightsOnDisk }
+func (s *mockLlm) WeightsOnDisk() int64 { return s.weightsOnDisk }
+
+func (s *mockLlm) LayerPlacement() *api.ModelPlacement                { return s.placement }
 func (s *mockLlm) Pid() int                                           { return -1 }
 func (s *mockLlm) GetPort() int                                       { return -1 }
 func (s *mockLlm) GetDeviceInfos(ctx context.Context) []ml.DeviceInfo { return nil }

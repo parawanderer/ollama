@@ -202,14 +202,20 @@ func kvCacheAttentionIsComplete(kv KV, arch string) bool {
 		// per-token figure is 17.63 GiB low over the load -- and low is the direction that
 		// overcommits a device, unlike the sliding-window case, which is high.
 		"attention.kv_lora_rank",
-		// NOTE: full_attention_interval and ssm.* were listed here and have been removed
-		// again. They do describe an architecture this cannot model -- qwen3.8:27b at 128k
-		// predicts 49.01 GiB against 26.35 used -- but the measurement they routed to is
-		// itself wrong for these models, because they carry an MTP draft head whose fit
-		// output the probe cannot yet total (see ErrFitProbeDraftModel). Marking them
-		// incomplete traded a safe over-prediction for an unsafe under-prediction. Restore
-		// this once a draft model's breakdown can be read.
+		// Restored 2026-09-07. These were listed, removed, and are now back: they do
+		// describe an architecture this cannot model, but the measurement they route to
+		// used to be wrong for exactly these models, because they carry an MTP draft head
+		// and the probe could not total a two-model fit output -- it read the draft's
+		// 16635 MiB as the cost of a load that used 26982. Marking them incomplete then
+		// traded a safe over-prediction for an unsafe under-prediction.
 		//
+		// The probe now reads the fit pass's own "projected to use" figure, which accounts
+		// for the shared weights, so a draft model measures correctly: 26823 MiB against
+		// 26985 used. The reason for holding these back is gone.
+		//
+		"full_attention_interval",
+		"ssm.conv_kernel",
+		"ssm.state_size",
 		// A hybrid attention/SSM stack runs attention on only some of its layers and a
 		// recurrent state on the rest, and the recurrent state does not grow with context
 		// at all. full_attention_interval says how sparse the attention is; the per-token

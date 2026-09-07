@@ -428,6 +428,50 @@ func (s *Scheduler) warnIfPredictionIsALowerBound(key llm.CalibrationKey, f *ggm
 // extremes, because the line is fitted, not interpolated.
 var probeContexts = [2]int{8192, 131072}
 
+// probeMinContext is the floor a halved probe point will not go below. Under it the two
+// points sit so close together that the slope is dominated by the 256-token rounding
+// rather than by the model.
+const probeMinContext = 256
+
+// probePoints picks the two contexts to measure at, or reports that no usable pair exists.
+//
+// The ordinary pair brackets normal use. Both are clamped to what the model supports, and
+// on a model whose ceiling is at or below the lower point they clamp onto the *same* value
+// -- two coincident points, no line, and until this the probe simply gave up. That cost
+// about a tenth of the models on this box, and not a random tenth: the short-context models
+// here are disproportionately sliding-window architectures (cohere2, gemma2, gemma3), which
+// is exactly where the metadata fallback is weakest.
+//
+// Nothing about the pair has to be 8192 and 131072 -- any two distinct contexts determine
+// the line. So when the ordinary pair collapses, put the second point *below* the ceiling
+// instead of clamping both onto it. Rounding down to a multiple of 256 keeps the requested
+// and granted contexts equal, since llama.cpp silently rounds a context *up* to a multiple
+// of 256 and a sample must be filed against the context it actually ran at.
+//
+// Models with a normal ceiling keep exactly the contexts they use today, so samples already
+// recorded stay comparable.
+// Takes the model's trained context rather than the model, because it is arithmetic and
+// nothing else -- which is also what makes it testable without building a GGML.
+func probePoints(trainCtx, numParallel int) ([2]int, bool) {
+	contexts := probeContexts
+	for i := range contexts {
+		contexts[i] = effectiveContext(contexts[i], trainCtx) * max(numParallel, 1)
+	}
+	if contexts[0] != contexts[1] {
+		return contexts, true
+	}
+
+	ceiling := contexts[1]
+	lower := (ceiling / 2 / 256) * 256
+	if lower < probeMinContext || lower >= ceiling {
+		// A ceiling too small to split. Rare, and the metadata estimate is at its most
+		// accurate here anyway: at 256 tokens the KV cache is a rounding error beside
+		// the weights, so what it gets wrong barely matters.
+		return contexts, false
+	}
+	return [2]int{lower, ceiling}, true
+}
+
 // probeCalibration measures a model at two context lengths without loading it, for the
 // case where nothing else can answer: an architecture whose metadata does not describe
 // everything it allocates, and which has never been loaded here.
@@ -454,13 +498,9 @@ func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey
 	}
 
 	// Probing at one context tells us nothing a metadata estimate does not: the point is
-	// the slope, and a slope needs two points. A model whose maximum context cannot
-	// accommodate both is left to the estimate.
-	contexts := probeContexts
-	for i := range contexts {
-		contexts[i] = effectiveLlamaServerContext(contexts[i], f, numParallel)
-	}
-	if contexts[0] == contexts[1] {
+	// the slope, and a slope needs two points.
+	contexts, ok := probePoints(modelTrainContext(f), numParallel)
+	if !ok {
 		return false
 	}
 

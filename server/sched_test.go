@@ -2375,3 +2375,43 @@ func TestReportLockedSeedsTheSnapshot(t *testing.T) {
 		t.Errorf("snapshot size_vram = %d, want %d", snapshot.sizeVRAM, int64(42<<30))
 	}
 }
+
+// TestProbePoints pins the pair of contexts the probe measures at.
+//
+// The case that matters is a ceiling at or below the lower point. Both points clamp onto
+// it, the two coincide, and before this the probe gave up -- on about a tenth of the models
+// on this box, skewed toward the sliding-window architectures whose metadata fallback is
+// weakest. Any two distinct contexts determine the line, so the second point moves below
+// the ceiling instead.
+func TestProbePoints(t *testing.T) {
+	tests := []struct {
+		name   string
+		maxCtx uint32
+		want   [2]int
+		wantOK bool
+	}{
+		{name: "ordinary ceiling keeps the usual pair", maxCtx: 262144, want: [2]int{8192, 131072}, wantOK: true},
+		{name: "ceiling between the points clamps the upper", maxCtx: 32768, want: [2]int{8192, 32768}, wantOK: true},
+		{name: "ceiling at the lower point halves instead of collapsing", maxCtx: 8192, want: [2]int{4096, 8192}, wantOK: true},
+		{name: "short ceiling still yields a pair", maxCtx: 4096, want: [2]int{2048, 4096}, wantOK: true},
+		{name: "very short ceiling still yields a pair", maxCtx: 512, want: [2]int{256, 512}, wantOK: true},
+		// Below this the two points sit close enough that the 256-token rounding, not the
+		// model, would set the slope.
+		{name: "ceiling too small to split is declined", maxCtx: 256, wantOK: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := probePoints(int(tt.maxCtx), 1)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v (got %v)", ok, tt.wantOK, got)
+			}
+			if ok && got != tt.want {
+				t.Errorf("contexts = %v, want %v", got, tt.want)
+			}
+			if ok && got[0] == got[1] {
+				t.Errorf("contexts %v coincide, so there is no line to fit", got)
+			}
+		})
+	}
+}

@@ -34,6 +34,11 @@ const fitProbeTooSmallLog = `0.00.645.129 I common_memory_breakdown_print: |   -
 0.01.179.394 I common_params_fit_impl: filling dense-only layers back-to-front:
 `
 
+// The expected total is the pass's own "projected to use" figure, which is 1 MiB above
+// the sum of the per-device rows (40771 + 38398 = 79169). The difference is the engine
+// rounding once rather than once per row, and its figure is the authoritative one -- it is
+// also the only figure that is correct when the pass describes more than one model, which
+// is why it is read instead of the rows.
 func TestScanFitBreakdownSumsDevices(t *testing.T) {
 	total, clean := scanFitBreakdown(strings.NewReader(fitProbeCleanLog), false)
 	if !clean {
@@ -41,7 +46,7 @@ func TestScanFitBreakdownSumsDevices(t *testing.T) {
 	}
 	// 40771 + 38398 MiB. The Host row is excluded: it is the mmap'd view of the weights,
 	// whose span overlaps the device copy, so adding it would count the model file twice.
-	if want := uint64(79169) * mib; total != want {
+	if want := uint64(79170) * mib; total != want {
 		t.Errorf("total = %d MiB, want %d MiB", total/mib, want/mib)
 	}
 }
@@ -158,7 +163,40 @@ func TestScanFitBreakdownCountsTheProjectorAndItsGraph(t *testing.T) {
 // hang every probe until the timeout.
 func TestScanFitBreakdownDoesNotWaitForAProjectorThatIsAbsent(t *testing.T) {
 	total, clean := scanFitBreakdown(strings.NewReader(fitProbeCleanLog), false)
-	if !clean || total != uint64(79169)*mib {
-		t.Errorf("total = %d MiB clean = %v; want 79169 MiB and clean", total/mib, clean)
+	if !clean || total != uint64(79170)*mib {
+		t.Errorf("total = %d MiB clean = %v; want 79170 MiB and clean", total/mib, clean)
+	}
+}
+
+// TestScanFitBreakdownPrefersProjectedOverSummedRows is the draft-model case, which the
+// probe used to refuse outright.
+//
+// The fit pass describes one model per breakdown and they share the weights, so the two
+// figures neither add nor stand alone: on qwen3.8:27b at 128k, main 25279 and draft 16635
+// against a load that used 26982. Taking the larger row-sum reads 25279 -- 1.7 GiB low --
+// and taking the last reads 16635, which is 10 GiB low. The pass itself reports
+// 25279 + 16635 - 15339 = 26575, and that is what this must read.
+//
+// Transcribed from a real probe of qwen3.8:27b, not written from memory.
+const fitProbeDraftLog = `0.00.593 I common_params_fit_impl: getting device memory data for initial parameters:
+0.00.593 I common_memory_breakdown_print: | memory breakdown [MiB]                                 | total    free     self   model   context   compute    unaccounted |
+0.00.593 I common_memory_breakdown_print: |   - CUDA0 (RTX PRO 6000 Blackwell Workstation Edition) | 97249 = 95938 + (25279 = 15339 +    8940 +    1000) +      -23968 |
+0.00.593 I common_memory_breakdown_print: |   - Host                                               |                   1274 =   682 +       0 +     592                |
+0.00.594 I common_memory_breakdown_print: | memory breakdown [MiB]                                 | total    free     self   model   context   compute    unaccounted |
+0.00.594 I common_memory_breakdown_print: |   - CUDA0 (RTX PRO 6000 Blackwell Workstation Edition) | 97249 = 96688 + (16635 = 15339 +     512 +     784) +      -16074 |
+0.00.594 I common_memory_breakdown_print: |   - Host                                               |                   1274 =   682 +       0 +     592                |
+0.00.624 I common_params_fit_impl: projected to use 26575 MiB of device memory vs. 95938 MiB of free device memory
+0.00.624 I common_params_fit_impl: will leave 69362 >= 1048 MiB of free device memory, no changes needed
+`
+
+func TestScanFitBreakdownPrefersProjectedOverSummedRows(t *testing.T) {
+	total, clean := scanFitBreakdown(strings.NewReader(fitProbeDraftLog), false)
+	if !clean {
+		t.Fatal("verdict was clean in the log but not reported as such")
+	}
+	const mib = 1024 * 1024
+	if got := total / mib; got != 26575 {
+		t.Errorf("total = %d MiB, want 26575 MiB (the pass's own figure); "+
+			"25279 means the largest breakdown was summed, 16635 the last one", got)
 	}
 }

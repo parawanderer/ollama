@@ -60,6 +60,19 @@ var (
 	reserveComputeMetaRegex = regexp.MustCompile(`reserve_compute_meta:\s+(\S+)\s+compute buffer size\s+=\s+([0-9.]+)\s+MiB`)
 )
 
+// The fit pass states its own total, and it is the number to read.
+//
+// Summing the breakdown rows is wrong as soon as the pass describes more than one model.
+// A draft-model configuration prints one breakdown per model and they SHARE the weights:
+// on qwen3.8:27b at 128k, main 25279 MiB and draft 16635 both count the same 15339 MiB of
+// model. Neither figure is the answer and they do not add -- but 25279 + 16635 - 15339 =
+// 26575, which is exactly what this line reports. llama.cpp has already done the
+// arithmetic that made a draft model unmeasurable.
+//
+// It is emitted for a single-model probe too, where it equals the sum, so this replaces
+// the summing path rather than special-casing the draft.
+var fitProjectedRegex = regexp.MustCompile(`projected to use\s+(\d+)\s+MiB of device memory`)
+
 var (
 	fitCleanRegex = regexp.MustCompile(`common_params_fit_impl:.*no changes needed`)
 	// Singular and plural both occur -- "cannot meet free memory target of 90000 MiB" on
@@ -84,10 +97,6 @@ const fitProbeTimeout = 30 * time.Second
 // one smaller than the last. A reader that simply takes the final breakdown records about
 // a gigabyte as the cost of a hundred-gigabyte model, and persists it.
 var ErrFitProbeWouldNotFit = errors.New("model does not fit in the memory free right now, so it cannot be measured")
-
-// ErrFitProbeDraftModel reports a load whose fit pass describes more than one model, which
-// this cannot yet total correctly. See ProbeFitVRAM.
-var ErrFitProbeDraftModel = errors.New("a draft model's memory cannot be separated from the main model's in a fit probe")
 
 // ProbeFitVRAM reports what a model would occupy at numCtx, by running llama-server's fit
 // pass and killing it as soon as it has answered. Nothing is loaded and no memory is
@@ -134,16 +143,6 @@ func ProbeFitVRAM(
 	launch, err := newLlamaServerLaunchConfig(gpus, modelPath, f, adapters, projectors, opts, numParallel, kvCacheType, config, newLlamaServerMediaMarker())
 	if err != nil {
 		return 0, err
-	}
-
-	// A draft model makes the fit pass describe two models, one breakdown each, and this
-	// cannot yet tell what their totals mean together: they share the weights, so the
-	// figures do not add, and the draft carries its own small context, so neither is the
-	// answer on its own. Measured on qwen3.8:27b at 128k -- main 25279 MiB, draft 16635,
-	// the load itself 26982. Refusing is the safe reading: the caller falls back to the
-	// metadata estimate, which for these over-predicts, where a wrong probe under-predicts.
-	if launch.draftType != "" {
-		return 0, ErrFitProbeDraftModel
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, fitProbeTimeout)
@@ -211,6 +210,11 @@ func scanFitBreakdown(r io.Reader, hasProjector bool) (total uint64, clean bool)
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
+	// projected is the pass's own total and is preferred over the summed rows whenever it
+	// appears, which is on every configuration seen. The row sum is kept as a fallback so
+	// a log that stops emitting the line degrades to the old behaviour rather than to
+	// nothing.
+	var projected uint64
 	var current, projector, clipCompute uint64
 	var sawRow, verdict, sawClip bool
 	for scanner.Scan() {
@@ -231,7 +235,7 @@ func scanFitBreakdown(r io.Reader, hasProjector bool) (total uint64, clean bool)
 		// which happens after the fit pass has reported. Everything else stops at the
 		// verdict, so this costs about half a second and only for such models.
 		if verdict && (!hasProjector || sawClip) {
-			return total + projector + clipCompute, clean
+			return pick(projected, total) + projector + clipCompute, clean
 		}
 
 		if match := fitBreakdownRegex.FindStringSubmatch(line); match != nil {
@@ -251,20 +255,33 @@ func scanFitBreakdown(r io.Reader, hasProjector bool) (total uint64, clean bool)
 			// draft model's 16635 MiB as the cost of a load that used 26982.
 			total, sawRow = max(total, current), false
 		}
+		if match := fitProjectedRegex.FindStringSubmatch(line); match != nil {
+			if mib, err := strconv.ParseUint(match[1], 10, 64); err == nil {
+				projected = mib * 1024 * 1024
+			}
+		}
 		switch {
 		case fitTooSmallRegex.MatchString(line):
-			return total, false
+			return pick(projected, total), false
 		case fitCleanRegex.MatchString(line):
 			// Not returned here when a projector is configured: the figures that make up a
 			// vision model's total are still to come.
-			verdict, clean = true, total > 0
+			verdict, clean = true, pick(projected, total) > 0
 			if !hasProjector {
-				return total, clean
+				return pick(projected, total), clean
 			}
 		}
 	}
 	if sawRow {
 		total = current
 	}
-	return total + projector + clipCompute, clean && verdict
+	return pick(projected, total) + projector + clipCompute, clean && verdict
+}
+
+// pick prefers the pass's own total and falls back to the summed rows when it is absent.
+func pick(projected, summed uint64) uint64 {
+	if projected > 0 {
+		return projected
+	}
+	return summed
 }

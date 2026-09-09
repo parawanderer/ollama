@@ -2172,12 +2172,14 @@ func (s *mockLlm) WeightsOnDisk() int64 { return s.weightsOnDisk }
 func (s *mockLlm) LayerPlacement() *api.ModelPlacement { return s.placement }
 
 func (s *mockLlm) Activity(ctx context.Context, busy bool) *api.RunnerActivity { return s.activity }
-func (s *mockLlm) Pid() int                                                    { return -1 }
-func (s *mockLlm) GetPort() int                                                { return -1 }
-func (s *mockLlm) GetDeviceInfos(ctx context.Context) []ml.DeviceInfo          { return nil }
-func (s *mockLlm) HasExited() bool                                             { return false }
-func (s *mockLlm) GetActiveDeviceIDs() []ml.DeviceID                           { return nil }
-func (s *mockLlm) ContextLength() int                                          { return s.contextLength }
+
+func (s *mockLlm) SetOnGenerationDone(func(api.GenerationTimings))    {}
+func (s *mockLlm) Pid() int                                           { return -1 }
+func (s *mockLlm) GetPort() int                                       { return -1 }
+func (s *mockLlm) GetDeviceInfos(ctx context.Context) []ml.DeviceInfo { return nil }
+func (s *mockLlm) HasExited() bool                                    { return false }
+func (s *mockLlm) GetActiveDeviceIDs() []ml.DeviceID                  { return nil }
+func (s *mockLlm) ContextLength() int                                 { return s.contextLength }
 
 func TestRunnerCanBeEvicted(t *testing.T) {
 	ctx, done := context.WithTimeout(t.Context(), 500*time.Millisecond)

@@ -669,6 +669,7 @@ func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, ses
 	if runner != nil && !runner.needsReload(c, req) {
 		if req.useLoadedRunner(runner, s.finishedReqCh) {
 			s.publishEvent(api.ModelEvent{Type: EventBusyStart, Model: runner.name})
+			s.publishEvent(api.ModelEvent{Type: EventGenStart, Model: runner.name})
 		}
 	} else {
 		select {
@@ -731,6 +732,8 @@ func (s *Scheduler) processPending(ctx context.Context) {
 						logutil.Trace("using existing loaded runner", "model", pendingKey)
 						if pending.useLoadedRunner(runner, s.finishedReqCh) {
 							s.publishEvent(api.ModelEvent{Type: EventBusyStart, Model: runner.name})
+							s.publishEvent(api.ModelEvent{Type: EventGenStart, Model: runner.name})
+							s.publishEvent(api.ModelEvent{Type: EventGenStart, Model: runner.name})
 						}
 						break
 					}
@@ -1198,6 +1201,15 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			llama, err = s.newServerFn(systemInfo, loadGpus, req.model.ModelPath, f, req.model.AdapterPaths, req.model.ProjectorPaths, launchOpts, numParallel, config)
 			if llama != nil {
 				llama.SetOnWeightsLoaded(onWeights)
+				// One registration for the life of the runner. The name is captured here
+				// rather than read at fire time because the runner outlives this request.
+				modelName := req.model.Name
+				llama.SetOnGenerationDone(func(t api.GenerationTimings) {
+					timings := t
+					s.publishEvent(api.ModelEvent{
+						Type: EventGenEnd, Model: modelName, Timings: &timings,
+					})
+				})
 			}
 			if err != nil {
 				// some older models are not compatible with newer versions of llama.cpp
@@ -1384,6 +1396,7 @@ iGPUScan:
 		runner.refCount++
 		if runner.refCount == 1 {
 			s.publishEvent(api.ModelEvent{Type: EventBusyStart, Model: req.model.Name})
+			s.publishEvent(api.ModelEvent{Type: EventGenStart, Model: req.model.Name})
 		}
 		runner.loading = false
 		runner.stillLoading.Store(false)

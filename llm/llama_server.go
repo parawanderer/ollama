@@ -150,9 +150,16 @@ type llamaServerRunner struct {
 	// activityCached is the last /slots reading and activityAt when it was taken. Its own
 	// mutex, not memoryMu: a poll makes an HTTP call, and holding the memory lock across
 	// that would stall every reader of the buffer figures for the duration.
-	activityMu       sync.Mutex
-	activityAt       time.Time
-	activityCached   *api.RunnerActivity
+	activityMu     sync.Mutex
+	activityAt     time.Time
+	activityCached *api.RunnerActivity
+
+	// onGeneration fires when a completion finishes, with the engine's own timings. One
+	// callback rather than an emission at each of the three handlers that produce a
+	// completion: this is the only point all of them pass through, and a hand-written copy
+	// per handler is the shape that has silently lost a field three times here already.
+	genMu            sync.Mutex
+	onGeneration     func(api.GenerationTimings)
 	gpuLayers        uint64 // model layers loaded on GPU, parsed from llama-server logs
 	gpuLayerOverflow int    // number of GPU-selected layers partially overflowed to CPU
 	status           *StatusWriter
@@ -1802,6 +1809,8 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 				if lsResp.StopType == "limit" {
 					doneReason = DoneReasonLength
 				}
+
+				s.notifyGeneration(lsResp.Timings)
 
 				finalResp = CompletionResponse{
 					Content:            lsResp.Content,
@@ -3469,6 +3478,32 @@ func activityTTL(last *api.RunnerActivity, busy bool) time.Duration {
 // activityRequestTimeout bounds one poll. /slots answers in well under a millisecond on
 // loopback; this only exists so a wedged runner cannot make /api/ps hang.
 const activityRequestTimeout = 2 * time.Second
+
+// SetOnGenerationDone registers a callback fired when a completion finishes, carrying the
+// engine's measurement of how it divided. Replaces any previous callback.
+func (s *llamaServerRunner) SetOnGenerationDone(fn func(api.GenerationTimings)) {
+	s.genMu.Lock()
+	s.onGeneration = fn
+	s.genMu.Unlock()
+}
+
+func (s *llamaServerRunner) notifyGeneration(t llamaServerTimings) {
+	s.genMu.Lock()
+	fn := s.onGeneration
+	s.genMu.Unlock()
+	if fn == nil {
+		return
+	}
+	fn(api.GenerationTimings{
+		// promptEvalCount is cache + computed, i.e. the whole prompt. The split is what
+		// carries the information; the total on its own is identical either way.
+		PromptTokens:       t.promptEvalCount(),
+		PromptTokensCached: t.CacheN,
+		PromptMs:           t.PromptMS,
+		EvalMs:             t.PredictMS,
+		Decoded:            t.PredictN,
+	})
+}
 
 // Activity reports what this runner is doing, from llama-server's /slots endpoint, or nil if
 // it cannot be determined.

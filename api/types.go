@@ -892,6 +892,36 @@ type ProcessModelResponse struct {
 // ProcessGPU reports one device a loaded model occupies and how much VRAM it
 // uses there. The id/runner pair matches GPUInfo's, since an id is only unique
 // within its runner.
+// GenerationTimings is how a completed generation divided, measured by the engine.
+//
+// These are llama-server's own figures, not observations of it. That distinction is the
+// reason this exists: a phase boundary derived from polling is a timestamp nobody measured,
+// and drawing one beside a memory trace that *is* measured makes the two disagree in a way
+// that reads as a fault in the box rather than in the arithmetic. Everything here comes back
+// with the completion.
+//
+// To place the phases on a timeline, work backwards from the end of the generation:
+// decode occupied the last EvalMs, and prefill the EvalMs+PromptMs to EvalMs before it.
+// Do not assume they abut the start -- see the note on GenerationTimings in ModelEvent.
+type GenerationTimings struct {
+	// PromptTokens is the whole prompt and PromptTokensCached the part of it the prefix
+	// cache served, so the difference is what was actually computed.
+	//
+	// The count alone hides a cache hit completely: the same 4098-token prompt reports 4098
+	// both times, while PromptMs goes from 161.6 to 3.4. So the cached figure and the
+	// duration are what explain a prefill too short to believe, and the count never is.
+	PromptTokens       int `json:"prompt_tokens"`
+	PromptTokensCached int `json:"prompt_tokens_cached,omitempty"`
+
+	// PromptMs is how long prefill took and EvalMs how long decode took, as the engine
+	// measured them.
+	PromptMs float64 `json:"prompt_ms"`
+	EvalMs   float64 `json:"eval_ms"`
+
+	// Decoded is how many tokens were generated.
+	Decoded int `json:"decoded"`
+}
+
 // RunnerActivity says what a resident model is *doing*, as distinct from what it is holding.
 //
 // It comes from llama-server's own /slots endpoint, which reports per-slot progress; nothing
@@ -1643,6 +1673,9 @@ type EventFrame struct {
 	// timestamps.
 	SizeVRAM int64 `json:"size_vram,omitempty"`
 
+	// Timings is how a generation divided, on a gen.end frame. See ModelEvent.
+	Timings *GenerationTimings `json:"timings,omitempty"`
+
 	// Memory splits SizeVRAM by what the memory holds; MemoryHost does the same for
 	// whatever spilled to the host. See the fields of the same name on ModelEvent.
 	Memory     *MemoryBreakdown `json:"memory,omitempty"`
@@ -1765,6 +1798,14 @@ type ModelEvent struct {
 	// matching the fields of the same name on /api/ps.
 	SizeVRAM int64        `json:"size_vram,omitempty"`
 	GPUs     []ProcessGPU `json:"gpus,omitempty"`
+
+	// Timings is how a generation divided, on a gen.end event. Engine-measured.
+	//
+	// It does NOT account for the whole span between gen.start and gen.end: whatever is left
+	// over is queueing, template rendering and a cold load if there was one. Measured on a
+	// fresh load, 2056 ms total against 161.6 of prefill and 115.7 of decode -- so nearly all
+	// of it. Attribute the remainder to neither phase.
+	Timings *GenerationTimings `json:"timings,omitempty"`
 
 	// Memory splits SizeVRAM by what the memory holds, and MemoryHost does the same for
 	// the part that did not fit on a device. On load.weights only Weights is populated,

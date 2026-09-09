@@ -539,6 +539,11 @@ func (c *Client) LayerPlacement() *api.ModelPlacement { return nil }
 // says "not reported" rather than claiming the model is idle.
 func (c *Client) Activity(ctx context.Context, busy bool) *api.RunnerActivity { return nil }
 
+// SetOnGenerationDone implements llm.LlamaServer. The MLX runner does not report a
+// prefill/decode split, so no callback is ever fired and no gen.end is emitted for it --
+// which is the right outcome: absent rather than invented.
+func (c *Client) SetOnGenerationDone(func(api.GenerationTimings)) {}
+
 var _ llm.LlamaServer = (*Client)(nil)
 
 // setEnv sets or replaces an environment variable in cmd.Env.

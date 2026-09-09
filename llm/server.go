@@ -90,6 +90,10 @@ type LlamaServer interface {
 	// cached briefly, so this is safe to call on a polled endpoint.
 	Activity(ctx context.Context, busy bool) *api.RunnerActivity
 
+	// SetOnGenerationDone registers a callback fired when a completion finishes, with the
+	// engine's own measurement of how it divided between prefill and decode.
+	SetOnGenerationDone(func(api.GenerationTimings))
+
 	// LayerPlacement reports which device each layer landed on, or nil when the runner
 	// was not asked to collect it (see envconfig.LayerPlacement).
 	LayerPlacement() *api.ModelPlacement

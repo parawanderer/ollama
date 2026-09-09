@@ -42,6 +42,17 @@ const (
 	// transitions in and out of idle, not per request, so overlapping requests produce one
 	// span rather than nested ones. The end matters twice over: it is also the only moment
 	// the keep-alive deadline moves, so a countdown is meaningless before it.
+	// EventGenStart and EventGenEnd bracket one generation, and gen.end carries the
+	// engine's own measurement of how it divided between prefill and decode.
+	//
+	// There is deliberately no gen.phase. A live transition could only be timestamped when
+	// a poll of the engine observed it, which is a moment nobody measured -- and drawn
+	// beside a memory trace that *is* measured, the two disagree in a way that reads as a
+	// fault in the box. The engine reports the split once, at the end, so that is when it
+	// is emitted; a consumer places the phases by working backwards from gen.end.
+	EventGenStart = "gen.start"
+	EventGenEnd   = "gen.end"
+
 	EventBusyStart = "busy.start"
 	EventBusyEnd   = "busy.end"
 )

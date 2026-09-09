@@ -162,6 +162,10 @@ func TestEventFrameCopiesEveryCommonField(t *testing.T) {
 		},
 		MemoryHost:    &api.MemoryBreakdown{Weights: 2 << 30},
 		WeightsOnDisk: 69 << 30,
+		Timings: &api.GenerationTimings{
+			PromptTokens: 4098, PromptTokensCached: 4097,
+			PromptMs: 3.4, EvalMs: 111.5, Decoded: 40,
+		},
 		Placement: &api.ModelPlacement{
 			NumLayers: 4,
 			Devices: []api.PlacementRange{

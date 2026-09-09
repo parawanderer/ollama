@@ -2309,6 +2309,7 @@ func (s *Server) eventFrame(ev api.ModelEvent, started time.Time) api.EventFrame
 		MemoryHost:    ev.MemoryHost,
 		WeightsOnDisk: ev.WeightsOnDisk,
 		Placement:     ev.Placement,
+		Timings:       ev.Timings,
 		Estimate:      ev.Estimate,
 		Dropped:       ev.Dropped,
 		T:             ev.At.Sub(started).Milliseconds(),

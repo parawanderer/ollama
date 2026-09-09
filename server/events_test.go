@@ -1,6 +1,12 @@
 package server
 
 import (
+	"bytes"
+	"compress/gzip"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
@@ -224,5 +230,143 @@ func TestEventFrameCopiesEveryCommonField(t *testing.T) {
 	}
 	if frame.T != 0 {
 		t.Errorf("t = %d, want 0 for an event at the stream's start time", frame.T)
+	}
+}
+
+func TestAcceptsGzip(t *testing.T) {
+	tests := []struct {
+		header string
+		want   bool
+	}{
+		{"", false},
+		{"gzip", true},
+		{"gzip, deflate, br", true},
+		{"deflate, br", false},
+		{"identity", false},
+		{"*", true},
+		{"gzip;q=1.0", true},
+		{"gzip;q=0.5, *;q=0.1", true},
+		// An explicit refusal. A substring match reads this as consent and sends a body the
+		// client has said it cannot read.
+		{"gzip;q=0", false},
+		{"gzip;q=0, deflate", false},
+		// A refusal of gzip beats a permissive wildcard, whichever order they appear in.
+		{"*, gzip;q=0", false},
+		{"gzip;q=0, *", false},
+		{"*;q=0", false},
+		{"GZIP", true},
+		{"  gzip  ;  q=0.9  ", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.header, func(t *testing.T) {
+			if got := acceptsGzip(tt.header); got != tt.want {
+				t.Errorf("acceptsGzip(%q) = %v, want %v", tt.header, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestEventEncoderFlushesEachFrame is the test this whole type exists for.
+//
+// A gzip writer holds bytes until it has a block worth emitting. Without a flush after every
+// frame the client receives nothing for seconds and then a burst, which turns a live stream
+// into a batch feed -- and every naive test still passes, because the bytes do all arrive and
+// do all decode, just not when they were written. So the assertion has to be that frame N is
+// readable BEFORE frame N+1 is written.
+func TestEventEncoderFlushesEachFrame(t *testing.T) {
+	for _, compress := range []bool{false, true} {
+		name := "plain"
+		if compress {
+			name = "gzip"
+		}
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			enc := newEventEncoder(&buf, nil, compress)
+
+			for i := 1; i <= 3; i++ {
+				if err := enc.Encode(api.EventFrame{V: 1, Kind: "sample", Model: fmt.Sprint("m", i)}); err != nil {
+					t.Fatalf("encode %d: %v", i, err)
+				}
+				// Read what a client would have received by now, without closing the
+				// stream -- closing is what a batch encoder would need to be readable.
+				got := decodeFrames(t, buf.Bytes(), compress)
+				if len(got) != i {
+					t.Fatalf("after writing %d frames the client can read %d; the encoder is "+
+						"buffering, so frames arrive late and in bursts", i, len(got))
+				}
+				if got[i-1].Model != fmt.Sprint("m", i) {
+					t.Errorf("frame %d = %q, want %q", i, got[i-1].Model, fmt.Sprint("m", i))
+				}
+			}
+			if err := enc.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+		})
+	}
+}
+
+// TestEventEncoderRoundTrips checks the compressed stream carries exactly what the plain one
+// does -- same frames, same order, same fields.
+func TestEventEncoderRoundTrips(t *testing.T) {
+	frames := []api.EventFrame{
+		{V: 1, Kind: "hello", Box: "abc"},
+		{V: 1, Kind: "load.complete", Model: "granite4.1:3b", SizeVRAM: 2915943054,
+			Memory: &api.MemoryBreakdown{Weights: 2095935651, KVCache: 671088640}},
+		{V: 1, Kind: "sample", Model: "granite4.1:3b"},
+	}
+
+	encode := func(compress bool) []byte {
+		var buf bytes.Buffer
+		enc := newEventEncoder(&buf, nil, compress)
+		for _, f := range frames {
+			if err := enc.Encode(f); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := enc.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return buf.Bytes()
+	}
+
+	plain, gzipped := encode(false), encode(true)
+	if !reflect.DeepEqual(decodeFrames(t, plain, false), decodeFrames(t, gzipped, true)) {
+		t.Error("the gzipped stream does not decode to the same frames as the plain one")
+	}
+
+	// Not an assertion about a particular ratio -- only that the window is shared across
+	// frames. Compressing each frame alone would not beat the plain encoding on a payload
+	// this small, because every frame would carry its own 18-byte gzip header.
+	if len(gzipped) >= len(plain) {
+		t.Errorf("gzipped %d bytes is not smaller than plain %d; the window is not being reused",
+			len(gzipped), len(plain))
+	}
+}
+
+// decodeFrames reads however many complete frames are present, without requiring the stream
+// to be finished. io.ErrUnexpectedEOF is the normal case mid-stream and not a failure.
+func decodeFrames(t *testing.T, b []byte, compressed bool) []api.EventFrame {
+	t.Helper()
+	var r io.Reader = bytes.NewReader(b)
+	if compressed {
+		zr, err := gzip.NewReader(r)
+		if err != nil {
+			if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+				return nil
+			}
+			t.Fatalf("gzip reader: %v", err)
+		}
+		zr.Multistream(false)
+		r = zr
+	}
+	var out []api.EventFrame
+	dec := json.NewDecoder(r)
+	for {
+		var f api.EventFrame
+		err := dec.Decode(&f)
+		if err != nil {
+			return out
+		}
+		out = append(out, f)
 	}
 }

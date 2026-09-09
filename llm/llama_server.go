@@ -144,8 +144,15 @@ type llamaServerRunner struct {
 	// sliding-window, indexed by layer. Empty unless envconfig.LayerPlacement is set,
 	// because the lines that fill it are only emitted at a log level the runner is
 	// otherwise not run at.
-	layerDevice      map[int]string
-	layerSWA         map[int]bool
+	layerDevice map[int]string
+	layerSWA    map[int]bool
+
+	// activityCached is the last /slots reading and activityAt when it was taken. Its own
+	// mutex, not memoryMu: a poll makes an HTTP call, and holding the memory lock across
+	// that would stall every reader of the buffer figures for the duration.
+	activityMu       sync.Mutex
+	activityAt       time.Time
+	activityCached   *api.RunnerActivity
 	gpuLayers        uint64 // model layers loaded on GPU, parsed from llama-server logs
 	gpuLayerOverflow int    // number of GPU-selected layers partially overflowed to CPU
 	status           *StatusWriter
@@ -3400,4 +3407,170 @@ func (s *llamaServerRunner) SetOnWeightsLoaded(fn func(time.Time, uint64)) {
 	if !already.IsZero() && fn != nil {
 		fn(already, vram)
 	}
+}
+
+// slotsResponse is the subset of llama-server's /slots payload this reads. The endpoint
+// returns much more -- every sampling parameter, the full prompt -- and decoding only these
+// keeps the poll cheap and stops an unrelated upstream field change from breaking it.
+//
+// Field notes, all verified against a live runner rather than the source:
+//
+//   - a slot that has never served a request carries ONLY id/n_ctx/is_processing, so every
+//     count here has to tolerate being absent;
+//   - n_prompt_tokens is n_past: it counts prompt AND generated tokens, and climbs during
+//     decode in lockstep with n_decoded;
+//   - n_prompt_tokens_processed and n_prompt_tokens_cache return to zero when the slot goes
+//     idle, while n_prompt_tokens does not. That is what makes an idle slot's occupancy
+//     readable without it looking like work in flight.
+type slotsResponse struct {
+	ID                     int  `json:"id"`
+	NCtx                   int  `json:"n_ctx"`
+	IsProcessing           bool `json:"is_processing"`
+	NPromptTokens          int  `json:"n_prompt_tokens"`
+	NPromptTokensProcessed int  `json:"n_prompt_tokens_processed"`
+	NPromptTokensCache     int  `json:"n_prompt_tokens_cache"`
+	NextToken              []struct {
+		NDecoded int `json:"n_decoded"`
+	} `json:"next_token"`
+}
+
+// How often /slots is asked, which has to be bounded: without it every /api/ps would make an
+// HTTP round trip per resident runner, and that endpoint is 0.19 ms and polled.
+//
+// The interval depends on what the runner was last seen doing, because the two cases have
+// opposite requirements. A busy runner's numbers change every few milliseconds and a prefill
+// can be over in a few hundred, so a coarse interval misses the phase entirely -- a first
+// version used a flat 200 ms and a capture of a real 4k-token prefill caught only the decode
+// that followed it. An idle runner's numbers do not change at all until it is given work, so
+// polling it often buys nothing.
+const (
+	activityPollBusyTTL = 40 * time.Millisecond
+	activityPollIdleTTL = 500 * time.Millisecond
+)
+
+// activityTTL is how long the last reading stays good.
+//
+// busy is the caller's own knowledge that a request is in flight, and it is what makes the
+// idle interval safe. Deciding from the last *reading* alone has a bootstrapping hole: a
+// runner last seen idle would not be re-asked for 500 ms, which is longer than a short
+// generation, so the transition into work is missed and the whole thing reads as idle. That
+// is not hypothetical -- it is what a first version did, and a capture of two real
+// generations (390 ms and 210 ms) recorded one busy sample out of sixteen taken inside them.
+//
+// A failed poll (nil) with no request in flight is treated as idle: a runner that does not
+// serve /slots should be asked rarely, not constantly.
+func activityTTL(last *api.RunnerActivity, busy bool) time.Duration {
+	if busy || (last != nil && last.SlotsBusy > 0) {
+		return activityPollBusyTTL
+	}
+	return activityPollIdleTTL
+}
+
+// activityRequestTimeout bounds one poll. /slots answers in well under a millisecond on
+// loopback; this only exists so a wedged runner cannot make /api/ps hang.
+const activityRequestTimeout = 2 * time.Second
+
+// Activity reports what this runner is doing, from llama-server's /slots endpoint, or nil if
+// it cannot be determined.
+//
+// busy says whether the caller knows a request is in flight; it only shortens the poll
+// interval and is never reported as the phase. The engine's own slot state decides that --
+// a request can be in flight while the runner is still queueing it.
+func (s *llamaServerRunner) Activity(ctx context.Context, busy bool) *api.RunnerActivity {
+	s.activityMu.Lock()
+	if !s.activityAt.IsZero() && time.Since(s.activityAt) < activityTTL(s.activityCached, busy) {
+		cached := s.activityCached
+		s.activityMu.Unlock()
+		return cached
+	}
+	s.activityMu.Unlock()
+
+	activity := s.pollActivity(ctx)
+
+	s.activityMu.Lock()
+	// A failed poll is cached too, as nil with a fresh timestamp, so a runner that does not
+	// serve /slots is asked at most once per TTL rather than on every request.
+	s.activityCached, s.activityAt = activity, time.Now()
+	s.activityMu.Unlock()
+	return activity
+}
+
+func (s *llamaServerRunner) pollActivity(ctx context.Context) *api.RunnerActivity {
+	if s.cmd == nil || s.cmd.ProcessState != nil || s.port == 0 {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, activityRequestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		fmt.Sprintf("http://127.0.0.1:%d/slots", s.port), nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := s.httpClient().Do(req)
+	if err != nil {
+		slog.Debug("could not read runner activity", "port", s.port, "error", err)
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		// Not an error worth logging loudly: the endpoint is disabled on some builds.
+		slog.Debug("runner declined to report activity", "port", s.port, "status", resp.StatusCode)
+		return nil
+	}
+
+	var slots []slotsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&slots); err != nil {
+		slog.Debug("could not decode runner activity", "port", s.port, "error", err)
+		return nil
+	}
+	return activityFromSlots(slots)
+}
+
+// activityFromSlots reduces the per-slot payload to one summary.
+//
+// Phase is the one that dominates the wait rather than the most common: a runner with one slot
+// prefilling and three decoding is, from a caller's point of view, waiting on the prefill.
+// Token counts sum across slots, which is what makes PromptTokens the cache occupancy for the
+// whole runner rather than for whichever slot happened to be first.
+func activityFromSlots(slots []slotsResponse) *api.RunnerActivity {
+	if len(slots) == 0 {
+		return nil
+	}
+
+	activity := &api.RunnerActivity{Phase: "idle", Slots: len(slots)}
+	anyPrefill, anyDecode := false, false
+	for _, slot := range slots {
+		activity.PromptTokens += slot.NPromptTokens
+		activity.PromptTokensDone += slot.NPromptTokensProcessed
+		activity.PromptTokensCached += slot.NPromptTokensCache
+
+		decoded := 0
+		if len(slot.NextToken) > 0 {
+			decoded = slot.NextToken[0].NDecoded
+		}
+		activity.Decoded += decoded
+
+		if !slot.IsProcessing {
+			continue
+		}
+		activity.SlotsBusy++
+		// A slot that has produced a token is decoding; one that is processing and has not
+		// is still working through the prompt. This is the engine's own progress, not a
+		// guess from elapsed time.
+		if decoded > 0 {
+			anyDecode = true
+		} else {
+			anyPrefill = true
+		}
+	}
+
+	switch {
+	case anyPrefill:
+		activity.Phase = "prefill"
+	case anyDecode:
+		activity.Phase = "decode"
+	}
+	return activity
 }

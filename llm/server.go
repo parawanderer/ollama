@@ -85,6 +85,11 @@ type LlamaServer interface {
 	// would break the invariant that a breakdown's fields sum to the figure beside them.
 	WeightsOnDisk() int64
 
+	// Activity reports what the runner is doing -- prefill, decode or idle -- with the
+	// prompt progress and KV occupancy behind it, or nil if it cannot say. Results are
+	// cached briefly, so this is safe to call on a polled endpoint.
+	Activity(ctx context.Context, busy bool) *api.RunnerActivity
+
 	// LayerPlacement reports which device each layer landed on, or nil when the runner
 	// was not asked to collect it (see envconfig.LayerPlacement).
 	LayerPlacement() *api.ModelPlacement

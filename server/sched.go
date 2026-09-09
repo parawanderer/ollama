@@ -2501,6 +2501,7 @@ type loadedModel struct {
 	memByGPU      map[ml.DeviceID]api.MemoryBreakdown
 	weightsOnDisk int64
 	placement     *api.ModelPlacement
+	activity      *api.RunnerActivity
 }
 
 // loadedModels returns a snapshot of the currently loaded models for status
@@ -2588,6 +2589,9 @@ func (r *runnerRef) reportLocked() loadedModel {
 		lm.memVRAM, _ = r.llama.MemoryBreakdownTotals()
 		lm.weightsOnDisk = r.llama.WeightsOnDisk()
 		lm.placement = r.llama.LayerPlacement()
+		// Briefly cached inside the runner, so a polled /api/ps does not make one HTTP
+		// round trip per resident model per request.
+		lm.activity = r.llama.Activity(context.Background(), lm.busy)
 	}
 	// The scheduler waits to set expiresAt, so a model that is still loading may have the
 	// zero value. Estimate expiration from the session duration instead.

@@ -2383,6 +2383,7 @@ func (s *Server) processResponse() *api.ProcessResponse {
 			ContextLength: v.contextLength,
 			WeightsOnDisk: v.weightsOnDisk,
 			Placement:     v.placement,
+			Activity:      v.activity,
 		}
 		if v.memVRAM.Total() > 0 {
 			breakdown := v.memVRAM

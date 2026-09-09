@@ -880,6 +880,9 @@ type ProcessModelResponse struct {
 	// started with OLLAMA_LAYER_PLACEMENT.
 	Placement *ModelPlacement `json:"placement,omitempty"`
 
+	// Activity says what the runner is doing right now. Absent when it could not be asked.
+	Activity *RunnerActivity `json:"activity,omitempty"`
+
 	// GPUs lists the devices this model was placed on, with per-device VRAM,
 	// in the same terms /api/info reports them. Empty when the model is
 	// running on the CPU.
@@ -889,6 +892,55 @@ type ProcessModelResponse struct {
 // ProcessGPU reports one device a loaded model occupies and how much VRAM it
 // uses there. The id/runner pair matches GPUInfo's, since an id is only unique
 // within its runner.
+// RunnerActivity says what a resident model is *doing*, as distinct from what it is holding.
+//
+// It comes from llama-server's own /slots endpoint, which reports per-slot progress; nothing
+// here is inferred from timing. Absent when the runner could not be asked -- a model that is
+// still loading, a backend with no such endpoint, or a poll that failed.
+//
+// Read Phase first and treat it as the discriminator. llama.cpp keeps a finished task's token
+// counts on the slot, which is not staleness -- those tokens really are still in the cache --
+// but it does mean the counts describe the *last* task once Phase is "idle", and must not be
+// drawn as work in flight.
+type RunnerActivity struct {
+	// Phase is "prefill", "decode" or "idle".
+	//
+	// Prefill is compute-bound and processes the prompt in batch-sized steps; decode is
+	// memory-bound and produces one token at a time. With several slots busy at once the
+	// phase reported is the one that dominates the wait: prefill if any slot is prefilling,
+	// else decode if any is decoding, else idle.
+	Phase string `json:"phase"`
+
+	// Slots is how many slots the runner has and SlotsBusy how many are processing. Both are
+	// reported even when Slots is 1, so a client is never left guessing whether a single
+	// figure describes one slot or a sum over several.
+	Slots     int `json:"slots"`
+	SlotsBusy int `json:"slots_busy"`
+
+	// PromptTokens is the number of tokens resident in the KV cache, summed across slots --
+	// llama.cpp's n_past. It is the occupancy to read against ContextLength, and it answers
+	// "how much of the reservation is live" for traffic this client did not cause. It keeps
+	// climbing through decode, because generated tokens enter the cache too.
+	PromptTokens int `json:"prompt_tokens,omitempty"`
+
+	// PromptTokensDone is how much of the prompt has been through prefill so far, so a
+	// prefill can be drawn as a fill rather than an opaque block. It advances in batch-sized
+	// steps, not one token at a time. Zero while idle.
+	PromptTokensDone int `json:"prompt_tokens_done,omitempty"`
+
+	// PromptTokensCached is how much of the prompt was served from the prefix cache and so
+	// never computed. It is the difference between a turn that starts in milliseconds and one
+	// that starts in seconds, and it is what explains a prefill span too short to believe --
+	// measured here at 1219 of 1220 tokens on a repeated prompt.
+	//
+	// Cached tokens are cheap in *time*, not in tokens: they are still sent and still counted.
+	// Zero while idle.
+	PromptTokensCached int `json:"prompt_tokens_cached,omitempty"`
+
+	// Decoded is how many tokens have been generated for the task in flight. Zero while idle.
+	Decoded int `json:"decoded,omitempty"`
+}
+
 // ModelPlacement says which part of a model went where, for a load split across devices.
 //
 // A memory breakdown says how much each device holds; this says *what* it holds. They

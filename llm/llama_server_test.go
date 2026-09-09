@@ -4344,3 +4344,134 @@ func TestLayerPlacementAbsentWhenNotCollected(t *testing.T) {
 		t.Errorf("placement = %+v, want nil when nothing was parsed", got)
 	}
 }
+
+// TestActivityFromSlots pins the reduction from per-slot payload to one summary. Every fixture
+// is transcribed from a live /slots response on this box, including the field *absences*.
+func TestActivityFromSlots(t *testing.T) {
+	decoded := func(n int) []struct {
+		NDecoded int `json:"n_decoded"`
+	} {
+		return []struct {
+			NDecoded int `json:"n_decoded"`
+		}{{NDecoded: n}}
+	}
+
+	tests := []struct {
+		name  string
+		slots []slotsResponse
+		want  *api.RunnerActivity
+	}{
+		{
+			// A slot that has never served a request carries only id/n_ctx/is_processing.
+			// Idle with nothing else known, not idle with zero tokens cached.
+			name:  "a runner that has served nothing",
+			slots: []slotsResponse{{ID: 0, NCtx: 8192}},
+			want:  &api.RunnerActivity{Phase: "idle", Slots: 1},
+		},
+		{
+			// Mid-prefill: processing, prompt partly through, nothing generated yet.
+			name: "prefill reports progress",
+			slots: []slotsResponse{{
+				ID: 0, NCtx: 8192, IsProcessing: true,
+				NPromptTokens: 4098, NPromptTokensProcessed: 3072, NPromptTokensCache: 3,
+				NextToken: decoded(0),
+			}},
+			want: &api.RunnerActivity{
+				Phase: "prefill", Slots: 1, SlotsBusy: 1,
+				PromptTokens: 4098, PromptTokensDone: 3072, PromptTokensCached: 3,
+			},
+		},
+		{
+			// Decoding. n_prompt_tokens has climbed past the prompt because generated
+			// tokens enter the cache too -- 4098 + 80.
+			name: "decode is distinguished by a generated token",
+			slots: []slotsResponse{{
+				ID: 0, NCtx: 8192, IsProcessing: true,
+				NPromptTokens: 4178, NPromptTokensProcessed: 4095, NPromptTokensCache: 3,
+				NextToken: decoded(80),
+			}},
+			want: &api.RunnerActivity{
+				Phase: "decode", Slots: 1, SlotsBusy: 1,
+				PromptTokens: 4178, PromptTokensDone: 4095, PromptTokensCached: 3, Decoded: 80,
+			},
+		},
+		{
+			// The shape most likely to be drawn wrongly. The slot is idle, but it still
+			// reports the last task's n_prompt_tokens -- those tokens really are still in
+			// the cache. llama.cpp zeroes processed/cache/decoded on its own, so occupancy
+			// survives and the in-flight counts do not.
+			name: "idle still reports occupancy from the last task",
+			slots: []slotsResponse{{
+				ID: 0, NCtx: 8192, IsProcessing: false, NPromptTokens: 4217,
+				NextToken: decoded(0),
+			}},
+			want: &api.RunnerActivity{Phase: "idle", Slots: 1, PromptTokens: 4217},
+		},
+		{
+			// Phase is the one that dominates the wait, not the most common: a caller
+			// waiting on this runner is waiting on the prefill.
+			name: "prefill wins over decode across slots",
+			slots: []slotsResponse{
+				{ID: 0, IsProcessing: true, NPromptTokens: 100, NPromptTokensProcessed: 100, NextToken: decoded(12)},
+				{ID: 1, IsProcessing: true, NPromptTokens: 900, NPromptTokensProcessed: 400, NextToken: decoded(0)},
+				{ID: 2, IsProcessing: false, NPromptTokens: 50, NextToken: decoded(0)},
+			},
+			want: &api.RunnerActivity{
+				Phase: "prefill", Slots: 3, SlotsBusy: 2,
+				PromptTokens: 1050, PromptTokensDone: 500, Decoded: 12,
+			},
+		},
+		{
+			name:  "no slots at all is not reported",
+			slots: []slotsResponse{},
+			want:  nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := activityFromSlots(tt.slots)
+			if tt.want == nil {
+				if got != nil {
+					t.Fatalf("activity = %+v, want nil", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("activity = nil, want a summary")
+			}
+			if *got != *tt.want {
+				t.Errorf("activity =\n  %+v\nwant\n  %+v", *got, *tt.want)
+			}
+		})
+	}
+}
+
+// TestActivityTTL pins the bootstrapping hole. Choosing the poll interval from the last
+// reading alone means a runner last seen idle is not re-asked for the idle interval -- which
+// is longer than a short generation, so the work is never observed and the runner reads idle
+// throughout. The caller's own knowledge that a request is in flight is what closes it.
+func TestActivityTTL(t *testing.T) {
+	idle := &api.RunnerActivity{Phase: "idle", Slots: 1}
+	working := &api.RunnerActivity{Phase: "decode", Slots: 1, SlotsBusy: 1}
+
+	tests := []struct {
+		name string
+		last *api.RunnerActivity
+		busy bool
+		want time.Duration
+	}{
+		{"seen working", working, false, activityPollBusyTTL},
+		{"seen idle and nothing in flight", idle, false, activityPollIdleTTL},
+		{"seen idle but a request is in flight", idle, true, activityPollBusyTTL},
+		{"never polled, request in flight", nil, true, activityPollBusyTTL},
+		{"never polled, nothing in flight", nil, false, activityPollIdleTTL},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := activityTTL(tt.last, tt.busy); got != tt.want {
+				t.Errorf("activityTTL = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

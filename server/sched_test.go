@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -2568,5 +2569,79 @@ func TestSchedSuccessfulLoadReportsNoFailure(t *testing.T) {
 	}
 	if n := s.loadsInFlight.Load(); n != 0 {
 		t.Errorf("loadsInFlight = %d after a successful load, want 0", n)
+	}
+}
+
+// The fixed probe points stop at 131072 while automatic context loads the most common models
+// here at 262144, so without a third point every such load was placed from a line
+// extrapolated to twice the furthest point measured.
+func TestProbeCoversTheContextBeingLoaded(t *testing.T) {
+	points := [2]int{8192, 131072}
+
+	if got := probeContextsFor(points, 262144); !slices.Equal(got, []int{8192, 131072, 262144}) {
+		t.Errorf("probe contexts for a 262144 load = %v, want the fixed pair plus 262144", got)
+	}
+	// Within the fixed range there is nothing to extrapolate, so nothing is added.
+	if got := probeContextsFor(points, 32768); !slices.Equal(got, []int{8192, 131072}) {
+		t.Errorf("probe contexts for a 32768 load = %v, want only the fixed pair", got)
+	}
+	// Added, never substituted: if 262144 turns out not to fit, the pair still makes a line.
+	if got := probeContextsFor(points, 262144); got[0] != 8192 || got[1] != 131072 {
+		t.Errorf("the fixed points were replaced: %v", got)
+	}
+}
+
+// The engine's per-layer is_swa is the authority on sliding window; the metadata's markers
+// are a guess from keys. When the engine reports sliding-window layers for a model whose
+// metadata the completeness check passed, the estimate has been modelling them as full
+// attention, and the model must be measured from then on.
+func TestSchedFlagsSlidingWindowTheMetadataDidNotDeclare(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer done()
+
+	for _, tt := range []struct {
+		name      string
+		swa       []int
+		wantFlags bool
+	}{
+		{"engine reports sliding-window layers", []int{0, 2, 4}, true},
+		{"engine reports none", nil, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := InitScheduler(ctx)
+			// The scenario's llama-architecture model carries no sliding-window key, so its
+			// metadata reads as complete -- the case the audit exists for.
+			scenario := newScenarioRequest(t, ctx, "swa-"+tt.name, 10, nil, map[ml.DeviceID]uint64{})
+			scenario.srv.placement = &api.ModelPlacement{NumLayers: 6, SWALayers: tt.swa}
+			s.newServerFn = scenario.newServer
+
+			s.load(scenario.req, ml.SystemInfo{}, nil, false)
+			select {
+			case err := <-scenario.req.errCh:
+				t.Fatal(err)
+			case <-scenario.req.successCh:
+			}
+
+			// load.complete is published after the runner is handed back; give it a moment.
+			deadline := time.Now().Add(200 * time.Millisecond)
+			for time.Now().Before(deadline) && s.slidingWindowUndeclared(scenario.req.model.ModelPath) != tt.wantFlags {
+				time.Sleep(5 * time.Millisecond)
+			}
+			if got := s.slidingWindowUndeclared(scenario.req.model.ModelPath); got != tt.wantFlags {
+				t.Errorf("flagged for measurement = %v, want %v", got, tt.wantFlags)
+			}
+			// And the flag has to change what happens next: the model is measured, though its
+			// metadata alone would still say it need not be.
+			f, err := llm.LoadModel(scenario.req.model.ModelPath, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if modelNeedsMeasurement(f, nil) {
+				t.Fatal("fixture: the scenario model's metadata should read as complete")
+			}
+			if got := s.shouldMeasure(f, nil, scenario.req.model.ModelPath); got != tt.wantFlags {
+				t.Errorf("shouldMeasure = %v, want %v", got, tt.wantFlags)
+			}
+		})
 	}
 }

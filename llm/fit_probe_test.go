@@ -200,3 +200,38 @@ func TestScanFitBreakdownPrefersProjectedOverSummedRows(t *testing.T) {
 			"25279 means the largest breakdown was summed, 16635 the last one", got)
 	}
 }
+
+// A probe is its own llama-server run and gets rounded like a load: asked for 12345, it built
+// and measured 12544. Filing its figure at 12345 puts the point 199 tokens left of where it
+// belongs on the calibration line. Transcribed from the dry run of granite4.1:3b asked for
+// num_ctx 12345 on 2026-09-11.
+func TestFitProbeReportsTheContextItMeasured(t *testing.T) {
+	log := `load_tensors:        CUDA0 model buffer size =     0.00 MiB
+llama_context: n_seq_max             = 1
+llama_context: n_ctx                 = 12544
+llama_context: n_ctx_seq             = 12544
+llama_context: n_ctx_seq (12544) < n_ctx_train (131072) -- the full capacity of the model will not be utilized
+common_params_fit_impl: projected to use 3129 MiB of device memory vs. 96690 MiB of free device memory
+common_params_fit_impl: will leave 93560 >= 1024 MiB of free device memory, no changes needed
+`
+	total, clean, measured := scanFitProbe(strings.NewReader(log), false)
+	if !clean || total == 0 {
+		t.Fatalf("clean=%v total=%d; the fixture should read as a clean probe", clean, total)
+	}
+	if measured != 12544 {
+		t.Errorf("measured context = %d, want 12544 (the engine rounded the requested 12345)", measured)
+	}
+}
+
+// With a draft model the pass describes two contexts; the main model's comes first and is the
+// one the figure belongs to.
+func TestFitProbeTakesTheFirstContextNotADraftModels(t *testing.T) {
+	log := `llama_context: n_ctx                 = 32768
+llama_context: n_ctx                 = 4096
+common_params_fit_impl: projected to use 26982 MiB of device memory vs. 96690 MiB of free device memory
+common_params_fit_impl: will leave 69708 >= 1024 MiB of free device memory, no changes needed
+`
+	if _, _, measured := scanFitProbe(strings.NewReader(log), false); measured != 32768 {
+		t.Errorf("measured context = %d, want the main model's 32768", measured)
+	}
+}

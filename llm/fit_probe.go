@@ -121,10 +121,10 @@ func ProbeFitVRAM(
 	kvCacheType string,
 	config LlamaServerConfig,
 	numCtx int,
-) (uint64, error) {
+) (vram uint64, measuredCtx int, err error) {
 	exe, err := FindLlamaServer()
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	// The probe must differ from the real invocation in the context length and nothing
@@ -142,7 +142,7 @@ func ProbeFitVRAM(
 	opts.NumCtx = numCtx
 	launch, err := newLlamaServerLaunchConfig(gpus, modelPath, f, adapters, projectors, opts, numParallel, kvCacheType, config, newLlamaServerMediaMarker())
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, fitProbeTimeout)
@@ -158,12 +158,12 @@ func ProbeFitVRAM(
 
 	out, err := cmd.StdoutPipe()
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	cmd.Stderr = cmd.Stdout
 
 	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("starting fit probe: %w", err)
+		return 0, 0, fmt.Errorf("starting fit probe: %w", err)
 	}
 
 	// The process is killed the moment the answer is in hand rather than left to exit on
@@ -179,7 +179,7 @@ func ProbeFitVRAM(
 		}
 	}()
 
-	total, clean := scanFitBreakdown(out, len(launch.projectors) > 0)
+	total, clean, measured := scanFitProbe(out, len(launch.projectors) > 0)
 	close(done)
 	_ = cmd.Process.Kill()
 	_, _ = io.Copy(io.Discard, out)
@@ -188,15 +188,15 @@ func ProbeFitVRAM(
 	switch {
 	case total == 0:
 		if err := ctx.Err(); err != nil {
-			return 0, fmt.Errorf("fit probe did not report in %s: %w", fitProbeTimeout, err)
+			return 0, 0, fmt.Errorf("fit probe did not report in %s: %w", fitProbeTimeout, err)
 		}
-		return 0, errors.New("fit probe produced no memory breakdown")
+		return 0, 0, errors.New("fit probe produced no memory breakdown")
 	case !clean:
-		return 0, ErrFitProbeWouldNotFit
+		return 0, 0, ErrFitProbeWouldNotFit
 	}
 
-	slog.Debug("probed model memory without loading it", "model", modelPath, "num_ctx", numCtx, "vram", total, "cmd", cmd)
-	return total, nil
+	slog.Debug("probed model memory without loading it", "model", modelPath, "num_ctx", numCtx, "measured_ctx", measured, "vram", total, "cmd", cmd)
+	return total, measured, nil
 }
 
 // scanFitBreakdown sums the per-device figures of the breakdown the fit pass reaches its
@@ -207,6 +207,16 @@ func ProbeFitVRAM(
 // which is what makes the figure correspond to the configuration that was requested rather
 // than to whichever fallback was printed last.
 func scanFitBreakdown(r io.Reader, hasProjector bool) (total uint64, clean bool) {
+	total, clean, _ = scanFitProbe(r, hasProjector)
+	return total, clean
+}
+
+// scanFitProbe is scanFitBreakdown that also returns the context the probe measured -- the
+// total, n_ctx, which is calibration's axis. A probe is its own llama-server run and is
+// rounded the same way a load is (each slot up to a multiple of 256), so the context it was
+// asked for is not necessarily the one its figure describes. The probe prints one context,
+// its dry run, and the first line wins: a draft model's context would follow it.
+func scanFitProbe(r io.Reader, hasProjector bool) (total uint64, clean bool, measuredCtx int) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
@@ -219,6 +229,12 @@ func scanFitBreakdown(r io.Reader, hasProjector bool) (total uint64, clean bool)
 	var sawRow, verdict, sawClip bool
 	for scanner.Scan() {
 		line := scanner.Text()
+
+		if measuredCtx == 0 {
+			if match := servingContextRegex.FindStringSubmatch(line); match != nil {
+				measuredCtx, _ = strconv.Atoi(match[1])
+			}
+		}
 
 		if match := mmprojWorstCaseRegex.FindStringSubmatch(line); match != nil {
 			if mib, err := strconv.ParseFloat(match[1], 64); err == nil {
@@ -235,7 +251,7 @@ func scanFitBreakdown(r io.Reader, hasProjector bool) (total uint64, clean bool)
 		// which happens after the fit pass has reported. Everything else stops at the
 		// verdict, so this costs about half a second and only for such models.
 		if verdict && (!hasProjector || sawClip) {
-			return pick(projected, total) + projector + clipCompute, clean
+			return pick(projected, total) + projector + clipCompute, clean, measuredCtx
 		}
 
 		if match := fitBreakdownRegex.FindStringSubmatch(line); match != nil {
@@ -262,20 +278,20 @@ func scanFitBreakdown(r io.Reader, hasProjector bool) (total uint64, clean bool)
 		}
 		switch {
 		case fitTooSmallRegex.MatchString(line):
-			return pick(projected, total), false
+			return pick(projected, total), false, measuredCtx
 		case fitCleanRegex.MatchString(line):
 			// Not returned here when a projector is configured: the figures that make up a
 			// vision model's total are still to come.
 			verdict, clean = true, pick(projected, total) > 0
 			if !hasProjector {
-				return pick(projected, total), clean
+				return pick(projected, total), clean, measuredCtx
 			}
 		}
 	}
 	if sawRow {
 		total = current
 	}
-	return pick(projected, total) + projector + clipCompute, clean && verdict
+	return pick(projected, total) + projector + clipCompute, clean && verdict, measuredCtx
 }
 
 // pick prefers the pass's own total and falls back to the summed rows when it is absent.

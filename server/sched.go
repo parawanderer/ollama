@@ -79,6 +79,12 @@ type Scheduler struct {
 	// model is predicted from measurement instead of from metadata alone.
 	vramCalibration *llm.VRAMCalibration
 
+	// swaUndeclared holds models whose engine ran sliding-window layers their metadata did
+	// not declare -- see auditSlidingWindow. Such a model is measured from then on, whatever
+	// the metadata says. Keyed by model path.
+	swaUndeclaredMu sync.Mutex
+	swaUndeclared   map[string]bool
+
 	// vramCalibrationPath is where those measurements survive a restart. Without it every
 	// restart re-earns them by making one uninformed placement per model.
 	vramCalibrationPath string
@@ -397,6 +403,56 @@ func vramCalibrationKey(req *LlmRequest, gpus []ml.DeviceInfo, numParallel int) 
 // covers the models on a single host. Some carry a separate projector file, and then the
 // model's own metadata holds no vision keys at all. Some carry the vision tensors inline,
 // and then there is no projector path. Only the third names it in the metadata.
+// auditSlidingWindow checks the metadata's account of a model against the engine's.
+//
+// The completeness check routes a model to be measured when its metadata carries a marker
+// the per-token estimate cannot model, sliding window among them. But it can only see keys,
+// and llama.cpp can also switch sliding windows on from its own per-architecture defaults
+// with no key at all. The engine's per-layer is_swa is the authority, so when it reports
+// sliding-window layers for a model whose metadata claimed to be complete, the estimate has
+// been treating those layers as full attention -- 89 GiB predicted against 10 used, the last
+// time a sliding-window model slipped through (gemma4:12b).
+//
+// Checked across every model on this box on 2026-09-11: each one carrying a sliding-window
+// key also carries attention.sliding_window, so this has not fired here. It is a net for the
+// architecture that arrives without the key, and it depends on OLLAMA_LAYER_PLACEMENT, which
+// is what makes the engine print is_swa at all.
+//
+// The load that notices has already recorded one calibration sample. One sample plus the
+// metadata's slope is worse than none for exactly this kind of model, so the flag makes the
+// next load measure a line instead.
+func (s *Scheduler) auditSlidingWindow(modelPath string, f *ggml.GGML, placement *api.ModelPlacement) {
+	if f == nil || placement == nil || len(placement.SWALayers) == 0 || !f.KV().KVCacheModelIsComplete() {
+		return
+	}
+	s.swaUndeclaredMu.Lock()
+	defer s.swaUndeclaredMu.Unlock()
+	if s.swaUndeclared[modelPath] {
+		return
+	}
+	if s.swaUndeclared == nil {
+		s.swaUndeclared = make(map[string]bool)
+	}
+	s.swaUndeclared[modelPath] = true
+	slog.Warn("the engine runs sliding-window layers this model's metadata does not declare; "+
+		"its memory will be measured rather than estimated from now on",
+		"model", modelPath, "architecture", f.KV().Architecture(),
+		"sliding_window_layers", len(placement.SWALayers), "layers", placement.NumLayers)
+}
+
+// shouldMeasure is whether a model's memory is measured by probe rather than taken from
+// its metadata: because the metadata admits it cannot describe the model, or because the
+// engine has shown that it did not.
+func (s *Scheduler) shouldMeasure(f *ggml.GGML, projectorPaths []string, modelPath string) bool {
+	return modelNeedsMeasurement(f, projectorPaths) || s.slidingWindowUndeclared(modelPath)
+}
+
+func (s *Scheduler) slidingWindowUndeclared(modelPath string) bool {
+	s.swaUndeclaredMu.Lock()
+	defer s.swaUndeclaredMu.Unlock()
+	return s.swaUndeclared[modelPath]
+}
+
 func modelNeedsMeasurement(f *ggml.GGML, projectorPaths []string) bool {
 	if f == nil {
 		return false
@@ -461,6 +517,26 @@ const probeMinContext = 256
 // recorded stay comparable.
 // Takes the model's trained context rather than the model, because it is arithmetic and
 // nothing else -- which is also what makes it testable without building a GGML.
+// probeContextsFor adds the context being loaded to the fixed probe points when it lies
+// beyond them.
+//
+// The fixed points stop at 131072, and the most common trained context on this box is
+// 262144 -- 26 of 70 models -- which is exactly what an automatic context loads them at. So
+// the figure every one of those loads was placed from was the line extrapolated to twice
+// the furthest point anyone measured. Probing the requested context turns that into a
+// measurement, for one more ~0.5 s probe, once per model.
+//
+// It is added rather than substituted. A requested context too large to fit in the memory
+// free right now fails to probe, and substituting it would then leave one point -- which
+// probeCalibration rightly discards -- where the fixed pair would have produced a line.
+func probeContextsFor(points [2]int, numCtx int) []int {
+	contexts := []int{points[0], points[1]}
+	if numCtx > points[1] {
+		contexts = append(contexts, numCtx)
+	}
+	return contexts
+}
+
 func probePoints(trainCtx, numParallel int) ([2]int, bool) {
 	contexts := probeContexts
 	for i := range contexts {
@@ -495,7 +571,7 @@ func probePoints(trainCtx, numParallel int) ([2]int, bool) {
 // within 0.01 GiB. That equivalence is the whole reason this is worth doing, and it is
 // entirely dependent on the invocation being identical -- see ProbeFitVRAM.
 func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey, req *LlmRequest, f *ggml.GGML, launchOpts api.Options, gpus []ml.DeviceInfo, numParallel int, numCtx int) bool {
-	if !modelNeedsMeasurement(f, req.model.ProjectorPaths) {
+	if !s.shouldMeasure(f, req.model.ProjectorPaths, req.model.ModelPath) {
 		return false
 	}
 	// Two distinct samples are what it takes to stop consulting the metadata: below that
@@ -508,10 +584,11 @@ func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey
 
 	// Probing at one context tells us nothing a metadata estimate does not: the point is
 	// the slope, and a slope needs two points.
-	contexts, ok := probePoints(modelTrainContext(f), numParallel)
+	points, ok := probePoints(modelTrainContext(f), numParallel)
 	if !ok {
 		return false
 	}
+	contexts := probeContextsFor(points, numCtx)
 
 	started := time.Now()
 	var recorded int
@@ -521,7 +598,7 @@ func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey
 		// measured. Probing with the request's own options measures a load that was never
 		// going to run -- on qwen3.8:27b at 128k that reported 15.86 GiB against 23.86 for
 		// the same model probed as it would actually be launched.
-		vram, err := llm.ProbeFitVRAM(ctx, gpus, req.model.ModelPath, f, req.model.AdapterPaths, req.model.ProjectorPaths,
+		vram, measuredCtx, err := llm.ProbeFitVRAM(ctx, gpus, req.model.ModelPath, f, req.model.AdapterPaths, req.model.ProjectorPaths,
 			launchOpts, numParallel, envconfig.KvCacheType(), llamaServerConfigForModel(req.model), probeCtx)
 		if err != nil {
 			// Not fitting is worth saying out loud: it is the reason this load is about
@@ -535,6 +612,13 @@ func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey
 				slog.Debug("could not measure model memory without loading it", "model", req.model.ModelPath, "num_ctx", probeCtx, "error", err)
 			}
 			continue
+		}
+		// Filed at the context the probe measured, not the one it asked for: llama.cpp
+		// rounds each slot up to a multiple of 256, so a probe point off that grid measures
+		// a larger cache than its label says. No model on this box trains at an unaligned
+		// context, so today the two agree -- the point is not to depend on that.
+		if measuredCtx > 0 {
+			probeCtx = measuredCtx
 		}
 		s.vramCalibration.Record(key, probeCtx, vram)
 		recorded++
@@ -1514,6 +1598,7 @@ iGPUScan:
 		}
 		complete.WeightsOnDisk = llama.WeightsOnDisk()
 		complete.Placement = llama.LayerPlacement()
+		s.auditSlidingWindow(req.model.ModelPath, f, complete.Placement)
 		if !runner.weightsLoaded.IsZero() && !runner.loadStarted.IsZero() {
 			complete.WeightsMs = runner.weightsLoaded.Sub(runner.loadStarted).Milliseconds()
 			complete.ContextMs = complete.DurationMs - complete.WeightsMs

@@ -76,10 +76,10 @@ func classifyUnavailable(p deviceProbe) ml.UnavailableDevice {
 		// 00000000:03:00.0: Not Supported" while its PCI reset_method reads "flr bus", so
 		// the kernel can reset a device the vendor tool will not. Naming one tool that
 		// fails on the commonest hardware reads as a dead end rather than a first step.
-		d.Recovery = "the GPU needs a reset: free the driver (stop anything using it, unload the " +
-			"kernel modules), then reset it. nvidia-smi -r is refused on many consumer and " +
-			"workstation cards; a PCIe function-level reset via sysfs works where the device " +
-			"supports it, and a cold power cycle always does"
+		d.Recovery = "a cold power cycle: shut down, wait for the rails to drain, power on. " +
+			"nvidia-smi -r is refused on many consumer and workstation cards, and unloading the " +
+			"kernel modules is worse than useless here -- the unload has to talk to the dead GPU " +
+			"to release it, so it blocks for minutes and takes the healthy cards down with it"
 	case nvmlErrorGPUIsLost:
 		d.Reason = "lost"
 		d.Recovery = "the driver can no longer reach the device; a reset may work, otherwise reseat and power-cycle"

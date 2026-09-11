@@ -121,3 +121,71 @@ func indexOf(h, n string) int {
 	}
 	return -1
 }
+
+// TestSysfsCatchesAGPUNVMLHasAlsoLost is the regression for a hole found the hard way.
+//
+// The detector was built on "NVML minus CUDA", because a faulted GPU stayed visible to NVML
+// with its name and UUID while vanishing from CUDA. That held for the fault as first
+// captured. It then STOPPED holding on the same machine on the same day: after the driver
+// was torn down and reloaded without the dead card, NVML reported one device too, and the
+// detector went quiet with a broken GPU still bolted into the machine.
+//
+// sysfs never lost it -- 0000:03:00.0, vendor 0x10de, class 0x030000, still bound to the
+// nvidia driver -- through the fault, a hung module unload and the reload. So sysfs is the
+// superset and NVML is a middle tier that can lose devices.
+//
+// The lesson generalises past this bug: a detector whose whole job is to notice something
+// missing must be anchored to the layer that cannot itself forget.
+func TestSysfsCatchesAGPUNVMLHasAlsoLost(t *testing.T) {
+	old := sysfsPCIRoot
+	sysfsPCIRoot = "testdata/pci"
+	t.Cleanup(func() { sysfsPCIRoot = old })
+
+	// The healthy card is the only one the backend offered.
+	got := gpusOnlySysfsCanSee(usableSet([]string{"0000:01:00.0"}), nil)
+
+	if len(got) != 1 {
+		t.Fatalf("got %d unavailable devices, want 1 (the card sysfs can see and nothing else can)", len(got))
+	}
+	if got[0].PCIID != "0000:03:00.0" {
+		t.Errorf("pci = %q, want %q", got[0].PCIID, "0000:03:00.0")
+	}
+	if got[0].Reason != "not_reported_by_driver" {
+		t.Errorf("reason = %q, want %q", got[0].Reason, "not_reported_by_driver")
+	}
+	// No status code exists for these -- the driver is not talking about them -- so the
+	// report must not imply one was read.
+	if got[0].Detail == "GPU requires reset" {
+		t.Error("a reason was invented for a device the driver never described")
+	}
+	if got[0].Bus == nil || !got[0].Bus.Present {
+		t.Error("the bus state is the entire evidence that this device exists; it must be reported")
+	}
+}
+
+// A device the backend already offered must never appear as unavailable, or a healthy
+// two-GPU machine reports one of its working cards as broken on every poll.
+func TestSysfsDoesNotReportDevicesTheBackendOffered(t *testing.T) {
+	old := sysfsPCIRoot
+	sysfsPCIRoot = "testdata/pci"
+	t.Cleanup(func() { sysfsPCIRoot = old })
+
+	got := gpusOnlySysfsCanSee(usableSet([]string{"0000:01:00.0", "0000:03:00.0"}), nil)
+	if len(got) != 0 {
+		t.Errorf("got %d unavailable devices, want 0; every enumerated GPU was offered by the backend", len(got))
+	}
+}
+
+// A device NVML already described must not be reported twice, once with its real reason and
+// again as an anonymous sysfs entry.
+func TestSysfsDoesNotDuplicateWhatNVMLAlreadyExplained(t *testing.T) {
+	old := sysfsPCIRoot
+	sysfsPCIRoot = "testdata/pci"
+	t.Cleanup(func() { sysfsPCIRoot = old })
+
+	seen := map[string]bool{"0000:03:00.0": true}
+	got := gpusOnlySysfsCanSee(usableSet([]string{"0000:01:00.0"}), seen)
+	if len(got) != 0 {
+		t.Errorf("got %d, want 0: NVML already reported this device with a real reason", len(got))
+	}
+}

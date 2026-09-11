@@ -79,3 +79,49 @@ func sumAERCounters(path string) int {
 	}
 	return total
 }
+
+// nvidiaGPUsInSysfs lists every NVIDIA display-class device the kernel enumerates.
+//
+// This is the OUTERMOST ring of the three that know about a GPU, and it is the only one
+// that survives everything:
+//
+//	sysfs  - every PCI device, whatever the driver is doing. Never lost a device here.
+//	NVML   - devices the driver is managing. Keeps a faulted device, with name and UUID...
+//	CUDA   - devices usable for compute. Drops a faulted device entirely.
+//
+// The middle ring was originally treated as the superset, and that was WRONG in a way only
+// a second incident showed. NVML did keep the faulted card at first, but after the driver
+// was torn down and reloaded without it, NVML reported one device too -- so a detector
+// built on "NVML minus CUDA" went quiet while the broken card was still bolted to the
+// machine, which is the exact silence this whole mechanism exists to break.
+//
+// sysfs never wavered: the device stayed at 0000:03:00.0, class 0x030000, vendor 0x10de,
+// still bound to the nvidia driver, through the fault, the hung unload and the reload.
+func nvidiaGPUsInSysfs() []string {
+	entries, err := os.ReadDir(sysfsPCIRoot)
+	if err != nil {
+		return nil
+	}
+
+	var out []string
+	for _, entry := range entries {
+		dir := filepath.Join(sysfsPCIRoot, entry.Name())
+
+		// 0x10de is NVIDIA. Other vendors' GPUs are deliberately not reported: this
+		// answers "is a card the backend should have offered missing", and only the
+		// devices whose absence we can explain belong in that answer.
+		if !strings.EqualFold(readTrimmed(filepath.Join(dir, "vendor")), "0x10de") {
+			continue
+		}
+
+		// Display controller (0x0300xx). The class is read rather than assumed because a
+		// vendor ships more than GPUs on a PCI bus, and an audio function or a bridge
+		// reported as a missing GPU would be a permanent false alarm.
+		if !strings.HasPrefix(readTrimmed(filepath.Join(dir, "class")), "0x0300") {
+			continue
+		}
+
+		out = append(out, entry.Name())
+	}
+	return out
+}

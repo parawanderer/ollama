@@ -911,8 +911,8 @@ func boolToCInt(v bool) C.int {
 func UnavailableDevices(known []string) []ml.UnavailableDevice {
 	nvml, err := dlopenFirst([]string{"libnvidia-ml.so.1", "libnvidia-ml.so"}, false)
 	if err != nil {
-		slog.Debug("NVML unavailable, cannot check for unusable devices", "error", err)
-		return nil
+		slog.Debug("NVML unavailable, falling back to the PCI bus", "error", err)
+		return gpusOnlySysfsCanSee(usableSet(known), nil)
 	}
 
 	initFn, initErr := dlsym(nvml, "nvmlInit_v2")
@@ -925,7 +925,7 @@ func UnavailableDevices(known []string) []ml.UnavailableDevice {
 	tempFn, tempErr := dlsym(nvml, "nvmlDeviceGetTemperature")
 	if err := cmp.Or(initErr, shutdownErr, countErr, handleErr, nameErr, uuidErr, pciErr, tempErr); err != nil {
 		slog.Debug("NVML missing a symbol needed to check device health", "error", err)
-		return nil
+		return gpusOnlySysfsCanSee(usableSet(known), nil)
 	}
 	// nvmlErrorString is looked up separately: without it the reason is still known, only
 	// the driver's own wording for it is missing, which is not worth losing the report for.
@@ -933,22 +933,20 @@ func UnavailableDevices(known []string) []ml.UnavailableDevice {
 
 	if ret := C.ollama_call_nvml_init(initFn); ret != 0 {
 		slog.Debug("nvmlInit_v2 failed", "status", int(ret))
-		return nil
+		return gpusOnlySysfsCanSee(usableSet(known), nil)
 	}
 	defer C.ollama_call_nvml_shutdown(shutdownFn)
+
+	usable := usableSet(known)
 
 	var count C.uint
 	if ret := C.ollama_call_nvml_device_get_count(countFn, &count); ret != 0 {
 		slog.Debug("nvmlDeviceGetCount_v2 failed", "status", int(ret))
-		return nil
-	}
-
-	usable := make(map[string]bool, len(known))
-	for _, pci := range known {
-		usable[strings.ToLower(pci)] = true
+		return gpusOnlySysfsCanSee(usable, nil)
 	}
 
 	var out []ml.UnavailableDevice
+	seen := map[string]bool{}
 	for i := range uint(count) {
 		var handle unsafe.Pointer
 		if ret := C.ollama_call_nvml_device_get_handle_by_index(handleFn, C.uint(i), &handle); ret != 0 {
@@ -991,6 +989,43 @@ func UnavailableDevices(known []string) []ml.UnavailableDevice {
 		device := classifyUnavailable(probe)
 		slog.Warn("a GPU is present but cannot be used",
 			"pci_id", device.PCIID, "name", device.Name, "reason", device.Reason, "detail", device.Detail)
+		seen[strings.ToLower(pci)] = true
+		out = append(out, device)
+	}
+
+	return append(out, gpusOnlySysfsCanSee(usable, seen)...)
+}
+
+// gpusOnlySysfsCanSee reports NVIDIA GPUs the kernel enumerates that neither the compute
+// backend nor NVML offered.
+//
+// It exists because NVML is not the superset it looks like. A faulted card was visible to
+// NVML at first and vanished from it later, after the driver was torn down and reloaded
+// without the device -- at which point NVML and CUDA agreed on one device and the detector
+// fell silent with a broken card still in the machine. sysfs never lost it.
+//
+// Nothing can be said about WHY these are unusable: the driver is not talking about them,
+// so there is no status code and no name. That is reported as such rather than guessed at,
+// because "a GPU is here and nothing will tell me why it is unusable" is already the
+// actionable fact, and inventing a reason would make it less trustworthy, not more.
+func gpusOnlySysfsCanSee(usable, seen map[string]bool) []ml.UnavailableDevice {
+	var out []ml.UnavailableDevice
+	for _, pci := range nvidiaGPUsInSysfs() {
+		key := strings.ToLower(pci)
+		if usable[key] || seen[key] {
+			continue
+		}
+
+		device := ml.UnavailableDevice{
+			PCIID:  pci,
+			Reason: "not_reported_by_driver",
+			Detail: "the kernel enumerates this GPU but the driver does not report it",
+			Recovery: "the driver has lost the device without releasing it. A cold power cycle " +
+				"restores it; a warm reboot may not, since the card keeps power across one",
+			Bus: busStateFor(pci),
+		}
+		slog.Warn("a GPU is on the PCI bus but the driver does not report it",
+			"pci_id", device.PCIID, "reason", device.Reason)
 		out = append(out, device)
 	}
 	return out
@@ -1004,4 +1039,14 @@ func nvmlString(size int, fill func(*C.char, C.uint) C.int) string {
 		return ""
 	}
 	return C.GoString(buf)
+}
+
+// usableSet indexes the PCI addresses discovery did offer, lowercased so a comparison
+// cannot fail on the hex casing of an address that came from a different source.
+func usableSet(known []string) map[string]bool {
+	usable := make(map[string]bool, len(known))
+	for _, pci := range known {
+		usable[strings.ToLower(pci)] = true
+	}
+	return usable
 }

@@ -12,13 +12,37 @@ import (
 )
 
 func TestRunnerPIDsNamesModelsAsPsDoes(t *testing.T) {
+	finishing := &runnerRef{llama: &mockLlm{pid: 970}, name: "registry.ollama.ai/library/gemma4:31b"}
+	finishing.stillLoading.Store(true)
 	s := &Scheduler{loaded: map[string]*runnerRef{
 		"a": {llama: &mockLlm{pid: 960}, name: "registry.ollama.ai/library/granite4.1:3b"},
 		"b": {llama: &mockLlm{}, name: "registry.ollama.ai/library/qwen3:32b"}, // no process
+		"c": finishing,
 	}}
 	got := s.runnerPIDs()
-	if len(got) != 1 || got[960] != "granite4.1:3b" {
-		t.Fatalf("runnerPIDs = %v, want {960: granite4.1:3b}", got)
+	want := map[int]runnerMark{960: {model: "granite4.1:3b"}, 970: {model: "gemma4:31b", loading: true}}
+	if len(got) != len(want) || got[960] != want[960] || got[970] != want[970] {
+		t.Fatalf("runnerPIDs = %v, want %v", got, want)
+	}
+}
+
+// A runner exists, and holds memory, for the whole of its load before it joins s.loaded.
+func TestRunnerPIDsIncludesTheRunnerBeingLoaded(t *testing.T) {
+	s := &Scheduler{loaded: map[string]*runnerRef{}}
+	s.setLoadingModel("registry.ollama.ai/library/qwen3.5:0.8b")
+	s.loadingPID.Store(384)
+	if got := s.runnerPIDs(); got[384] != (runnerMark{model: "qwen3.5:0.8b", loading: true}) {
+		t.Fatalf("runnerPIDs = %v, want 384 marked as qwen3.5:0.8b, loading", got)
+	}
+	s.clearLoadingModel()
+	if got := s.runnerPIDs(); len(got) != 0 {
+		t.Fatalf("after the load ends the pid must not linger: %v", got)
+	}
+	// The next load names its model at load.start, before its process exists. A pid left
+	// over from the last load would be pinned on the new model in that window.
+	s.setLoadingModel("registry.ollama.ai/library/gemma4:31b")
+	if got := s.runnerPIDs(); len(got) != 0 {
+		t.Fatalf("the previous load's pid was named as the next model: %v", got)
 	}
 }
 
@@ -28,7 +52,7 @@ func TestGPUProcessesMarksRunnersAndHelpers(t *testing.T) {
 		{PID: 1010, UsedMemory: 600 << 20, Name: "llama-server", OllamaChild: true}, // a fit probe
 		{PID: 7, UsedMemory: 2 << 30, Name: "python3"},                              // someone else's
 	}
-	got := gpuProcesses(procs, map[int]string{960: "granite4.1:3b"})
+	got := gpuProcesses(procs, map[int]runnerMark{960: {model: "granite4.1:3b"}})
 
 	if got[0].Runner == nil || got[0].Runner.Model != "granite4.1:3b" || got[0].OllamaHelper {
 		t.Errorf("runner: %+v", got[0])

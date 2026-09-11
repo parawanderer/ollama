@@ -103,6 +103,12 @@ type Scheduler struct {
 	// the moment it publishes load.start; this is that same knowledge, readable by a poll.
 	loadingModel atomic.Pointer[string]
 
+	// loadingPID is the process of the runner being loaded, from the moment it exists until
+	// it is resident. The runner joins s.loaded only after its load returns, so without this
+	// a process holding gigabytes on a card for the whole load could not be named. An atomic
+	// rather than a read of activeLoading, which is written outside loadedMu.
+	loadingPID atomic.Int64
+
 	// events publishes model lifecycle transitions to /api/events subscribers, and ring
 	// retains them so a client that reconnects can be told what it missed rather than
 	// having a gap drawn over.
@@ -1368,6 +1374,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 		}
 
 		s.activeLoading = llama
+		s.loadingPID.Store(int64(llama.Pid()))
 	} else {
 		wantPath := req.model.ModelPath
 		if wantPath == "" {
@@ -2740,6 +2747,7 @@ func (s *Scheduler) setLoadingModel(name string) {
 
 func (s *Scheduler) clearLoadingModel() {
 	s.loadingModel.Store(nil)
+	s.loadingPID.Store(0)
 }
 
 // LoadingModel is the model currently being loaded, or "" if none.
@@ -2750,27 +2758,47 @@ func (s *Scheduler) LoadingModel() string {
 	return ""
 }
 
-// runnerPIDs maps each resident runner's process id to the model it serves, named as
-// /api/ps names it. Reads only fields fixed when the runner was created -- llama is never
-// reassigned and its process starts in its constructor -- so no runner lock is taken, and
-// a runner busy loading does not stall /api/info.
-func (s *Scheduler) runnerPIDs() map[int]string {
+// runnerMark is what /api/info says about a runner process: the model it serves, named as
+// /api/ps names it, and whether it is still loading.
+type runnerMark struct {
+	model   string
+	loading bool
+}
+
+func displayModelName(name string) string {
+	if short := model.ParseName(name).DisplayShortest(); short != "" {
+		return short
+	}
+	return name
+}
+
+// runnerPIDs maps each runner's process id to the model it serves: resident runners, and
+// the one being loaded. Reads only fields fixed when a runner was created -- llama is never
+// reassigned and its process starts in its constructor -- and atomics, so no runner lock is
+// taken and a runner busy loading does not stall /api/info.
+//
+// The loading runner matters most: measured on qwen3.5:0.8b, its process held 14 MB, then
+// 1.4 GB, then 5.9 GB on the card before the load returned, and without this it was named
+// an anonymous helper for all of it.
+func (s *Scheduler) runnerPIDs() map[int]runnerMark {
 	s.loadedMu.Lock()
-	defer s.loadedMu.Unlock()
-	out := make(map[int]string, len(s.loaded))
+	out := make(map[int]runnerMark, len(s.loaded)+1)
 	for _, r := range s.loaded {
 		if r.llama == nil {
 			continue
 		}
-		pid := r.llama.Pid()
-		if pid <= 0 {
-			continue
+		if pid := r.llama.Pid(); pid > 0 {
+			out[pid] = runnerMark{model: displayModelName(r.name), loading: r.stillLoading.Load()}
 		}
-		name := model.ParseName(r.name).DisplayShortest()
-		if name == "" {
-			name = r.name
+	}
+	s.loadedMu.Unlock()
+
+	if pid := int(s.loadingPID.Load()); pid > 0 {
+		if _, resident := out[pid]; !resident {
+			if name := s.LoadingModel(); name != "" {
+				out[pid] = runnerMark{model: displayModelName(name), loading: true}
+			}
 		}
-		out[pid] = name
 	}
 	return out
 }

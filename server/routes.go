@@ -2764,15 +2764,15 @@ func (s *Server) InfoHandler(c *gin.Context) {
 // sound because NVML reports pids in the caller's namespace -- measured in the container
 // here: NVML said 960, the runner's pid inside the container, where the host knows it as
 // 414316.
-func gpuProcesses(procs []ml.DeviceProcess, runners map[int]string) []api.GPUProcess {
+func gpuProcesses(procs []ml.DeviceProcess, runners map[int]runnerMark) []api.GPUProcess {
 	if len(procs) == 0 {
 		return nil
 	}
 	out := make([]api.GPUProcess, 0, len(procs))
 	for _, p := range procs {
 		gp := api.GPUProcess{PID: p.PID, UsedMemory: p.UsedMemory, Name: p.Name}
-		if model, ok := runners[p.PID]; ok {
-			gp.Runner = &api.GPUProcessRunner{Model: model}
+		if mark, ok := runners[p.PID]; ok {
+			gp.Runner = &api.GPUProcessRunner{Model: mark.model, Loading: mark.loading}
 		} else if p.OllamaChild {
 			gp.OllamaHelper = true
 		}

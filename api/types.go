@@ -2046,6 +2046,11 @@ type GPUProcess struct {
 // GPUProcessRunner identifies the model a runner process serves.
 type GPUProcessRunner struct {
 	Model string `json:"model"`
+
+	// Loading is set while the runner is still loading that model. Its memory is climbing
+	// toward the load's total and the model's own figures on /api/ps are not in yet, so it
+	// is not the moment to subtract one from the other.
+	Loading bool `json:"loading,omitempty"`
 }
 
 type GPUInfo struct {

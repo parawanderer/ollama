@@ -60,6 +60,62 @@ func TestPruneLayersSkipsRecentOrphans(t *testing.T) {
 	}
 }
 
+func TestGenerationDefaultsFromMetadata(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "model-*.gguf")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ggml.WriteGGUF(file, ggml.KV{
+		"general.architecture":             "llama",
+		"general.sampling.top_k":           uint32(40),
+		"general.sampling.top_p":           int32(1),
+		"general.sampling.min_p":           float32(0),
+		"general.sampling.typ_p":           float32(0.95),
+		"general.sampling.temp":            uint32(1),
+		"general.sampling.penalty_last_n":  float32(64),
+		"general.sampling.penalty_repeat":  float32(1.05),
+		"general.sampling.penalty_freq":    uint32(0),
+		"general.sampling.penalty_present": int32(0),
+		"general.sampling.xtc_threshold":   float32(0.5),
+		"general.sampling.mirostat_tau":    float32(5),
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	md, err := extractGGUFMetadata(file.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defaults := generationDefaultsFromMetadata(md)
+	check := func(key string, want any) {
+		t.Helper()
+		if got := defaults[key]; got != want {
+			t.Fatalf("%s = %#v, want %#v", key, got, want)
+		}
+	}
+
+	check("top_k", int64(40))
+	check("top_p", float64(1))
+	check("min_p", float64(0))
+	check("typical_p", float64(0.95))
+	check("temperature", float64(1))
+	check("repeat_last_n", int64(64))
+	check("repeat_penalty", float64(1.05))
+	check("frequency_penalty", float64(0))
+	check("presence_penalty", float64(0))
+	if _, ok := defaults["mirostat_tau"]; ok {
+		t.Fatal("mirostat_tau should not be mapped to an Ollama option")
+	}
+	if _, ok := defaults["xtc_threshold"]; ok {
+		t.Fatal("xtc_threshold should not be mapped to an Ollama option")
+	}
+}
+
 func TestGetModelTemplateMetadata(t *testing.T) {
 	customTemplate := "CUSTOM {{ .Prompt }}"
 
@@ -293,6 +349,28 @@ func writeTestModelManifest(t *testing.T, name, digest, tmpl string) {
 	}
 	if err := manifest.WriteManifest(model.ParseName(name), *configLayer, layers); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// loadTestMetadata fills in what GetModel would have read from the metadata
+// files, so
+// hand-built models resolve capabilities the same way loaded ones do.
+func loadTestMetadata(t *testing.T, m *Model) {
+	t.Helper()
+	if m.ModelPath != "" {
+		md, err := extractGGUFMetadata(m.ModelPath)
+		if err != nil {
+			t.Fatalf("metadata for %s: %v", m.ModelPath, err)
+		}
+		m.metadata = md
+	}
+	m.projectorMetadata = nil
+	for _, path := range m.ProjectorPaths {
+		md, err := extractGGUFMetadata(path)
+		if err != nil {
+			t.Fatalf("projector metadata for %s: %v", path, err)
+		}
+		m.projectorMetadata = append(m.projectorMetadata, md)
 	}
 }
 
@@ -531,39 +609,6 @@ func TestModelCapabilities(t *testing.T) {
 			},
 			expectedCaps: []model.Capability{model.CapabilityCompletion, model.CapabilityTools, model.CapabilityThinking},
 		},
-		{
-			name: "gemma4 small safetensors suppresses vision and audio",
-			model: Model{
-				Config: model.ConfigV2{
-					ModelFormat:  "safetensors",
-					Renderer:     gemma4RendererSmall,
-					Capabilities: []string{"vision", "audio"},
-				},
-				Template: chatTemplate,
-			},
-		},
-		{
-			name: "gemma4 large safetensors suppresses vision and audio",
-			model: Model{
-				Config: model.ConfigV2{
-					ModelFormat:  "safetensors",
-					Renderer:     gemma4RendererLarge,
-					Capabilities: []string{"vision", "audio"},
-				},
-				Template: chatTemplate,
-			},
-		},
-		{
-			name: "default gemma4 safetensors suppresses vision and audio",
-			model: Model{
-				Config: model.ConfigV2{
-					ModelFormat:  "safetensors",
-					Renderer:     gemma4RendererLegacy,
-					Capabilities: []string{"vision", "audio"},
-				},
-				Template: chatTemplate,
-			},
-		},
 	}
 
 	// compare two slices of model.Capability regardless of order
@@ -593,6 +638,8 @@ func TestModelCapabilities(t *testing.T) {
 
 	for _, tt := range testModels {
 		t.Run(tt.name, func(t *testing.T) {
+			loadTestMetadata(t, &tt.model)
+
 			// Test Capabilities method
 			caps := tt.model.Capabilities()
 			if !compareCapabilities(caps, tt.expectedCaps) {
@@ -723,6 +770,8 @@ func TestModelCheckCapabilities(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			loadTestMetadata(t, &tt.model)
+
 			// Test CheckCapabilities method
 			err := tt.model.CheckCapabilities(tt.checkCaps...)
 			if tt.expectedErrMsg == "" {

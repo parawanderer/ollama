@@ -163,7 +163,7 @@ func TestEventFrameCopiesEveryCommonField(t *testing.T) {
 		MemoryHost:    &api.MemoryBreakdown{Weights: 2 << 30},
 		WeightsOnDisk: 69 << 30,
 		Timings: &api.GenerationTimings{
-			PromptTokens: 4098, PromptTokensCached: 4097,
+			PromptTokens: 4098, PromptTokensCached: cachedTokens(4097),
 			PromptMs: 3.4, EvalMs: 111.5, Decoded: 40,
 		},
 		Placement: &api.ModelPlacement{
@@ -444,5 +444,43 @@ func TestBackfilledEdgeCarriesTheSamePayloadAsLive(t *testing.T) {
 		if !ok {
 			t.Errorf("%s was lost on the way through the ring", name)
 		}
+	}
+}
+
+func cachedTokens(n int) *int { return &n }
+
+// TestCachedPromptTokensDistinguishesColdFromUnreported is the regression for an ambiguity
+// this field carried from the day it shipped until upstream's #17943 forced it into view.
+//
+// It was an int with omitempty, so a cold prefill -- nothing served from the prefix cache,
+// a genuine zero -- was OMITTED, identical on the wire to an engine that does not report the
+// figure at all. Every uncached request looked like a missing measurement. That is the exact
+// failure the consumers of this stream asked us to design out: absence is load-bearing here,
+// and it was being spent on the commonest case.
+//
+// llama-server always reports the count, so on this box the pointer is never nil in practice;
+// MLX does not, which is why upstream made it optional and why the two states must differ.
+func TestCachedPromptTokensDistinguishesColdFromUnreported(t *testing.T) {
+	encode := func(ts api.GenerationTimings) string {
+		b, err := json.Marshal(ts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+
+	cold := encode(api.GenerationTimings{PromptTokens: 4098, PromptTokensCached: cachedTokens(0)})
+	if !strings.Contains(cold, `"prompt_tokens_cached":0`) {
+		t.Errorf("a cold prefill must report 0, not vanish: %s", cold)
+	}
+
+	unreported := encode(api.GenerationTimings{PromptTokens: 4098})
+	if strings.Contains(unreported, "prompt_tokens_cached") {
+		t.Errorf("an engine that does not report the figure must omit it: %s", unreported)
+	}
+
+	if cold == unreported {
+		t.Error("a cold prefill and an unreported figure encode identically; the field cannot " +
+			"tell a consumer which one it is looking at")
 	}
 }

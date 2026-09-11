@@ -72,7 +72,15 @@ func (t *promptCacheTracker) observeLineLocked(line []byte) {
 			return
 		}
 		m := promptCacheUpdateTookRegex.FindSubmatch(line)
-		t.pending.Ms, _ = strconv.ParseFloat(string(m[1]), 64)
+		ms, _ := strconv.ParseFloat(string(m[1]), 64)
+		// The engine runs an update for the first request into an empty slot too, with
+		// nothing to save and nothing to restore. That is not a swap, and reporting it as
+		// one would put a 0.01 ms non-event on every freshly loaded model's first request.
+		if *t.pending == (api.PromptCacheSwap{}) {
+			t.pending = nil
+			return
+		}
+		t.pending.Ms = ms
 		t.done, t.pending = t.pending, nil
 	case promptCacheStateRegex.Match(line):
 		m := promptCacheStateRegex.FindSubmatch(line)

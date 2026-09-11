@@ -65,6 +65,20 @@ func TestPromptCacheThrashedSwap(t *testing.T) {
 	}
 }
 
+// Transcribed from the first request a freshly loaded runner served: the engine runs an
+// update into the empty slot that saves, evicts and restores nothing.
+func TestPromptCacheEmptySlotIsNoSwap(t *testing.T) {
+	var tr promptCacheTracker
+	tr.begin()
+	tr.observe(readFixture(t, "prompt_cache_empty_slot.log"))
+	if got := tr.take(); got != nil {
+		t.Fatalf("an update that moved nothing was reported as a swap: %+v", got)
+	}
+	if state := tr.snapshot(); state == nil || state.Entries != 0 || state.LimitBytes != mibBytes(8192) {
+		t.Fatalf("state = %+v, want the empty cache and its limit", state)
+	}
+}
+
 // The runner's stderr arrives in whatever chunks the pipe delivers. Order within the stream
 // is what a swap is made of, so line-by-line delivery must read the same as one chunk.
 func TestPromptCacheChunkingDoesNotMatter(t *testing.T) {

@@ -2002,6 +2002,12 @@ type GPUInfo struct {
 	PCIeMaxGeneration int `json:"pcie_max_generation,omitempty"`
 	PCIeMaxWidth      int `json:"pcie_max_width,omitempty"`
 
+	// Utilization is how busy the card is, live, as its driver averages it over its own
+	// sample period (NVML documents 1/6 s to 1 s depending on the product, and does not
+	// report which through this call -- so no window is given). Absent when unreadable;
+	// a 0 always means idle, never "could not look".
+	Utilization *GPUUtilization `json:"utilization,omitempty"`
+
 	// FreeMemory is the amount of video memory on the GPU available for loading new models
 	FreeMemory uint64 `json:"free_memory"`
 
@@ -2080,6 +2086,13 @@ type GPULink struct {
 
 	// Reason explains an "unknown" pair, or a link a client should not over-read.
 	Reason string `json:"reason,omitempty"`
+}
+
+// GPUUtilization is a card's busy share. Each figure is independently optional: an AMD
+// integrated GPU, for one, reports gpu_percent and has no memory_percent at all.
+type GPUUtilization struct {
+	GPUPercent    *int `json:"gpu_percent,omitempty"`
+	MemoryPercent *int `json:"memory_percent,omitempty"`
 }
 
 // UnavailableGPU is a GPU the machine has that cannot be used, and why.

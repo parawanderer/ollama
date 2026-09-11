@@ -68,6 +68,11 @@ message End {
   string finish_reason = 1;
   uint32 prompt_tokens = 2;
   uint32 completion_tokens = 3;
+  // How much of the prompt the prefix cache served. `optional` for presence, and that is the
+  // point of the field: 0 is a cold prefill and absent is "not reported" -- a plain proto3
+  // uint32 would drop the 0 and make the two indistinguishable. Same distinction as
+  // gen.end's prompt_tokens_cached and the OpenAI usage.prompt_tokens_details.cached_tokens.
+  optional uint32 cached_tokens = 4;
 }
 
 message Frame {

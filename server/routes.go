@@ -2817,6 +2817,12 @@ func (s *Server) infoResponse() *api.InfoResponse {
 			gpus[i].Driver = dev.Driver()
 		}
 		gpus[i].PCIeMaxGeneration, gpus[i].PCIeMaxWidth = discover.PCIeMaxLink(dev.PCIID)
+		if dev.Utilization != nil {
+			gpus[i].Utilization = &api.GPUUtilization{
+				GPUPercent:    dev.Utilization.GPUPercent,
+				MemoryPercent: dev.Utilization.MemoryPercent,
+			}
+		}
 	}
 
 	ms, _ := manifest.Manifests(true)

@@ -80,6 +80,10 @@ type DeviceInfo struct {
 	MemoryBusWidthBits int `json:"memory_bus_width_bits,omitempty"`
 	MemoryClockMaxMHz  int `json:"memory_clock_max_mhz,omitempty"`
 
+	// Utilization is the device's live busy figures, refreshed with free memory, or nil when
+	// the driver cannot report them.
+	Utilization *DeviceUtilization `json:"utilization,omitempty"`
+
 	// FreeMemory is the amount of memory currently available on the device for loading models
 	FreeMemory uint64 `json:"free_memory,omitempty"`
 
@@ -754,4 +758,16 @@ type TopologyLink struct {
 
 	// Reason explains an "unknown" pair, or anything else a client should not infer.
 	Reason string
+}
+
+// DeviceUtilization is how busy a device is, as its driver averages it.
+//
+// Pointers, because 0 is a real reading -- idle -- and must stay distinct from "could not
+// read"; an int with omitempty would spend the absent state on the idle one.
+type DeviceUtilization struct {
+	// GPUPercent is the share of the driver's sample period during which a kernel ran.
+	GPUPercent *int
+	// MemoryPercent is the memory controller's busy share over the same period. For decode,
+	// which is bandwidth-bound, it is the more telling of the two.
+	MemoryPercent *int
 }

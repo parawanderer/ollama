@@ -176,7 +176,11 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 				if fc := openai.FinishChunk(w.id, chatResponse, w.toolCallSent); len(fc.Choices) > 0 && fc.Choices[0].FinishReason != nil {
 					reason = *fc.Choices[0].FinishReason
 				}
-				if _, err := w.ResponseWriter.Write(EndFrame(reason, u.PromptTokens, u.CompletionTokens)); err != nil {
+				var cached *int
+				if u.PromptTokensDetails != nil {
+					cached = &u.PromptTokensDetails.CachedTokens
+				}
+				if _, err := w.ResponseWriter.Write(EndFrame(reason, u.PromptTokens, u.CompletionTokens, cached)); err != nil {
 					return 0, err
 				}
 				return len(data), nil

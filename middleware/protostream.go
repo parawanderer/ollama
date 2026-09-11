@@ -79,6 +79,7 @@ const (
 	endFinishReason     = 1
 	endPromptTokens     = 2
 	endCompletionTokens = 3
+	endCachedTokens     = 4
 )
 
 // wire types, of which this needs three
@@ -196,11 +197,19 @@ func tokenLogprob(t api.TokenLogprob) []byte {
 }
 
 // EndFrame closes the stream, replacing both the finish chunk and "data: [DONE]".
-func EndFrame(finishReason string, prompt, completion int) []byte {
+// EndFrame closes a stream. cached is the prompt tokens the prefix cache served, or nil when
+// the engine did not report it.
+func EndFrame(finishReason string, prompt, completion int, cached *int) []byte {
 	var m []byte
 	m = appendString(m, endFinishReason, finishReason)
 	m = appendUint(m, endPromptTokens, uint64(max(prompt, 0)))
 	m = appendUint(m, endCompletionTokens, uint64(max(completion, 0)))
+	if cached != nil {
+		// Not appendUint, which skips zero as proto3's default: this field is declared
+		// optional, so a 0 is written, and a cold prefill stays distinct from "not reported".
+		m = appendTag(m, endCachedTokens, wireVarint)
+		m = binary.AppendUvarint(m, uint64(max(*cached, 0)))
+	}
 	return frame(frameEnd, m)
 }
 

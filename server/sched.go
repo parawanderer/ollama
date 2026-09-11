@@ -328,6 +328,9 @@ func (s *Scheduler) refreshFreeMemory() bool {
 	if len(free) == 0 {
 		return false
 	}
+	// Read at the same moment and from the same held-open session, so the two figures on a
+	// device describe one instant and the read costs nothing extra to open.
+	util := discover.UtilizationByPCI(ids)
 
 	s.deviceCacheMu.Lock()
 	defer s.deviceCacheMu.Unlock()
@@ -339,6 +342,13 @@ func (s *Scheduler) refreshFreeMemory() bool {
 	for i := range s.deviceCache {
 		if got, ok := free[s.deviceCache[i].PCIID]; ok {
 			s.deviceCache[i].FreeMemory = got
+		}
+		// Replaced, not merged: a device that stopped answering loses its old figure rather
+		// than showing a stale one as current.
+		if u, ok := util[s.deviceCache[i].PCIID]; ok {
+			s.deviceCache[i].Utilization = &u
+		} else {
+			s.deviceCache[i].Utilization = nil
 		}
 	}
 	s.deviceCacheAt = time.Now()

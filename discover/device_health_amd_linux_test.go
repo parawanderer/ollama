@@ -168,3 +168,30 @@ func linkAMDDevice(t *testing.T, root, pci string) {
 	}
 	writeFakeSysfsFile(t, filepath.Join(target, "power"), "runtime_status", "active\n")
 }
+
+// Read from this box's iGPU: active, gpu_busy_percent readable, and no mem_busy_percent file at
+// all. So each figure is present only when read -- and a real 0 (idle) must survive.
+func TestAMDUtilizationReportsOnlyWhatWasRead(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "power"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFakeSysfsFile(t, dir, "driver", "amdgpu\n")
+	writeFakeSysfsFile(t, filepath.Join(dir, "power"), "runtime_status", "active\n")
+	writeFakeSysfsFile(t, dir, "gpu_busy_percent", "0\n")
+
+	u, ok := amdUtilization(dir)
+	if !ok || u.GPUPercent == nil || *u.GPUPercent != 0 {
+		t.Fatalf("got %+v ok=%v, want gpu_percent present and 0: idle is a reading", u, ok)
+	}
+	if u.MemoryPercent != nil {
+		t.Errorf("memory_percent = %d for an ASIC with no mem_busy_percent; it must be absent", *u.MemoryPercent)
+	}
+
+	// Suspended: it is idle, but the read would answer EPERM, and "idle" would be an
+	// inference rather than a reading.
+	writeFakeSysfsFile(t, filepath.Join(dir, "power"), "runtime_status", "suspended\n")
+	if _, ok := amdUtilization(dir); ok {
+		t.Error("a suspended device was reported; it cannot be read without waking it")
+	}
+}

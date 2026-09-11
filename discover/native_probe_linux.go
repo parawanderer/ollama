@@ -248,6 +248,24 @@ static int ollama_call_nvml_nvlink_remote_pci(void * fn, void * dev, unsigned in
 	return ret;
 }
 
+// nvmlUtilization_t: two unsigned ints, gpu then memory, in percent.
+typedef struct {
+	unsigned int gpu;
+	unsigned int memory;
+} ollama_nvml_utilization_t;
+
+typedef int (*ollama_nvml_device_get_utilization_fn)(void *, ollama_nvml_utilization_t *);
+
+static int ollama_call_nvml_device_get_utilization(void * fn, void * device, unsigned int * gpu, unsigned int * memory) {
+	ollama_nvml_utilization_t u = {0};
+	int ret = ((ollama_nvml_device_get_utilization_fn) fn)(device, &u);
+	if (ret == 0) {
+		*gpu = u.gpu;
+		*memory = u.memory;
+	}
+	return ret;
+}
+
 typedef int (*ollama_nvml_device_get_uint_fn)(void *, unsigned int *);
 typedef int (*ollama_nvml_device_get_max_clock_fn)(void *, int, unsigned int *);
 
@@ -285,6 +303,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"unsafe"
@@ -797,6 +816,8 @@ func FreeMemoryByPCI(pciIDs []string) map[string]uint64 {
 type nvmlLiveSession struct {
 	memoryFn unsafe.Pointer
 	handleFn unsafe.Pointer
+	// utilFn is optional: a driver without it still reports free memory.
+	utilFn unsafe.Pointer
 
 	mu      sync.Mutex
 	handles map[string]unsafe.Pointer
@@ -827,9 +848,11 @@ func liveMemorySession() *nvmlLiveSession {
 			return
 		}
 
+		utilFn, _ := dlsym(nvml, "nvmlDeviceGetUtilizationRates")
 		liveMemorySessionValue = &nvmlLiveSession{
 			memoryFn: memoryFn,
 			handleFn: handleFn,
+			utilFn:   utilFn,
 			handles:  make(map[string]unsafe.Pointer),
 		}
 	})
@@ -1302,4 +1325,42 @@ func nvidiaTopology(pciIDs []string) *ml.Topology {
 	})
 	t.Status, t.Detail = topologyStatus(t.Links)
 	return t
+}
+
+// UtilizationByPCI reads each device's busy figures from the held-open NVML session -- a
+// handful of microseconds per device, the same cost as the free-memory read it sits beside --
+// and falls back to amdgpu's sysfs for devices NVML does not know. A device that answers
+// neither is left out, and is reported as "not read", never as idle.
+//
+// Measured on this box: a card whose firmware had faulted answered NOT_SUPPORTED to this call
+// while its temperature read answered RESET_REQUIRED, so a missing reading here is not by
+// itself a fault signal (see UnavailableDevices for that).
+func UtilizationByPCI(pciIDs []string) map[string]ml.DeviceUtilization {
+	out := make(map[string]ml.DeviceUtilization, len(pciIDs))
+	if session := liveMemorySession(); session != nil && session.utilFn != nil {
+		for _, pci := range pciIDs {
+			if pci == "" {
+				continue
+			}
+			handle, ok := session.handle(pci)
+			if !ok {
+				continue
+			}
+			var gpu, mem C.uint
+			if C.ollama_call_nvml_device_get_utilization(session.utilFn, handle, &gpu, &mem) != 0 {
+				continue
+			}
+			g, m := int(gpu), int(mem)
+			out[pci] = ml.DeviceUtilization{GPUPercent: &g, MemoryPercent: &m}
+		}
+	}
+	for _, pci := range pciIDs {
+		if _, done := out[pci]; done || pci == "" {
+			continue
+		}
+		if u, ok := amdUtilization(filepath.Join(sysfsRoot, "bus", "pci", "devices", pci)); ok {
+			out[pci] = u
+		}
+	}
+	return out
 }

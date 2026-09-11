@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -154,4 +155,22 @@ func amdUnavailableDevices(usable map[string]bool) []ml.UnavailableDevice {
 func amdDriverName(deviceDir string) string {
 	driver, _ := readSysfsDriverName(filepath.Join(deviceDir, "driver"))
 	return driver
+}
+
+// amdUtilization reads amdgpu's busy percentages. Only an awake amdgpu device is asked: a
+// runtime-suspended one answers EPERM (it is idle, but that is an inference, not a reading),
+// and an ASIC may not create mem_busy_percent at all -- this box's iGPU has only the gpu one.
+// Each figure is present only if its read succeeded.
+func amdUtilization(dir string) (ml.DeviceUtilization, bool) {
+	if amdDriverName(dir) != "amdgpu" || readTrimmed(filepath.Join(dir, "power", "runtime_status")) != "active" {
+		return ml.DeviceUtilization{}, false
+	}
+	var u ml.DeviceUtilization
+	if v, err := strconv.Atoi(readTrimmed(filepath.Join(dir, "gpu_busy_percent"))); err == nil {
+		u.GPUPercent = &v
+	}
+	if v, err := strconv.Atoi(readTrimmed(filepath.Join(dir, "mem_busy_percent"))); err == nil {
+		u.MemoryPercent = &v
+	}
+	return u, u.GPUPercent != nil || u.MemoryPercent != nil
 }

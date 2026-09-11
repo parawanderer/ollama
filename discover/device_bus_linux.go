@@ -26,7 +26,11 @@ func busStateFor(pciID string) *ml.DeviceBusState {
 		return nil
 	}
 
-	dir := filepath.Join(sysfsPCIRoot, pciID)
+	return busStateAt(filepath.Join(sysfsPCIRoot, pciID))
+}
+
+// busStateAt is busStateFor for a device directory the caller has already resolved.
+func busStateAt(dir string) *ml.DeviceBusState {
 	if _, err := os.Stat(dir); err != nil {
 		// Not enumerated. Reported rather than omitted: "the kernel cannot see this
 		// device either" is the single most useful fact about a missing GPU, and an

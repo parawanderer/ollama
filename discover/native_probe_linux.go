@@ -897,18 +897,25 @@ func boolToCInt(v bool) C.int {
 	return 0
 }
 
-// UnavailableDevices reports GPUs the machine has that the compute backends did not offer.
+// UnavailableDevices reports GPUs the machine has that the compute backends did not offer,
+// from every vendor this package knows how to ask.
+func UnavailableDevices(known []string) []ml.UnavailableDevice {
+	return append(nvidiaUnavailableDevices(known), amdUnavailableDevices(usableSet(known))...)
+}
+
+// nvidiaUnavailableDevices is the NVIDIA half of UnavailableDevices.
 //
 // known is the set of PCI addresses discovery DID return, in ml.DeviceInfo.PCIID form.
 // Anything NVML enumerates and that set does not contain is a device that physically
 // exists and cannot be used -- see the note on ml.UnavailableDevice for why that comparison
 // is the whole detector, and why the absence of such a device is otherwise unreportable.
 //
-// Returns nil on any failure to ask, and that is deliberate: this is a diagnostic, and a
-// diagnostic that invents devices when its own plumbing breaks is worse than one that stays
-// quiet. An empty result means "nothing to report OR could not look", which is why the
-// caller does not present it as "all devices healthy".
-func UnavailableDevices(known []string) []ml.UnavailableDevice {
+// When NVML cannot be asked, it falls back to the PCI bus rather than returning nothing,
+// because the case NVML is least able to describe -- a card the driver has lost -- is the one
+// most worth reporting. It never invents a reason it did not read. An empty result still
+// means "nothing to report OR could not look", which is why the caller does not present it
+// as "all devices healthy".
+func nvidiaUnavailableDevices(known []string) []ml.UnavailableDevice {
 	nvml, err := dlopenFirst([]string{"libnvidia-ml.so.1", "libnvidia-ml.so"}, false)
 	if err != nil {
 		slog.Debug("NVML unavailable, falling back to the PCI bus", "error", err)

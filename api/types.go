@@ -877,13 +877,18 @@ type ProcessModelResponse struct {
 	// the way they always have.
 	State string `json:"state,omitempty"`
 
-	Model         string       `json:"model"`
-	Size          int64        `json:"size"`
-	Digest        string       `json:"digest"`
-	Details       ModelDetails `json:"details,omitempty"`
-	ExpiresAt     time.Time    `json:"expires_at"`
-	SizeVRAM      int64        `json:"size_vram"`
-	ContextLength int          `json:"context_length"`
+	Model     string       `json:"model"`
+	Size      int64        `json:"size"`
+	Digest    string       `json:"digest"`
+	Details   ModelDetails `json:"details,omitempty"`
+	ExpiresAt time.Time    `json:"expires_at"`
+	SizeVRAM  int64        `json:"size_vram"`
+
+	// ContextLength is the context the engine allocated per slot, which is what a client
+	// can actually fill. It is not necessarily the num_ctx that was requested: llama.cpp
+	// rounds each slot up to a multiple of 256, so a request for 12345 serves 12544. It
+	// falls back to the requested figure until the engine has reported its own.
+	ContextLength int `json:"context_length"`
 
 	// Memory splits SizeVRAM by what the memory holds, summed across every device this
 	// model sits on. Its fields sum to SizeVRAM. Absent while a model is still loading,

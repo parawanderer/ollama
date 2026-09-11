@@ -561,6 +561,8 @@ func (c *Client) WeightsOnDisk() int64 {
 // device assignment, and nil says so rather than claiming everything is on one device.
 func (c *Client) LayerPlacement() *api.ModelPlacement { return nil }
 
+func (c *Client) GrantedContext() (perSlot, total int) { return 0, 0 }
+
 // Activity implements llm.LlamaServer. The MLX runner exposes no per-slot progress, and nil
 // says "not reported" rather than claiming the model is idle.
 func (c *Client) Activity(ctx context.Context, busy bool) *api.RunnerActivity { return nil }

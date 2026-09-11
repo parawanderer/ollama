@@ -98,6 +98,13 @@ type LlamaServer interface {
 	// was not asked to collect it (see envconfig.LayerPlacement).
 	LayerPlacement() *api.ModelPlacement
 
+	// GrantedContext is the context the engine actually allocated, per slot and in total,
+	// or zeros when it has not been read. It is not ContextLength, and the difference is
+	// load-bearing: ContextLength is what was ASKED and is what decides whether a runner can
+	// be reused, so replacing it with the granted figure would make every request with an
+	// unaligned num_ctx look different from the runner serving it and reload the model.
+	GrantedContext() (perSlot, total int)
+
 	// SetOnWeightsLoaded registers a callback fired when the model's weights reach device
 	// memory, which happens partway through a load rather than at its end. It is passed
 	// the moment the weights arrived, which may predate the call itself, and how much

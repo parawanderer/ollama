@@ -1431,8 +1431,17 @@ iGPUScan:
 		// The total is what the load would have taken with room for it: 5.37 GiB against
 		// 5.23 actually measured on a full offload, 2.7% apart. So a spill is not a lost
 		// sample but a good one, taken at the moment memory ran out.
+		// Filed against the context the memory was actually allocated for. The calibration
+		// line maps context to memory, so an x-value that is 199 tokens short of the cache
+		// it describes bends the line -- by slope x 199, which on a model holding 1 MiB of
+		// KV per token is 199 MiB, every time an unaligned num_ctx is requested. The total,
+		// not per slot: calibration's axis is effectiveModelContext x numParallel.
+		recordedCtx := runner.calibrationCtx
+		if _, grantedTotal := llama.GrantedContext(); grantedTotal > 0 {
+			recordedCtx = grantedTotal
+		}
 		if loadedTotal > 0 {
-			s.vramCalibration.Record(runner.calibrationKey, runner.calibrationCtx, loadedTotal)
+			s.vramCalibration.Record(runner.calibrationKey, recordedCtx, loadedTotal)
 			if s.vramCalibrationPath != "" {
 				go s.vramCalibration.Persist(s.vramCalibrationPath)
 			}
@@ -1445,7 +1454,7 @@ iGPUScan:
 		if loadedTotal > loadedVRAM {
 			slog.Warn("model did not fit and is running partly on the CPU",
 				"model", req.model.ModelPath,
-				"num_ctx", runner.calibrationCtx,
+				"num_ctx", recordedCtx,
 				"needed", format.HumanBytes2(loadedTotal),
 				"on_device", format.HumanBytes2(loadedVRAM),
 				"on_host", format.HumanBytes2(loadedTotal-loadedVRAM))
@@ -2619,7 +2628,14 @@ func (r *runnerRef) reportLocked() loadedModel {
 		gpus:      slices.Clone(r.gpus),
 	}
 	if r.llama != nil {
+		// The context the engine built, not the one asked for. They differ whenever num_ctx
+		// is not a multiple of 256 -- asked 12345, the engine allocated 12544 -- and this
+		// figure is what a client can actually fill. The asked value stays in Options,
+		// where runner reuse compares it; see GrantedContext for why the two must not merge.
 		lm.contextLength = r.llama.ContextLength()
+		if granted, _ := r.llama.GrantedContext(); granted > 0 {
+			lm.contextLength = granted
+		}
 		total, vram := r.llama.MemorySize()
 		lm.size = int64(total)
 		lm.sizeVRAM = int64(vram)

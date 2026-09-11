@@ -2069,12 +2069,13 @@ func TestSchedLlamaServerEvictsExistingOnPending(t *testing.T) {
 }
 
 type mockLlm struct {
-	memVRAM       api.MemoryBreakdown
-	memHost       api.MemoryBreakdown
-	memByGPU      map[ml.DeviceID]api.MemoryBreakdown
-	weightsOnDisk int64
-	placement     *api.ModelPlacement
-	activity      *api.RunnerActivity
+	grantedSeq, grantedTotal int
+	memVRAM                  api.MemoryBreakdown
+	memHost                  api.MemoryBreakdown
+	memByGPU                 map[ml.DeviceID]api.MemoryBreakdown
+	weightsOnDisk            int64
+	placement                *api.ModelPlacement
+	activity                 *api.RunnerActivity
 
 	modelPath         string
 	pingResp          error
@@ -2170,6 +2171,8 @@ func (s *mockLlm) MemoryBreakdownByGPU(id ml.DeviceID) api.MemoryBreakdown {
 func (s *mockLlm) WeightsOnDisk() int64 { return s.weightsOnDisk }
 
 func (s *mockLlm) LayerPlacement() *api.ModelPlacement { return s.placement }
+
+func (s *mockLlm) GrantedContext() (perSlot, total int) { return s.grantedSeq, s.grantedTotal }
 
 func (s *mockLlm) Activity(ctx context.Context, busy bool) *api.RunnerActivity { return s.activity }
 
@@ -2419,4 +2422,46 @@ func TestProbePoints(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSchedLoadFilesCalibrationAtTheGrantedContext drives a real load. The calibration line
+// maps context to memory, so a sample filed 199 tokens short of the cache it measured bends
+// the line by slope x 199 every time an unaligned num_ctx is used.
+//
+// It also pins the other half: the runner's own options keep the REQUESTED context, because
+// that is what reuse compares against the next request.
+func TestSchedLoadFilesCalibrationAtTheGrantedContext(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer done()
+
+	s := InitScheduler(ctx)
+	scenario := newScenarioRequestWithContext(t, ctx, "granted", 10, nil, map[ml.DeviceID]uint64{}, 131072)
+	scenario.req.opts.NumCtx = 12345
+	scenario.srv.contextLength = 12345
+	// The two-slot figures from a real load, so per-slot and total differ: the test must be
+	// able to tell which of the two the calibration was filed under.
+	scenario.srv.grantedSeq, scenario.srv.grantedTotal = 12544, 25088
+	scenario.srv.totalSize = 3 << 30
+	s.newServerFn = scenario.newServer
+
+	s.load(scenario.req, ml.SystemInfo{}, nil, false)
+
+	var runner *runnerRef
+	select {
+	case err := <-scenario.req.errCh:
+		t.Fatal(err)
+	case runner = <-scenario.req.successCh:
+	}
+
+	require.Equal(t, 12345, runner.Options.NumCtx,
+		"the runner must keep the requested context; reuse compares it with the next request")
+
+	// With one sample, Predict returns vram + bytesPerToken x (asked - recorded). Asking at
+	// the granted TOTAL with a slope of 1 gives back exactly 3 GiB only if the sample was
+	// filed there; filed at the requested context or at the per-slot figure it reads high.
+	got, ok := s.vramCalibration.Predict(runner.calibrationKey, 25088, 0, 1)
+	require.True(t, ok, "the load was not recorded at all")
+	require.Equal(t, uint64(3<<30), got,
+		"calibration was not filed at the granted total (25088): calibration's axis is "+
+			"context x slots, so the per-slot figure would halve every multi-slot sample")
 }

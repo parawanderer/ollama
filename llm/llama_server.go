@@ -182,6 +182,14 @@ type llamaServerRunner struct {
 	// handle to set the callback on -- without it the notification is lost to that race.
 	onWeightsLoaded func(time.Time, uint64)
 	weightsLoadedAt time.Time
+
+	// grantedCtxSeq and grantedCtxTotal are the context the engine allocated for serving,
+	// per slot and in total, read from its own llama_context lines. llama.cpp rounds the
+	// per-slot context up to a multiple of 256 and multiplies back: asked 12345 with two
+	// slots, it built 2 x 12544 = 25088, so neither figure can be derived from the request
+	// by rounding the total, which gives 24832. Read, not computed. Guarded by memoryMu.
+	grantedCtxSeq   int
+	grantedCtxTotal int
 	weightsVRAM     uint64
 
 	// System-reported free VRAM per device at model load time, parsed from
@@ -378,6 +386,12 @@ func contextShiftPromptLimit(numCtx, numKeep int) int {
 
 func (s *llamaServerRunner) ContextLength() int {
 	return s.options.NumCtx
+}
+
+func (s *llamaServerRunner) GrantedContext() (perSlot, total int) {
+	s.memoryMu.Lock()
+	defer s.memoryMu.Unlock()
+	return s.grantedCtxSeq, s.grantedCtxTotal
 }
 
 // FindLlamaServer locates the llama-server binary in lib/ollama/.
@@ -3126,6 +3140,14 @@ var layerAssignedRegex = regexp.MustCompile(
 
 // bufferSizeRegex matches llama-server buffer size lines and captures the
 // component so repeated fit/probe values can be replaced by the final load.
+// servingContextRegex and servingContextSeqRegex read the context the engine allocated.
+// They are anchored on "=" so neither matches "n_ctx_train", "n_ctx_orig_yarn" or the
+// "n_ctx_seq (12544) < n_ctx_train" advisory, and n_ctx cannot match n_ctx_seq.
+var (
+	servingContextRegex    = regexp.MustCompile(`llama_context: n_ctx\s+=\s+(\d+)`)
+	servingContextSeqRegex = regexp.MustCompile(`llama_context: n_ctx_seq\s+=\s+(\d+)`)
+)
+
 var bufferSizeRegex = regexp.MustCompile(`(?m)(?:^|\n)[^\n:]*?([A-Za-z_][A-Za-z0-9_]*):\s+(\S+)\s+(model|KV|compute|output|RS)\s+buffer size\s*=\s*([\d.]+)\s*MiB`)
 
 // clipBackendRegex captures the backend a multimodal projector was placed on:
@@ -3193,6 +3215,10 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
 		func() {
 			w.runner.memoryMu.Lock()
 			defer w.runner.memoryMu.Unlock()
+
+			// Captured before this chunk's buffers are parsed: whether the real load had
+			// already begun decides which of this chunk's context lines can be believed.
+			realLoadBefore := !w.weightsSeenAt.IsZero()
 
 			if match := deviceFreeRegex.FindSubmatch(b); match != nil {
 				devName := string(match[1])
@@ -3305,6 +3331,7 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
 					}
 				}
 			}
+			w.noteServingContextLocked(b, realLoadBefore)
 		}()
 
 		if notifyWeightsLoaded != nil {
@@ -3312,6 +3339,69 @@ func (w *memoryParsingWriter) Write(b []byte) (int, error) {
 		}
 	}
 	return w.inner.Write(b)
+}
+
+// noteServingContextLocked records the context the engine allocated to serve, once.
+//
+// llama-server prints llama_context lines more than once, and only one set describes the
+// context that serves. Transcribed from a real load, in order:
+//
+//	load_tensors: CUDA0 model buffer size =    0.00 MiB   <- the fit pass, measuring
+//	llama_context: n_ctx_seq             = 12544          <- its dry-run context
+//	common_params_fit_impl: ... no changes needed          <- its verdict
+//	load_tensors: CUDA0 model buffer size = 1998.84 MiB   <- the real load
+//	llama_context: n_ctx_seq             = 12544          <- THE serving context
+//
+// The two agree today because ollama passes -c. They stop agreeing the moment it does not:
+// the fit pass runs at the initial parameters and only then reduces the context, so the
+// dry-run figure is the one it rejected. So a line counts only once the real load has
+// begun, which is the same signal load.weights uses -- a non-zero model buffer.
+//
+// And the FIRST line after that wins, not the last: a draft model builds a second context
+// after the main one, and "latest" would report the draft model's.
+//
+// Positions matter inside one chunk. A write can carry many lines, and a chunk holding
+// both a dry-run context line and the first real buffer must not accept the dry-run line
+// merely because the real load began somewhere in the same write.
+func (w *memoryParsingWriter) noteServingContextLocked(b []byte, realLoadBefore bool) {
+	if w.runner.grantedCtxSeq > 0 && w.runner.grantedCtxTotal > 0 {
+		return
+	}
+
+	after := 0
+	if !realLoadBefore {
+		after = -1
+		for _, m := range bufferSizeRegex.FindAllSubmatchIndex(b, -1) {
+			if string(b[m[6]:m[7]]) != "model" {
+				continue
+			}
+			if mib, err := strconv.ParseFloat(string(b[m[8]:m[9]]), 64); err == nil && mib > 0 {
+				after = m[1]
+				break
+			}
+		}
+		if after < 0 {
+			return
+		}
+	}
+
+	first := func(re *regexp.Regexp) int {
+		for _, m := range re.FindAllSubmatchIndex(b, -1) {
+			if m[0] < after {
+				continue
+			}
+			if n, err := strconv.Atoi(string(b[m[2]:m[3]])); err == nil && n > 0 {
+				return n
+			}
+		}
+		return 0
+	}
+	if w.runner.grantedCtxTotal == 0 {
+		w.runner.grantedCtxTotal = first(servingContextRegex)
+	}
+	if w.runner.grantedCtxSeq == 0 {
+		w.runner.grantedCtxSeq = first(servingContextSeqRegex)
+	}
 }
 
 // addToBreakdown files a buffer under the field its kind describes.

@@ -110,15 +110,16 @@ func TestPsHandlerOmitsDevicesOnCPU(t *testing.T) {
 // memory accessors. Everything else panics if the handler ever grows a call.
 type fakeRunner struct {
 	llm.LlamaServer
-	vram          map[ml.DeviceID]uint64
-	total         uint64
-	gpuTotal      uint64
-	memVRAM       api.MemoryBreakdown
-	memHost       api.MemoryBreakdown
-	memByGPU      map[ml.DeviceID]api.MemoryBreakdown
-	weightsOnDisk int64
-	placement     *api.ModelPlacement
-	activity      *api.RunnerActivity
+	grantedSeq, grantedTotal int
+	vram                     map[ml.DeviceID]uint64
+	total                    uint64
+	gpuTotal                 uint64
+	memVRAM                  api.MemoryBreakdown
+	memHost                  api.MemoryBreakdown
+	memByGPU                 map[ml.DeviceID]api.MemoryBreakdown
+	weightsOnDisk            int64
+	placement                *api.ModelPlacement
+	activity                 *api.RunnerActivity
 }
 
 func (f *fakeRunner) MemorySize() (uint64, uint64)    { return f.total, f.gpuTotal }
@@ -136,6 +137,8 @@ func (f *fakeRunner) MemoryBreakdownByGPU(id ml.DeviceID) api.MemoryBreakdown {
 func (f *fakeRunner) WeightsOnDisk() int64 { return f.weightsOnDisk }
 
 func (f *fakeRunner) LayerPlacement() *api.ModelPlacement { return f.placement }
+
+func (f *fakeRunner) GrantedContext() (perSlot, total int) { return f.grantedSeq, f.grantedTotal }
 
 func (f *fakeRunner) Activity(ctx context.Context, busy bool) *api.RunnerActivity { return f.activity }
 
@@ -262,5 +265,30 @@ func TestPsHandlerDoesNotDuplicateALoadingModel(t *testing.T) {
 	}
 	if got.Models[0].State == "loading" {
 		t.Error("the resident row was replaced by the loading placeholder")
+	}
+}
+
+// /api/ps reports the context the engine built, which is what a client can fill. Asked for
+// 12345, llama.cpp allocates 12544 -- it rounds each slot up to a multiple of 256 -- and
+// reporting the asked figure understates the capacity and misfiles any comparison against
+// the memory, which was sized for 12544.
+func TestPsHandlerReportsTheGrantedContext(t *testing.T) {
+	runner := func(granted int) *runnerRef {
+		return &runnerRef{
+			model:     &Model{ShortName: "granite4.1:3b"},
+			expiresAt: time.Now().Add(5 * time.Minute),
+			llama:     &fakeRunner{grantedSeq: granted, grantedTotal: granted}, // ContextLength() is 4096
+		}
+	}
+
+	got, _ := psResponse(t, runner(12544))
+	if cl := got.Models[0].ContextLength; cl != 12544 {
+		t.Errorf("context_length = %d, want the granted 12544", cl)
+	}
+
+	// Until the engine has said, the requested figure is the best available.
+	got, _ = psResponse(t, runner(0))
+	if cl := got.Models[0].ContextLength; cl != 4096 {
+		t.Errorf("context_length = %d, want the requested 4096 while nothing was granted", cl)
 	}
 }

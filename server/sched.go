@@ -181,7 +181,7 @@ func (s *Scheduler) publishEvent(ev api.ModelEvent) {
 	if ev.At.IsZero() {
 		ev.At = time.Now().UTC()
 	}
-	s.ring.add(retainedFrame{at: ev.At, kind: ev.Type, model: ev.Model, reason: ev.Reason})
+	s.ring.add(retainedFrame{at: ev.At, event: ev})
 	s.events.Publish(ev)
 	s.wakeSampler()
 }
@@ -218,7 +218,7 @@ func (s *Scheduler) publishExpiry(model string, at time.Time) {
 // a KV cache filling during a generation moves the number with nothing to announce it.
 func (s *Scheduler) publishSample(ps *api.ProcessResponse, info *api.InfoResponse) {
 	at := time.Now().UTC()
-	s.ring.add(retainedFrame{at: at, kind: "sample", ps: ps, info: info})
+	s.ring.add(retainedFrame{at: at, event: api.ModelEvent{Type: "sample", At: at, PS: ps, Info: info}})
 	s.events.Publish(api.ModelEvent{Type: "sample", At: at, PS: ps, Info: info})
 }
 

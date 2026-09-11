@@ -35,12 +35,21 @@ const (
 // and converted to a per-connection offset when served, since each connection anchors on
 // its own hello.
 type retainedFrame struct {
-	at     time.Time
-	kind   string
-	model  string
-	reason string
-	ps     *api.ProcessResponse
-	info   *api.InfoResponse
+	at time.Time
+
+	// event is the whole event, not a chosen subset of it.
+	//
+	// It used to be six named fields -- kind, model, reason, ps, info -- and an edge
+	// therefore replayed carrying only its model name. Everything that makes an edge worth
+	// having was dropped: weights_ms and context_ms, size_vram, memory, placement, timings,
+	// estimate, expires_at. A client reconnecting (which for a browser extension is the
+	// ordinary case, not the exceptional one) got a load span it could not subdivide and a
+	// generation with no prefill/decode split.
+	//
+	// Keeping the event whole is what makes that unfixable-by-omission: there is no list
+	// here to forget to extend. It was the third hand-written copy of api.ModelEvent in
+	// this file's neighbourhood, and the only one with no test asserting it was complete.
+	event api.ModelEvent
 }
 
 type frameRing struct {

@@ -11,9 +11,9 @@ func TestFrameRingDropsFramesPastTheWindow(t *testing.T) {
 	r := newFrameRing(time.Minute)
 	now := time.Now()
 
-	r.add(retainedFrame{at: now.Add(-90 * time.Second), kind: "sample"})
-	r.add(retainedFrame{at: now.Add(-30 * time.Second), kind: "sample"})
-	r.add(retainedFrame{at: now, kind: EventLoadStart})
+	r.add(retainedFrame{at: now.Add(-90 * time.Second), event: api.ModelEvent{Type: "sample"}})
+	r.add(retainedFrame{at: now.Add(-30 * time.Second), event: api.ModelEvent{Type: "sample"}})
+	r.add(retainedFrame{at: now, event: api.ModelEvent{Type: EventLoadStart}})
 
 	frames, _ := r.since(time.Hour)
 	if len(frames) != 2 {
@@ -26,8 +26,8 @@ func TestFrameRingDropsFramesPastTheWindow(t *testing.T) {
 // a period nobody measured.
 func TestFrameRingReportsHowFarBackItReaches(t *testing.T) {
 	r := newFrameRing(time.Hour)
-	r.add(retainedFrame{at: time.Now().Add(-20 * time.Second), kind: "sample"})
-	r.add(retainedFrame{at: time.Now(), kind: "sample"})
+	r.add(retainedFrame{at: time.Now().Add(-20 * time.Second), event: api.ModelEvent{Type: "sample"}})
+	r.add(retainedFrame{at: time.Now(), event: api.ModelEvent{Type: "sample"}})
 
 	frames, reach := r.since(time.Hour)
 	if len(frames) != 2 {

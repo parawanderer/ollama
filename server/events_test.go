@@ -114,8 +114,8 @@ func TestEventBusReportsDropsToTheSubscriber(t *testing.T) {
 // The difference is the client's gap, and a gap it cannot see is one it will draw over.
 func TestFrameRingBackfillReportsShortfall(t *testing.T) {
 	r := newFrameRing(10 * time.Minute)
-	r.add(retainedFrame{at: time.Now().Add(-8 * time.Second), kind: "sample"})
-	r.add(retainedFrame{at: time.Now(), kind: EventLoadComplete, model: "m"})
+	r.add(retainedFrame{at: time.Now().Add(-8 * time.Second), event: api.ModelEvent{Type: "sample"}})
+	r.add(retainedFrame{at: time.Now(), event: api.ModelEvent{Type: EventLoadComplete, Model: "m"}})
 
 	frames, reach := r.since(10 * time.Minute)
 	if len(frames) != 2 {
@@ -181,7 +181,7 @@ func TestEventFrameCopiesEveryCommonField(t *testing.T) {
 		Info:      &api.InfoResponse{},
 	}
 
-	frame := (&Server{}).eventFrame(ev, at)
+	frame := frameFromEvent(ev, at)
 
 	jsonNames := func(v any) map[string]reflect.Value {
 		out := map[string]reflect.Value{}
@@ -372,5 +372,77 @@ func decodeFrames(t *testing.T, b []byte, compressed bool) []api.EventFrame {
 			return out
 		}
 		out = append(out, f)
+	}
+}
+
+// TestBackfilledEdgeCarriesTheSamePayloadAsLive is the regression for a real bug: an edge
+// replayed from the ring arrived carrying only its model name.
+//
+// The ring stored a hand-picked six fields of api.ModelEvent and the replay loop rebuilt a
+// frame from those, so every field that makes an edge worth having was dropped on the way
+// through — weights_ms, context_ms, size_vram, memory, placement, timings, estimate,
+// expires_at. Nothing broke: a client reads each conditionally and absence already means
+// "not reported", so it drew an empty span instead of a wrong one. That is the failure this
+// endpoint exists to prevent, arriving quietly.
+//
+// It matters because backfill is the ORDINARY path for a browser client — an evicted
+// service worker takes the connection with it, so a reconnect asking for the whole ring is
+// routine.
+func TestBackfilledEdgeCarriesTheSamePayloadAsLive(t *testing.T) {
+	at := time.Now().UTC()
+	expires := at.Add(time.Hour)
+	ev := api.ModelEvent{
+		Type: EventLoadComplete, Model: "granite4.1:3b", At: at,
+		DurationMs: 517, WeightsMs: 327, ContextMs: 190,
+		SizeVRAM: 2915943054, SizeTotal: 2915943054, WeightsOnDisk: 2099501664,
+		Memory:    &api.MemoryBreakdown{Weights: 2095935651, KVCache: 671088640},
+		Placement: &api.ModelPlacement{NumLayers: 41},
+		Timings:   &api.GenerationTimings{PromptTokens: 4098, PromptMs: 3.5, EvalMs: 170.6},
+		Estimate:  &api.LoadEstimate{Predicted: 2915943054, Source: "calibration"},
+		ExpiresAt: &expires,
+		Reason:    "because",
+	}
+
+	// Live: what a connected subscriber receives.
+	live := frameFromEvent(ev, at)
+
+	// Backfilled: through the REAL publish path, not by building a retainedFrame here.
+	//
+	// A first version of this test constructed the retained frame directly and passed
+	// against the bug, because the stripping happened in publishEvent -- the one line the
+	// test skipped. Going through the scheduler is what makes it a regression test rather
+	// than an assertion that the ring returns what it was handed.
+	sched := &Scheduler{
+		ring:            newFrameRing(10 * time.Minute),
+		events:          newEventBus(),
+		getGpuFn:        getGpuFn,
+		getSystemInfoFn: getSystemInfoFn,
+	}
+	sched.publishEvent(ev)
+	got, _ := sched.ring.since(10 * time.Minute)
+	if len(got) != 1 {
+		t.Fatalf("ring returned %d frames, want 1", len(got))
+	}
+	replayed := frameFromEvent(got[0].event, at)
+
+	if !reflect.DeepEqual(live, replayed) {
+		t.Errorf("a backfilled edge differs from the live one.\nlive:     %+v\nreplayed: %+v",
+			live, replayed)
+	}
+	// Named explicitly as well, so a future change that drops one of these fails with the
+	// field name rather than with a struct diff nobody reads.
+	for name, ok := range map[string]bool{
+		"weights_ms": replayed.WeightsMs == 327,
+		"context_ms": replayed.ContextMs == 190,
+		"size_vram":  replayed.SizeVRAM == 2915943054,
+		"memory":     replayed.Memory != nil,
+		"placement":  replayed.Placement != nil,
+		"timings":    replayed.Timings != nil,
+		"estimate":   replayed.Estimate != nil,
+		"expires_at": replayed.ExpiresAt != nil,
+	} {
+		if !ok {
+			t.Errorf("%s was lost on the way through the ring", name)
+		}
 	}
 }

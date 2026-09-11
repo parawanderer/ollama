@@ -2295,7 +2295,11 @@ func (s *Server) PsHandler(c *gin.Context) {
 // function so a test can assert that no field is dropped in the conversion: this is a
 // hand-written copy and it has silently lost a field three times, each time producing a
 // client that could not see something the server was already reporting.
-func (s *Server) eventFrame(ev api.ModelEvent, started time.Time) api.EventFrame {
+// frameFromEvent converts an event to the frame that goes on the wire. It is the single
+// conversion: the live path and the backfill path both use it, so a field added to
+// api.ModelEvent cannot reach one and not the other. TestEventFrameCopiesEveryCommonField
+// guards it.
+func frameFromEvent(ev api.ModelEvent, started time.Time) api.EventFrame {
 	f := api.EventFrame{
 		Kind:          ev.Type,
 		Model:         ev.Model,
@@ -2316,9 +2320,20 @@ func (s *Server) eventFrame(ev api.ModelEvent, started time.Time) api.EventFrame
 	}
 	// Bodies come from the event where it carried them -- a sample measured them at its
 	// own instant, and re-reading here would report a later moment under an earlier
-	// timestamp. An edge carries none, so its resulting placement is read now, which is
-	// as close to the edge as this can get.
+	// timestamp.
 	f.PS, f.Info, f.ExpiresAt = ev.PS, ev.Info, ev.ExpiresAt
+	return f
+}
+
+// eventFrame is frameFromEvent plus the one thing only a live emission may do: read the
+// placement now, for an edge that carried none.
+//
+// That step is why replay does NOT go through here. A frame off the ring happened minutes
+// ago, and attaching the current placement to it would state, with a timestamp, a fact
+// about a moment that was never measured -- the same error as drawing a line across a
+// sampling gap, arriving from the other direction.
+func (s *Server) eventFrame(ev api.ModelEvent, started time.Time) api.EventFrame {
+	f := frameFromEvent(ev, started)
 	if f.PS == nil && ev.Type != EventLoadStart {
 		f.PS = s.processResponse()
 	}
@@ -2637,14 +2652,11 @@ func (s *Server) EventsHandler(c *gin.Context) {
 	// Backfilled frames carry a negative offset: they happened before this connection
 	// opened, and saying so is more honest than restamping them as if they had not.
 	for _, f := range backfill {
-		if !emit(api.EventFrame{
-			Kind:   f.kind,
-			Model:  f.model,
-			Reason: f.reason,
-			PS:     f.ps,
-			Info:   f.info,
-			T:      f.at.Sub(started).Milliseconds(),
-		}) {
+		// Through the same conversion the live path uses, so a backfilled edge carries
+		// everything a live one does. Not through eventFrame: that fills in the current
+		// placement for an edge without one, which for a frame from ten minutes ago would
+		// be a claim about a moment nobody measured.
+		if !emit(frameFromEvent(f.event, started)) {
 			return
 		}
 	}

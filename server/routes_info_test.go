@@ -293,3 +293,34 @@ func TestInfoPublishesTheLoadStallTimeout(t *testing.T) {
 			"not a constant of the client's)", got.LoadStallTimeoutMs, want)
 	}
 }
+
+// TestInfoHandlerReportsTheBusAddress pins the join key a client needs. unavailable_gpus is
+// keyed by pci_id, so without the same field here a client cannot tell that a card which
+// reappears in supported_gpus is the one that was reported faulted a minute ago -- gpu_id is
+// an index into one enumeration and can change when a card drops out and comes back.
+func TestInfoHandlerReportsTheBusAddress(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+	s := &Server{
+		sched: &Scheduler{
+			getSystemInfoFn: getSystemInfoFn,
+			getGpuFn: func(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.DeviceInfo {
+				return []ml.DeviceInfo{
+					{DeviceID: ml.DeviceID{ID: "0", Library: "CUDA"}, Name: "CUDA0", PCIID: "0000:01:00.0", TotalMemory: 96 * format.GibiByte},
+					{DeviceID: ml.DeviceID{ID: "0", Library: "Metal"}, Name: "Metal", TotalMemory: 24 * format.GibiByte},
+				}
+			},
+			loaded: map[string]*runnerRef{},
+		},
+	}
+
+	gpus := infoResponse(t, s).ComputeInfo.SupportedGPUs
+	if gpus[0].PCIID != "0000:01:00.0" {
+		t.Errorf("pci_id = %q, want 0000:01:00.0, the same form unavailable_gpus uses", gpus[0].PCIID)
+	}
+	// A backend with no bus address omits the field rather than sending an empty key that
+	// would join to nothing -- or worse, to every other device that also lacks one.
+	if gpus[1].PCIID != "" {
+		t.Errorf("pci_id = %q for a device with no bus address, want it omitted", gpus[1].PCIID)
+	}
+}

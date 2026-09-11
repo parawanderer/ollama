@@ -2742,6 +2742,7 @@ func (s *Server) infoResponse() *api.InfoResponse {
 	for i, dev := range devices {
 		gpus[i] = api.GPUInfo{
 			ID:             dev.ID,
+			PCIID:          dev.PCIID,
 			Name:           dev.Name,
 			TotalMemory:    dev.TotalMemory,
 			PhysicalMemory: dev.PhysicalMemory,

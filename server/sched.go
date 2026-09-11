@@ -1022,6 +1022,30 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 	// When the load began, so load.complete can report a duration that covers the whole
 	// thing rather than the sliver after the runner object was created.
 	var loadStartedAt time.Time
+
+	// Every load.start must be followed by exactly one load.complete or load.failed, and the
+	// loading row and the in-flight count it set up must be undone. That used to happen only
+	// on the goroutine that finishes a successful launch, so every exit between load.start
+	// and that handoff leaked all three -- six of them, three of which are retries that
+	// announce again and so drove loadsInFlight above zero for good. Measured: a client that
+	// disconnected mid-load left a "loading" row on /api/ps that never cleared, for a load
+	// whose llama-server had already exited, and no load.failed on the stream.
+	var loadAnnounced, loadSettled bool
+	abandon := func(err error, retrying bool) {
+		if !loadAnnounced || loadSettled {
+			return
+		}
+		loadSettled = true
+		s.abandonLoad(req, loadStartedAt, err, retrying)
+	}
+	defer func() {
+		// The net under the explicit calls below. Reaching it means an exit was added
+		// without routing through abandon, so it says so rather than passing as ordinary.
+		if loadAnnounced && !loadSettled {
+			slog.Warn("load exited without settling the state it announced; cleaning up", "model", req.model.ModelPath)
+			abandon(errors.New("load ended before the runner was ready"), false)
+		}
+	}()
 	var weightsLoadedAt time.Time
 
 	// The calibration key as it stood when the prediction was made. It must be captured
@@ -1180,6 +1204,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			s.loadsInFlight.Add(1)
 			s.setLoadingModel(model.ParseName(req.model.Name).DisplayShortest())
 			s.publishEvent(api.ModelEvent{Type: EventLoadStart, Model: req.model.Name, At: loadStartedAt})
+			loadAnnounced = true
 
 			// A load has two halves and they cost quite differently. Reading and
 			// transferring the weights dominates a cold load; the context -- KV cache and
@@ -1237,6 +1262,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			slog.Info("failed to create server", "model", req.model.ShortName, "error", err)
 			req.errCh <- err
 			s.loadedMu.Unlock()
+			abandon(err, false)
 			return false
 		}
 
@@ -1279,8 +1305,12 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 				s.activeLoading.Close()
 				s.activeLoading = nil
 				req.errCh <- err
+				abandon(err, false)
 				return false
 			}
+			// Not an error the client sees: the scheduler evicts and calls load again, which
+			// announces a fresh attempt. This one still has to end, or it never does.
+			abandon(err, true)
 			return true
 		}
 
@@ -1305,16 +1335,19 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 					"loaded_count", loadedCount,
 					"evict_all", otherLoaded,
 					"error", err)
+				abandon(err, true)
 				return true
 			}
 		}
 		if otherLoaded && !req.oomRetryAttempted && llm.IsOutOfMemory(err) {
 			req.oomRetryAttempted = true
 			slog.Warn("llama-server load failed; evicting all other models and retrying once", "model", req.model.ModelPath, "error", err)
+			abandon(err, true)
 			return true
 		}
 
 		req.errCh <- err
+		abandon(err, false)
 		return false
 	}
 	logTemplateSelection(req.model)
@@ -1383,6 +1416,9 @@ iGPUScan:
 	slog.Info("loaded runners", "count", len(s.loaded))
 	s.loadedMu.Unlock()
 
+	// From here the goroutine owns the attempt's outcome: it publishes load.complete or
+	// load.failed and undoes the loading state either way.
+	loadSettled = true
 	go func() {
 		defer runner.refMu.Unlock()
 		if err = llama.WaitUntilRunning(req.ctx); err != nil {
@@ -2546,6 +2582,31 @@ type loadedModel struct {
 
 // loadedModels returns a snapshot of the currently loaded models for status
 // reporting without exposing the scheduler's internal runner bookkeeping.
+// abandonLoad ends a load attempt that will not reach a runner: it undoes the loading row
+// and the in-flight count, and publishes the load.failed that pairs with its load.start.
+//
+// A retry is still reported as a failure, because it is one -- the attempt ended, and the
+// next one announces itself with its own load.start. Leaving the first unterminated would
+// give a client an edge it can never close.
+func (s *Scheduler) abandonLoad(req *LlmRequest, started time.Time, err error, retrying bool) {
+	s.loadsInFlight.Add(-1)
+	s.clearLoadingModel()
+
+	reason := "load did not complete"
+	if err != nil {
+		reason = err.Error()
+	}
+	if retrying {
+		reason += "; retrying"
+	}
+	s.publishEvent(api.ModelEvent{
+		Type:       EventLoadFailed,
+		Model:      req.model.Name,
+		DurationMs: time.Since(started).Milliseconds(),
+		Reason:     reason,
+	})
+}
+
 func (s *Scheduler) setLoadingModel(name string) {
 	s.loadingModel.Store(&name)
 }

@@ -1904,6 +1904,14 @@ type GPUInfo struct {
 	// ID is the unique identifier to use for selection of this specific GPU by device vendor
 	ID string `json:"gpu_id"`
 
+	// PCIID is the device's bus address, in the same form unavailable_gpus uses. It is the
+	// identity that survives rediscovery, which ID does not: ID is an index into whatever the
+	// backend enumerated this time, so a card that drops out and comes back can return under a
+	// different one. Joining a card that reappears here to the entry that reported it faulted,
+	// or to anything else keyed by bus address, needs this. Omitted when the backend does not
+	// report one (Metal).
+	PCIID string `json:"pci_id,omitempty"`
+
 	// Name is the model or other identifying information about the GPU
 	Name string `json:"name"`
 

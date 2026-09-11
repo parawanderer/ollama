@@ -1408,8 +1408,16 @@ func (s *llamaServerRunner) WaitUntilRunning(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// Say which it was. This used to report every cancellation as a timeout, so a
+			// client that disconnected mid-load produced a load.failed reading "timed out
+			// waiting for llama-server to start: context canceled" -- which sends whoever
+			// reads it off to investigate a slow server, when the server was fine and the
+			// caller had simply gone. The real stall timeout is reported further down.
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return fmt.Errorf("timed out waiting for llama-server to start: %w", ctx.Err())
+			}
 			slog.Warn("client connection closed before llama-server finished loading, aborting load")
-			return fmt.Errorf("timed out waiting for llama-server to start: %w", ctx.Err())
+			return fmt.Errorf("load abandoned: the request that started it was cancelled before llama-server finished loading: %w", ctx.Err())
 		case <-s.done:
 			if msg := s.lastErrMsg(); msg != "" {
 				if s.doneErr == nil {

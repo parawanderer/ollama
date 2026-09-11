@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -2464,4 +2465,108 @@ func TestSchedLoadFilesCalibrationAtTheGrantedContext(t *testing.T) {
 	require.Equal(t, uint64(3<<30), got,
 		"calibration was not filed at the granted total (25088): calibration's axis is "+
 			"context x slots, so the per-slot figure would halve every multi-slot sample")
+}
+
+// TestSchedFailedLoadEndsWhatItAnnounced is the regression for a phantom load. A client that
+// disconnected mid-load made llama.Load fail with exactly this error -- worded as a timeout,
+// though it is a cancellation -- and the scheduler returned without undoing any of the state
+// it had announced. /api/ps went on showing a "loading" row for a load whose llama-server had
+// already exited, indefinitely, and the event stream got a load.start with no end.
+func TestSchedFailedLoadEndsWhatItAnnounced(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer done()
+
+	s := InitScheduler(ctx)
+	scenario := newScenarioRequest(t, ctx, "abandoned", 10, nil, map[ml.DeviceID]uint64{})
+	scenario.srv.loadErr = errors.New("timed out waiting for llama-server to start: context canceled")
+	s.newServerFn = scenario.newServer
+
+	if retry := s.load(scenario.req, ml.SystemInfo{}, nil, false); retry {
+		t.Fatal("a plain failure was reported as a retry")
+	}
+
+	if name := s.LoadingModel(); name != "" {
+		t.Errorf("/api/ps would still show %q as loading after the load failed", name)
+	}
+	if n := s.loadsInFlight.Load(); n != 0 {
+		t.Errorf("loadsInFlight = %d after the load ended, want 0; the sampler stays at its "+
+			"loading rate for as long as this is non-zero", n)
+	}
+	requireLoadEdges(t, s, "context canceled")
+}
+
+// The retry paths announce again when load is called for the second attempt, so a leak there
+// is worse than a stale row: the in-flight count climbs past what any completion can undo.
+func TestSchedRetriedLoadEndsTheFirstAttempt(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer done()
+
+	s := InitScheduler(ctx)
+	scenario := newScenarioRequest(t, ctx, "retried", 10, nil, map[ml.DeviceID]uint64{})
+	scenario.srv.loadErr = llm.ErrLoadRequiredFull
+	s.newServerFn = scenario.newServer
+
+	if retry := s.load(scenario.req, ml.SystemInfo{}, nil, true); !retry {
+		t.Fatal("a load that must evict and retry was not reported as a retry")
+	}
+
+	if n := s.loadsInFlight.Load(); n != 0 {
+		t.Errorf("loadsInFlight = %d after the first attempt ended, want 0; the retry will add "+
+			"its own, and this one would never be subtracted", n)
+	}
+	requireLoadEdges(t, s, "; retrying")
+}
+
+// requireLoadEdges checks the stream carried a load.start and exactly one load.failed whose
+// reason contains want.
+func requireLoadEdges(t *testing.T, s *Scheduler, want string) {
+	t.Helper()
+	frames, _ := s.ring.since(10 * time.Minute)
+	var starts, fails int
+	var reason string
+	for _, f := range frames {
+		switch f.event.Type {
+		case EventLoadStart:
+			starts++
+		case EventLoadFailed:
+			fails++
+			reason = f.event.Reason
+		}
+	}
+	if starts != 1 || fails != 1 {
+		t.Fatalf("stream carried %d load.start and %d load.failed, want 1 and 1: every "+
+			"announced load must end, exactly once", starts, fails)
+	}
+	if !strings.Contains(reason, want) {
+		t.Errorf("load.failed reason %q does not contain %q", reason, want)
+	}
+}
+
+// The guard that ends abandoned loads must not fire on a successful one. It is a deferred
+// check, so if the handoff to the finishing goroutine ever stops marking the attempt settled,
+// every successful load would also publish a load.failed and drive loadsInFlight negative.
+func TestSchedSuccessfulLoadReportsNoFailure(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer done()
+
+	s := InitScheduler(ctx)
+	scenario := newScenarioRequest(t, ctx, "loads-fine", 10, nil, map[ml.DeviceID]uint64{})
+	s.newServerFn = scenario.newServer
+
+	s.load(scenario.req, ml.SystemInfo{}, nil, false)
+	select {
+	case err := <-scenario.req.errCh:
+		t.Fatal(err)
+	case <-scenario.req.successCh:
+	}
+
+	frames, _ := s.ring.since(10 * time.Minute)
+	for _, f := range frames {
+		if f.event.Type == EventLoadFailed {
+			t.Fatalf("a successful load published load.failed: %q", f.event.Reason)
+		}
+	}
+	if n := s.loadsInFlight.Load(); n != 0 {
+		t.Errorf("loadsInFlight = %d after a successful load, want 0", n)
+	}
 }

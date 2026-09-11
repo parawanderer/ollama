@@ -4506,3 +4506,32 @@ func TestActivityTTL(t *testing.T) {
 		})
 	}
 }
+
+// A client leaving is not a timeout. The load.failed reason is read by people deciding what
+// went wrong, and "timed out" sends them after a slow server when the server was fine and the
+// caller had gone. The wrapped error must still satisfy errors.Is, which callers rely on.
+func TestWaitUntilRunningDoesNotCallACancellationATimeout(t *testing.T) {
+	// Nothing listens on this port, so the runner never reports ready and the only way out
+	// is the context.
+	runner := &llamaServerRunner{port: 1, cmd: fakeRunningCmd()}
+	runner.output = &memoryParsingWriter{inner: io.Discard, runner: runner}
+
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	err := runner.WaitUntilRunning(cancelled)
+	if err == nil {
+		t.Fatal("WaitUntilRunning succeeded with no server and a cancelled context")
+	}
+	if strings.Contains(err.Error(), "timed out") {
+		t.Errorf("a cancellation was reported as a timeout: %q", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("errors.Is(err, context.Canceled) = false for %q", err)
+	}
+
+	expired, cancelExpired := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+	if err := runner.WaitUntilRunning(expired); err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("a real deadline should still read as a timeout, got %v", err)
+	}
+}

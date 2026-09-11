@@ -55,11 +55,12 @@ const (
 	startSystemFingerprint = 4
 	startRole              = 5
 
-	deltaContent   = 1
-	deltaReasoning = 2
-	deltaToolCalls = 3
-	deltaLogprobs  = 4
-	deltaIndex     = 5
+	deltaContent          = 1
+	deltaReasoning        = 2
+	deltaToolCalls        = 3
+	deltaLogprobs         = 4
+	deltaIndex            = 5
+	deltaCompletionTokens = 6
 
 	toolCallID       = 1
 	toolCallIndex    = 2
@@ -149,11 +150,19 @@ func StartFrame(id, model, fingerprint, role string, created int64) []byte {
 
 // DeltaFrame carries one step of the generation. Everything beyond the text is present only
 // on the chunks that have it, so a plain text delta is unchanged in size by their existence.
-func DeltaFrame(index int, content, reasoning string, toolCalls []openai.ToolCall, logprobs *openai.ChoiceLogprobs) []byte {
+//
+// completionTokens is the running count of generated tokens up to this delta, present only
+// when the request asked for it (stream_options.continuous_usage_stats). It is written even
+// when zero, since the field is declared optional and absent means "not asked for".
+func DeltaFrame(index int, content, reasoning string, toolCalls []openai.ToolCall, logprobs *openai.ChoiceLogprobs, completionTokens *int) []byte {
 	var m []byte
 	m = appendString(m, deltaContent, content)
 	m = appendString(m, deltaReasoning, reasoning)
 	m = appendUint(m, deltaIndex, uint64(max(index, 0)))
+	if completionTokens != nil {
+		m = appendTag(m, deltaCompletionTokens, wireVarint)
+		m = binary.AppendUvarint(m, uint64(max(*completionTokens, 0)))
+	}
 
 	for _, tc := range toolCalls {
 		var fn []byte

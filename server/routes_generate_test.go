@@ -2906,6 +2906,112 @@ func TestChatWithPromptEndingInThinkTag(t *testing.T) {
 			t.Errorf("final durations = (%s, %s), want (%s, %s)", last.PromptEvalDuration, last.EvalDuration, wantMetrics.PromptEvalDuration, wantMetrics.EvalDuration)
 		}
 	})
+
+	// stream_metrics: the engine's running count on every chunk, so a client can show an
+	// exact live count. Only asked of the engine when the client asks for it.
+	streamChat := func(t *testing.T, req api.ChatRequest) []api.ChatResponse {
+		t.Helper()
+		w := createRequest(t, s.ChatHandler, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+		}
+		var events []api.ChatResponse
+		decoder := json.NewDecoder(w.Body)
+		for {
+			var event api.ChatResponse
+			if err := decoder.Decode(&event); err == io.EOF {
+				break
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			events = append(events, event)
+		}
+		return events
+	}
+
+	t.Run("stream metrics on every chunk", func(t *testing.T) {
+		for _, asked := range []bool{true, false} {
+			var requests []llm.CompletionRequest
+			mock.CompletionFn = func(ctx context.Context, r llm.CompletionRequest, fn func(r llm.CompletionResponse)) error {
+				requests = append(requests, r)
+				fn(llm.CompletionResponse{Content: " weighing it up", PromptEvalCount: 40, EvalCount: 3, EvalDuration: 3})
+				fn(llm.CompletionResponse{Content: " </think> The answer", PromptEvalCount: 40, EvalCount: 7, EvalDuration: 7})
+				fn(llm.CompletionResponse{Content: " is 42.", Done: true, DoneReason: llm.DoneReasonStop, PromptEvalCount: 40, EvalCount: 9, EvalDuration: 9})
+				return nil
+			}
+			streamRequest := true
+			events := streamChat(t, api.ChatRequest{
+				Model:         "test-thinking",
+				Messages:      []api.Message{{Role: "user", Content: "What is it?"}},
+				Think:         &api.ThinkValue{Value: true},
+				Stream:        &streamRequest,
+				StreamMetrics: asked,
+			})
+			mock.CompletionFn = nil
+
+			if len(requests) != 1 || requests[0].IncludeIntermediateMetrics != asked {
+				t.Fatalf("stream_metrics=%v: engine asked for running counts = %v, want %v", asked, requests[0].IncludeIntermediateMetrics, asked)
+			}
+			if !asked {
+				continue
+			}
+			last := 0
+			for _, e := range events {
+				if e.EvalCount == 0 {
+					t.Errorf("a chunk carried no running count: %+v", e)
+				}
+				if e.EvalCount < last {
+					t.Errorf("running count went backwards: %d after %d", e.EvalCount, last)
+				}
+				last = e.EvalCount
+			}
+			if last != 9 {
+				t.Errorf("final count = %d, want 9", last)
+			}
+		}
+	})
+
+	// A structured-outputs restart runs a second completion that counts from zero. The count
+	// a client watches must fold in the first pass mid-stream, not only at the end.
+	t.Run("stream metrics across the structured outputs restart", func(t *testing.T) {
+		var calls int
+		mock.CompletionFn = func(ctx context.Context, r llm.CompletionRequest, fn func(r llm.CompletionResponse)) error {
+			calls++
+			if calls == 1 {
+				fn(llm.CompletionResponse{Content: " I am thinking through this problem.", PromptEvalCount: 10, EvalCount: 6, EvalDuration: 6})
+				fn(llm.CompletionResponse{Content: " </think> {\"answer\":\"42\"}", PromptEvalCount: 10, EvalCount: 12, EvalDuration: 12})
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			fn(llm.CompletionResponse{Content: `{"answer":`, PromptEvalCount: 20, EvalCount: 5, EvalDuration: 5})
+			fn(llm.CompletionResponse{Content: `"42"}`, Done: true, DoneReason: llm.DoneReasonStop, PromptEvalCount: 20, EvalCount: 22, EvalDuration: 22})
+			return nil
+		}
+		streamRequest := true
+		events := streamChat(t, api.ChatRequest{
+			Model:         "test-thinking",
+			Messages:      []api.Message{{Role: "user", Content: "Please respond in JSON."}},
+			Think:         &api.ThinkValue{Value: true},
+			Stream:        &streamRequest,
+			Format:        json.RawMessage(`{"type":"object","properties":{"answer":{"type":"string"}}}`),
+			StreamMetrics: true,
+		})
+		mock.CompletionFn = nil
+
+		last := 0
+		for _, e := range events {
+			if e.EvalCount == 0 {
+				t.Errorf("a chunk carried no running count: %+v", e)
+			}
+			if e.EvalCount < last {
+				t.Errorf("running count went backwards across the restart: %d after %d", e.EvalCount, last)
+			}
+			last = e.EvalCount
+		}
+		if last != 12+22 {
+			t.Errorf("final count = %d, want both passes, %d", last, 12+22)
+		}
+	})
 }
 
 // TestChatFormatWithThinkFalse verifies that when a model uses a builtin

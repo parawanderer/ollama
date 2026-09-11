@@ -122,6 +122,14 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 		if !isEmptyTrailer {
 			includeRole := !w.firstChunkSent
 			chunks := openai.ToStreamChunks(w.id, chatResponse, includeRole)
+			// The running count, when the client asked for it on every chunk. Taken from the
+			// engine's counts on this response, which the chat handler only fills in mid-stream
+			// when the request carried the same option.
+			var running *openai.Usage
+			if w.streamOptions != nil && w.streamOptions.ContinuousUsageStats {
+				u := openai.ToUsage(chatResponse)
+				running = &u
+			}
 			for _, c := range chunks {
 				if !w.toolCallSent && len(c.Choices) > 0 && len(c.Choices[0].Delta.ToolCalls) > 0 {
 					w.toolCallSent = true
@@ -143,8 +151,12 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 							len(choice.Delta.ToolCalls) == 0 && choice.Logprobs == nil {
 							continue
 						}
+						var completionTokens *int
+						if running != nil {
+							completionTokens = &running.CompletionTokens
+						}
 						if _, err := w.ResponseWriter.Write(DeltaFrame(
-							choice.Index, content, reasoning, choice.Delta.ToolCalls, choice.Logprobs,
+							choice.Index, content, reasoning, choice.Delta.ToolCalls, choice.Logprobs, completionTokens,
 						)); err != nil {
 							return 0, err
 						}
@@ -153,6 +165,7 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 					continue
 				}
 
+				c.Usage = running
 				d, err := json.Marshal(c)
 				if err != nil {
 					return 0, err

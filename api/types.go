@@ -177,6 +177,14 @@ type ChatRequest struct {
 	// each with an associated log probability. Only applies when Logprobs is true.
 	// Valid values are 0-20. Default is 0 (only return the selected token's logprob).
 	TopLogprobs int `json:"top_logprobs,omitempty"`
+
+	// StreamMetrics puts the engine's running counts -- eval_count, prompt_eval_count and
+	// their durations -- on every streamed chunk instead of only the last. Each chunk's
+	// eval_count is the number of tokens generated up to and including it, counted by the
+	// engine, so a client can show an exact live count instead of estimating one from the
+	// text. Chunks are not tokens: the thinking and tool-call parsers regroup text, so a
+	// chunk can carry several tokens or wait for more. Thinking tokens are counted too.
+	StreamMetrics bool `json:"stream_metrics,omitempty"`
 }
 
 type Tools []Tool

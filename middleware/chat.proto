@@ -36,6 +36,13 @@ message Delta {
 
   // Present only when the request asked for logprobs.
   repeated Logprob logprobs = 4;
+
+  // The running count of generated tokens, up to and including this delta, as the engine
+  // counted them. Present only when the request set stream_options.continuous_usage_stats,
+  // so a client can show an exact count instead of estimating one from the text. A delta is
+  // not a token -- the thinking and tool-call parsers regroup text -- so read the count, do
+  // not count deltas. Thinking tokens are included.
+  optional uint32 completion_tokens = 6;
 }
 
 message ToolCall {

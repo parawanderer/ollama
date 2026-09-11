@@ -3278,7 +3278,11 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			if req.Format != nil && structuredOutputsState == structuredOutputsState_None && !forceImmediate && ((builtinParser != nil || thinkingState != nil) && slices.Contains(m.Capabilities(), model.CapabilityThinking)) {
 				currentFormat = nil
 			}
-			includeIntermediateMetrics := req.Format != nil && currentFormat == nil
+			// Running counts are asked of the engine for two reasons: to fold a structured-
+			// outputs restart's first pass into the final figures (internal, never sent), and
+			// because the client asked to see them on every chunk.
+			captureFirstPass := req.Format != nil && currentFormat == nil
+			includeIntermediateMetrics := captureFirstPass || req.StreamMetrics
 
 			// sets up new context given parent context per request
 			ctx, cancel := context.WithCancel(c.Request.Context())
@@ -3306,12 +3310,14 @@ func (s *Server) ChatHandler(c *gin.Context) {
 					EvalCount:             r.EvalCount,
 					EvalDuration:          r.EvalDuration,
 				}
-				if includeIntermediateMetrics {
+				if captureFirstPass {
 					firstPassMetrics = metrics
-					if !r.Done {
+					if !r.Done && !req.StreamMetrics {
 						metrics = api.Metrics{}
 					}
-				} else if structuredOutputsState == structuredOutputsState_Applying && r.Done {
+				} else if structuredOutputsState == structuredOutputsState_Applying && (r.Done || req.StreamMetrics) {
+					// Mid-stream too when the client watches the running count: the second
+					// pass counts from zero, and the count it sees must not go backwards.
 					// Treat the restart as generation work: retain the original prompt metrics and fold in the second prefill.
 					metrics.PromptEvalCount = firstPassMetrics.PromptEvalCount
 					metrics.PromptEvalCachedCount = firstPassMetrics.PromptEvalCachedCount

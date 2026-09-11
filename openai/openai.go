@@ -101,6 +101,11 @@ type EmbedRequest struct {
 
 type StreamOptions struct {
 	IncludeUsage bool `json:"include_usage"`
+
+	// ContinuousUsageStats puts usage on every chunk, not only a final one: the running
+	// count of generated tokens, from the engine. Not part of OpenAI's API -- the name and
+	// shape are vLLM's, so a client written against vLLM needs nothing new here.
+	ContinuousUsageStats bool `json:"continuous_usage_stats,omitempty"`
 }
 
 type Reasoning struct {
@@ -731,6 +736,7 @@ func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 		Logprobs:        r.Logprobs != nil && *r.Logprobs,
 		TopLogprobs:     r.TopLogprobs,
 		DebugRenderOnly: r.DebugRenderOnly,
+		StreamMetrics:   r.Stream && r.StreamOptions != nil && r.StreamOptions.ContinuousUsageStats,
 	}, nil
 }
 

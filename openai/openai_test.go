@@ -1121,3 +1121,35 @@ func TestFromChatRequest_TopLogprobsRange(t *testing.T) {
 		})
 	}
 }
+
+// continuous_usage_stats (vLLM's option) maps onto the native stream_metrics, and only for a
+// streamed request -- a non-streamed one has one response, which already carries usage.
+func TestFromChatRequest_ContinuousUsageStats(t *testing.T) {
+	for _, tc := range []struct {
+		stream bool
+		opts   *StreamOptions
+		want   bool
+	}{
+		{true, &StreamOptions{IncludeUsage: true, ContinuousUsageStats: true}, true},
+		{true, &StreamOptions{IncludeUsage: true}, false},
+		{true, nil, false},
+		{false, &StreamOptions{ContinuousUsageStats: true}, false},
+	} {
+		req := ChatCompletionRequest{Model: "m", Messages: []Message{{Role: "user", Content: "hi"}}, Stream: tc.stream, StreamOptions: tc.opts}
+		got, err := FromChatRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.StreamMetrics != tc.want {
+			t.Errorf("stream=%v options=%+v: StreamMetrics = %v, want %v", tc.stream, tc.opts, got.StreamMetrics, tc.want)
+		}
+	}
+
+	var parsed ChatCompletionRequest
+	if err := json.Unmarshal([]byte(`{"model":"m","stream":true,"stream_options":{"include_usage":true,"continuous_usage_stats":true}}`), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if parsed.StreamOptions == nil || !parsed.StreamOptions.ContinuousUsageStats {
+		t.Fatalf("the wire name did not parse: %+v", parsed.StreamOptions)
+	}
+}

@@ -2345,6 +2345,58 @@ func (s *Server) eventFrame(ev api.ModelEvent, started time.Time) api.EventFrame
 	return f
 }
 
+// modelRoofline computes the decode ceiling for a model from what the runner holds on each
+// device and each device's bandwidth. See api.ModelRoofline for the arithmetic and why a
+// split model sums its devices rather than averaging them.
+//
+// It returns nil only for a model on no GPU. Every other case returns an object, and a case
+// that cannot be bounded honestly says why in Unavailable rather than guessing -- a client
+// renders the reason, where an absent object could only be rendered as nothing.
+func modelRoofline(v loadedModel) *api.ModelRoofline {
+	if len(v.gpus) == 0 {
+		return nil
+	}
+	switch {
+	case v.expertCount > 0:
+		return &api.ModelRoofline{Unavailable: "mixture_of_experts"}
+	case v.size > v.sizeVRAM:
+		return &api.ModelRoofline{Unavailable: "partly_on_cpu"}
+	}
+
+	r := &api.ModelRoofline{Basis: "dense_weights"}
+	var seconds float64
+	var kvTotal uint64
+	for _, dev := range v.gpus {
+		bw := v.bandwidthByGPU[dev]
+		mem, ok := v.memByGPU[dev]
+		if bw == 0 || !ok {
+			return &api.ModelRoofline{Unavailable: "bandwidth_unknown"}
+		}
+		// Recurrent state is read and rewritten every token, like a weight: it does not grow
+		// with the context, so it belongs in the per-token base rather than the KV term.
+		bytes := uint64(max(mem.Weights+mem.RecurrentState, 0))
+		d := api.RooflineDevice{
+			ID:              dev.ID,
+			PCIID:           v.pciByGPU[dev],
+			BytesPerToken:   bytes,
+			MemoryBandwidth: bw,
+		}
+		if !v.slidingWindow && v.grantedCtxTotal > 0 {
+			d.KVBytesPerContextToken = uint64(max(mem.KVCache, 0)) / uint64(v.grantedCtxTotal)
+			kvTotal += d.KVBytesPerContextToken
+		}
+		r.BytesPerToken += bytes
+		seconds += float64(bytes) / float64(bw)
+		r.Devices = append(r.Devices, d)
+	}
+	if seconds <= 0 {
+		return &api.ModelRoofline{Unavailable: "bandwidth_unknown"}
+	}
+	r.CeilingTokensPerSec = 1 / seconds
+	r.KVBytesPerContextToken = kvTotal
+	return r
+}
+
 func (s *Server) processResponse() *api.ProcessResponse {
 	models := []api.ProcessModelResponse{}
 
@@ -2406,6 +2458,7 @@ func (s *Server) processResponse() *api.ProcessResponse {
 			Placement:     v.placement,
 			Activity:      v.activity,
 		}
+		row.Roofline = modelRoofline(v)
 		if v.memVRAM.Total() > 0 {
 			breakdown := v.memVRAM
 			row.Memory = &breakdown
@@ -2741,14 +2794,17 @@ func (s *Server) infoResponse() *api.InfoResponse {
 	gpus := make([]api.GPUInfo, len(devices))
 	for i, dev := range devices {
 		gpus[i] = api.GPUInfo{
-			ID:             dev.ID,
-			PCIID:          dev.PCIID,
-			Name:           dev.Name,
-			TotalMemory:    dev.TotalMemory,
-			PhysicalMemory: dev.PhysicalMemory,
-			Processes:      gpuProcesses(processes[dev.PCIID]),
-			FreeMemory:     dev.FreeMemory,
-			Runner:         dev.Library,
+			ID:                 dev.ID,
+			PCIID:              dev.PCIID,
+			MemoryBandwidth:    dev.MemoryBandwidth(),
+			MemoryBusWidthBits: dev.MemoryBusWidthBits,
+			MemoryClockMaxMHz:  dev.MemoryClockMaxMHz,
+			Name:               dev.Name,
+			TotalMemory:        dev.TotalMemory,
+			PhysicalMemory:     dev.PhysicalMemory,
+			Processes:          gpuProcesses(processes[dev.PCIID]),
+			FreeMemory:         dev.FreeMemory,
+			Runner:             dev.Library,
 		}
 
 		// Compute capability and driver version are CUDA/ROCm concepts; a backend
@@ -2760,6 +2816,7 @@ func (s *Server) infoResponse() *api.InfoResponse {
 		if dev.DriverMajor > 0 || dev.DriverMinor > 0 {
 			gpus[i].Driver = dev.Driver()
 		}
+		gpus[i].PCIeMaxGeneration, gpus[i].PCIeMaxWidth = discover.PCIeMaxLink(dev.PCIID)
 	}
 
 	ms, _ := manifest.Manifests(true)

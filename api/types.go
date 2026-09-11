@@ -861,6 +861,60 @@ type ListModelResponse struct {
 	Capabilities []model.Capability `json:"capabilities,omitempty"`
 }
 
+// ModelRoofline is the fastest this model can decode on the devices it occupies, bounded by
+// memory bandwidth, and exactly what that bound was computed from.
+//
+// Decode is memory-bound: every token reads every weight once. So the ceiling is bytes per
+// token over bandwidth -- and on a layer-split model the devices run in sequence, one token
+// passing through each card's layers in turn, so the step time is the SUM over devices:
+//
+//	ceiling = 1 / Σ_d (bytes_d / bandwidth_d)
+//
+// not total bytes over an average bandwidth. On identical cards the two agree; on mismatched
+// ones the average hides a slow card that holds many layers and drags every token.
+//
+// The ceiling is at an EMPTY context. Decode also reads the used part of the KV cache every
+// token, which grows with the context, so the real bound falls as a conversation lengthens.
+// That term is reported separately (KVBytesPerContextToken) rather than folded in, because it
+// depends on an occupancy that changes per request. To bound a request that ran at occupancy n:
+//
+//	ceiling(n) = 1 / Σ_d ((bytes_d + n × kv_d) / bandwidth_d)
+//
+// Measured decode never exceeds the ceiling on a dense model; above it is a bug somewhere.
+type ModelRoofline struct {
+	// Unavailable, when set, says why no ceiling is given, and every other field is absent:
+	// "mixture_of_experts" -- a token reads only its active experts, so the dense bound would
+	//   sit BELOW measured speed and read as a fault; omitted until the active fraction is read
+	// "partly_on_cpu" -- the spilled layers are read at host-memory speed, which nothing here
+	//   measures
+	// "bandwidth_unknown" -- a device the model occupies does not report its memory interface
+	Unavailable string `json:"unavailable,omitempty"`
+
+	// Basis names what BytesPerToken counts. "dense_weights": every resident weight plus any
+	// recurrent state, read once per token, with an empty KV cache.
+	Basis string `json:"basis,omitempty"`
+
+	BytesPerToken       uint64  `json:"bytes_per_token,omitempty"`
+	CeilingTokensPerSec float64 `json:"ceiling_tokens_per_sec,omitempty"`
+
+	// KVBytesPerContextToken is how many more bytes each decoded token reads per token of
+	// context already in the cache. Absent for a sliding-window model, whose windowed layers
+	// stop growing at the window and so do not follow a per-token rate.
+	KVBytesPerContextToken uint64 `json:"kv_bytes_per_context_token,omitempty"`
+
+	// Devices carries the per-device inputs, so the sum can be checked client-side.
+	Devices []RooflineDevice `json:"devices,omitempty"`
+}
+
+// RooflineDevice is one device's share of a model's per-token reads.
+type RooflineDevice struct {
+	ID                     string `json:"gpu_id"`
+	PCIID                  string `json:"pci_id,omitempty"`
+	BytesPerToken          uint64 `json:"bytes_per_token"`
+	KVBytesPerContextToken uint64 `json:"kv_bytes_per_context_token,omitempty"`
+	MemoryBandwidth        uint64 `json:"memory_bandwidth_bytes_per_sec"`
+}
+
 // ProcessModelResponse is a single model description in [ProcessResponse].
 type ProcessModelResponse struct {
 	Name string `json:"name"`
@@ -883,6 +937,10 @@ type ProcessModelResponse struct {
 	Details   ModelDetails `json:"details,omitempty"`
 	ExpiresAt time.Time    `json:"expires_at"`
 	SizeVRAM  int64        `json:"size_vram"`
+
+	// Roofline is the decode ceiling this placement allows. Absent for a model that is not on
+	// a GPU; present with Unavailable set when a ceiling cannot honestly be computed.
+	Roofline *ModelRoofline `json:"roofline,omitempty"`
 
 	// ContextLength is the context the engine allocated per slot, which is what a client
 	// can actually fill. It is not necessarily the num_ctx that was requested: llama.cpp
@@ -1930,6 +1988,19 @@ type GPUInfo struct {
 	// figure to display as the machine's hardware, since it is what the system's own tools
 	// report. Omitted when no source distinguishes the two.
 	PhysicalMemory uint64 `json:"physical_memory,omitempty"`
+
+	// The memory interface and the peak bandwidth derived from it. Static capabilities,
+	// never live readings, and absent -- not zero -- wherever the driver cannot report them.
+	// Bandwidth is what bounds decode speed; see ModelRoofline.
+	MemoryBandwidth    uint64 `json:"memory_bandwidth_bytes_per_sec,omitempty"`
+	MemoryBusWidthBits int    `json:"memory_bus_width_bits,omitempty"`
+	MemoryClockMaxMHz  int    `json:"memory_clock_max_mhz,omitempty"`
+
+	// PCIeMaxGeneration and PCIeMaxWidth are the host link's capability. They bound model
+	// load time, not decode speed, and a width below the slot's maximum is normal on a
+	// two-GPU desktop that splits its lanes x8/x8.
+	PCIeMaxGeneration int `json:"pcie_max_generation,omitempty"`
+	PCIeMaxWidth      int `json:"pcie_max_width,omitempty"`
 
 	// FreeMemory is the amount of video memory on the GPU available for loading new models
 	FreeMemory uint64 `json:"free_memory"`

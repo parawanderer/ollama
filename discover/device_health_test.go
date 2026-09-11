@@ -189,3 +189,17 @@ func TestSysfsDoesNotDuplicateWhatNVMLAlreadyExplained(t *testing.T) {
 		t.Errorf("got %d, want 0: NVML already reported this device with a real reason", len(got))
 	}
 }
+
+// The kernel's link-speed strings are a closed set (pci_speed_string, drivers/pci/probe.c), so
+// the mapping is an exact match on its own vocabulary.
+func TestPCIeGenerationFromTheKernelsStrings(t *testing.T) {
+	for speed, want := range map[string]int{
+		"2.5 GT/s PCIe": 1, "5.0 GT/s PCIe": 2, "8.0 GT/s PCIe": 3,
+		"16.0 GT/s PCIe": 4, "32.0 GT/s PCIe": 5, "64.0 GT/s PCIe": 6,
+		"Unknown": 0, "": 0, "8x AGP": 0, "133 MHz PCI-X 533": 0,
+	} {
+		if got := pcieGeneration(speed); got != want {
+			t.Errorf("pcieGeneration(%q) = %d, want %d", speed, got, want)
+		}
+	}
+}

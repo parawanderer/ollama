@@ -129,3 +129,42 @@ func nvidiaGPUsInSysfs() []string {
 	}
 	return out
 }
+
+// PCIeMaxLink reports the PCIe generation and width a device's link is capable of, from sysfs
+// and so for any vendor, or zeros when unknown.
+//
+// Capability only. The current link is deliberately not offered here: an idle card drops to
+// Gen1 under ASPM, so an instantaneous reading presented beside a capability would read as a
+// fault on a healthy machine.
+func PCIeMaxLink(pciID string) (generation, width int) {
+	if pciID == "" {
+		return 0, 0
+	}
+	dir := filepath.Join(sysfsPCIRoot, pciID)
+	generation = pcieGeneration(readTrimmed(filepath.Join(dir, "max_link_speed")))
+	width, _ = strconv.Atoi(readTrimmed(filepath.Join(dir, "max_link_width")))
+	return generation, width
+}
+
+// pcieGeneration maps the kernel's link-speed string to a PCIe generation.
+//
+// The strings are a closed set -- pci_speed_string() in drivers/pci/probe.c indexes a static
+// table -- so this is an exact match on the kernel's own vocabulary, not a parse of a number.
+// Anything else, including "Unknown" and the legacy PCI/AGP entries, is 0.
+func pcieGeneration(speed string) int {
+	switch speed {
+	case "2.5 GT/s PCIe":
+		return 1
+	case "5.0 GT/s PCIe":
+		return 2
+	case "8.0 GT/s PCIe":
+		return 3
+	case "16.0 GT/s PCIe":
+		return 4
+	case "32.0 GT/s PCIe":
+		return 5
+	case "64.0 GT/s PCIe":
+		return 6
+	}
+	return 0
+}

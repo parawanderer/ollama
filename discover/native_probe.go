@@ -35,6 +35,8 @@ type nativeProbeDevice struct {
 	IntegratedKnown     bool               `json:"integrated_known"`
 	TotalMemory         uint64             `json:"total_memory,omitempty"`
 	PhysicalMemory      uint64             `json:"physical_memory,omitempty"`
+	MemoryBusWidthBits  int                `json:"memory_bus_width_bits,omitempty"`
+	MemoryClockMaxMHz   int                `json:"memory_clock_max_mhz,omitempty"`
 	Processes           []ml.DeviceProcess `json:"processes,omitempty"`
 	FreeMemory          uint64             `json:"free_memory,omitempty"`
 	ComputeMajor        int                `json:"compute_major,omitempty"`
@@ -191,6 +193,12 @@ func mergeNativeProbeDevice(dst *nativeProbeDevice, src nativeProbeDevice) {
 	}
 	if dst.PhysicalMemory == 0 {
 		dst.PhysicalMemory = src.PhysicalMemory
+	}
+	if dst.MemoryBusWidthBits == 0 {
+		dst.MemoryBusWidthBits = src.MemoryBusWidthBits
+	}
+	if dst.MemoryClockMaxMHz == 0 {
+		dst.MemoryClockMaxMHz = src.MemoryClockMaxMHz
 	}
 	if dst.FreeMemory == 0 {
 		dst.FreeMemory = src.FreeMemory

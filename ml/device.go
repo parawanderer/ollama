@@ -75,6 +75,11 @@ type DeviceInfo struct {
 	// only figure available and should be displayed instead.
 	PhysicalMemory uint64 `json:"physical_memory,omitempty"`
 
+	// MemoryBusWidthBits and MemoryClockMaxMHz describe the memory interface, read from the
+	// driver. Zero where no source reports them (Metal, AMD today, an older driver).
+	MemoryBusWidthBits int `json:"memory_bus_width_bits,omitempty"`
+	MemoryClockMaxMHz  int `json:"memory_clock_max_mhz,omitempty"`
+
 	// FreeMemory is the amount of memory currently available on the device for loading models
 	FreeMemory uint64 `json:"free_memory,omitempty"`
 
@@ -684,4 +689,23 @@ type DeviceBusState struct {
 	// at the slot, the riser or the cabling rather than at the card.
 	FatalErrors    int `json:"pcie_fatal_errors"`
 	NonFatalErrors int `json:"pcie_nonfatal_errors"`
+}
+
+// MemoryBandwidth is the peak memory bandwidth in bytes per second, derived from the bus
+// width and the maximum memory clock, or 0 when either is unknown.
+//
+// bandwidth = bus_width/8 x clock x 2. The factor of two is because NVML reports the memory
+// clock in the double-data-rate sense. Validated against published figures on three memory
+// technologies rather than one, so it is not tuned to a single card:
+//
+//	RTX PRO 6000 (GDDR7)   512-bit x 14001 MHz x 2 = 1792 GB/s   published 1792
+//	RTX 3090 (GDDR6X)      384-bit x  9751 MHz x 2 =  936 GB/s   published  936
+//	A100 80GB (HBM2e)     5120-bit x  1512 MHz x 2 = 1935 GB/s   published 1935
+//
+// It is a peak, not an achieved rate; decode typically reaches a large fraction of it.
+func (d DeviceInfo) MemoryBandwidth() uint64 {
+	if d.MemoryBusWidthBits <= 0 || d.MemoryClockMaxMHz <= 0 {
+		return 0
+	}
+	return uint64(d.MemoryBusWidthBits) / 8 * uint64(d.MemoryClockMaxMHz) * 1_000_000 * 2
 }

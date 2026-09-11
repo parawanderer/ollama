@@ -214,6 +214,19 @@ static int ollama_call_nvml_device_get_temperature(void * fn, void * device, uns
 	return ((ollama_nvml_device_get_temperature_fn) fn)(device, 0, temp);
 }
 
+typedef int (*ollama_nvml_device_get_uint_fn)(void *, unsigned int *);
+typedef int (*ollama_nvml_device_get_max_clock_fn)(void *, int, unsigned int *);
+
+static int ollama_call_nvml_device_get_uint(void * fn, void * device, unsigned int * value) {
+	return ((ollama_nvml_device_get_uint_fn) fn)(device, value);
+}
+
+// The 2 is NVML_CLOCK_MEM (graphics 0, sm 1, mem 2, video 3). Written as a literal because
+// this block is one Go comment and an inline C comment would end it.
+static int ollama_call_nvml_device_get_max_mem_clock(void * fn, void * device, unsigned int * mhz) {
+	return ((ollama_nvml_device_get_max_clock_fn) fn)(device, 2, mhz);
+}
+
 static const char * ollama_call_nvml_error_string(void * fn, int status) {
 	return ((ollama_nvml_error_string_fn) fn)(status);
 }
@@ -474,6 +487,14 @@ func probeCUDADriverLinux() ([]nativeProbeDevice, error) {
 	pciIDs := make([]string, 0, len(devices))
 	for _, d := range devices {
 		pciIDs = append(pciIDs, d.DeviceID)
+	}
+	for pci, iface := range nvmlMemoryInterfaceByPCI(pciIDs) {
+		for i := range devices {
+			if devices[i].DeviceID == pci {
+				devices[i].MemoryBusWidthBits = iface.busWidthBits
+				devices[i].MemoryClockMaxMHz = iface.clockMaxMHz
+			}
+		}
 	}
 	if physical := nvmlPhysicalMemoryByPCI(pciIDs); len(physical) > 0 {
 		for i := range devices {
@@ -1056,4 +1077,61 @@ func usableSet(known []string) map[string]bool {
 		usable[strings.ToLower(pci)] = true
 	}
 	return usable
+}
+
+type nvmlMemoryInterface struct {
+	busWidthBits int
+	clockMaxMHz  int
+}
+
+// nvmlMemoryInterfaceByPCI reads each device's memory bus width and maximum memory clock,
+// from which ml.DeviceInfo.MemoryBandwidth derives peak bandwidth. These are static
+// properties of the card: read once at discovery, never a live reading.
+//
+// A device that answers only one of the two is left out entirely -- a bandwidth derived from
+// half its inputs would be a number with the authority of a measurement and none of the basis.
+func nvmlMemoryInterfaceByPCI(pciIDs []string) map[string]nvmlMemoryInterface {
+	if len(pciIDs) == 0 {
+		return nil
+	}
+	nvml, err := dlopenFirst([]string{"libnvidia-ml.so.1", "libnvidia-ml.so"}, false)
+	if err != nil {
+		return nil
+	}
+	initFn, initErr := dlsym(nvml, "nvmlInit_v2")
+	shutdownFn, shutdownErr := dlsym(nvml, "nvmlShutdown")
+	handleFn, handleErr := dlsym(nvml, "nvmlDeviceGetHandleByPciBusId_v2")
+	busFn, busErr := dlsym(nvml, "nvmlDeviceGetMemoryBusWidth")
+	clockFn, clockErr := dlsym(nvml, "nvmlDeviceGetMaxClockInfo")
+	if err := cmp.Or(initErr, shutdownErr, handleErr, busErr, clockErr); err != nil {
+		slog.Debug("NVML cannot report the memory interface", "error", err)
+		return nil
+	}
+	if ret := C.ollama_call_nvml_init(initFn); ret != 0 {
+		return nil
+	}
+	defer C.ollama_call_nvml_shutdown(shutdownFn)
+
+	out := make(map[string]nvmlMemoryInterface, len(pciIDs))
+	for _, pci := range pciIDs {
+		if pci == "" {
+			continue
+		}
+		cpci := C.CString(pci)
+		var handle unsafe.Pointer
+		ret := C.ollama_call_nvml_device_get_handle_by_pci_bus_id(handleFn, cpci, &handle)
+		C.free(unsafe.Pointer(cpci))
+		if ret != 0 {
+			continue
+		}
+		var bus, clock C.uint
+		if C.ollama_call_nvml_device_get_uint(busFn, handle, &bus) != 0 || bus == 0 {
+			continue
+		}
+		if C.ollama_call_nvml_device_get_max_mem_clock(clockFn, handle, &clock) != 0 || clock == 0 {
+			continue
+		}
+		out[pci] = nvmlMemoryInterface{busWidthBits: int(bus), clockMaxMHz: int(clock)}
+	}
+	return out
 }

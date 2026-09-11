@@ -1476,6 +1476,16 @@ iGPUScan:
 		trainContext:    trainContext,
 	}
 	runner.name = req.model.Name
+	runner.bandwidthByGPU = make(map[ml.DeviceID]uint64, len(loadGpus))
+	runner.pciByGPU = make(map[ml.DeviceID]string, len(loadGpus))
+	for _, dev := range loadGpus {
+		runner.bandwidthByGPU[dev.DeviceID] = dev.MemoryBandwidth()
+		runner.pciByGPU[dev.DeviceID] = dev.PCIID
+	}
+	if f != nil {
+		runner.expertCount = int(f.KV().Uint("expert_count"))
+		runner.slidingWindow = f.KV().Uint("attention.sliding_window") > 0
+	}
 	runner.stillLoading.Store(true)
 	runner.numParallel = numParallel
 	runner.calibrationKey = calibrationKey
@@ -2197,6 +2207,14 @@ func (s *Scheduler) updateFreeSpace(allGpus []ml.DeviceInfo) {
 
 // TODO consolidate sched_types.go
 type runnerRef struct {
+	// Fixed at load, for the decode roofline: per-device bandwidth and bus address of the
+	// devices this runner occupies, and the two model properties that decide whether a dense
+	// bound applies. Captured here so /api/ps never has to run device discovery to answer.
+	bandwidthByGPU map[ml.DeviceID]uint64
+	pciByGPU       map[ml.DeviceID]string
+	expertCount    int
+	slidingWindow  bool
+
 	refMu    sync.Mutex
 	refCount uint // prevent unloading if > 0
 
@@ -2663,6 +2681,13 @@ type loadedModel struct {
 	weightsOnDisk int64
 	placement     *api.ModelPlacement
 	activity      *api.RunnerActivity
+
+	// Inputs to the decode roofline; see modelRoofline.
+	bandwidthByGPU  map[ml.DeviceID]uint64
+	pciByGPU        map[ml.DeviceID]string
+	expertCount     int
+	slidingWindow   bool
+	grantedCtxTotal int
 }
 
 // loadedModels returns a snapshot of the currently loaded models for status
@@ -2798,6 +2823,11 @@ func (r *runnerRef) reportLocked() loadedModel {
 		lm.memVRAM, _ = r.llama.MemoryBreakdownTotals()
 		lm.weightsOnDisk = r.llama.WeightsOnDisk()
 		lm.placement = r.llama.LayerPlacement()
+		lm.bandwidthByGPU = r.bandwidthByGPU
+		lm.pciByGPU = r.pciByGPU
+		lm.expertCount = r.expertCount
+		lm.slidingWindow = r.slidingWindow
+		_, lm.grantedCtxTotal = r.llama.GrantedContext()
 		// Briefly cached inside the runner, so a polled /api/ps does not make one HTTP
 		// round trip per resident model per request.
 		lm.activity = r.llama.Activity(context.Background(), lm.busy)

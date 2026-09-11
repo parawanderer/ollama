@@ -536,6 +536,13 @@ const probeMinContext = 256
 // the furthest point anyone measured. Probing the requested context turns that into a
 // measurement, for one more ~0.5 s probe, once per model.
 //
+// Measured afterwards on all 31 models here trained past 131072 (slop-zone
+// notebooks/context-vs-vram.ipynb): the extrapolation was never off by more than 590 MiB
+// (0.4%, dsv4-flash), and by exactly 0 for 19 of them, because allocation is close to
+// linear in context. So the third point turned an assumption into a measurement rather than
+// correcting a real error. It pays past 262144, where the line's error grows with distance:
+// -2.2 GiB at 1M on dsv4-flash.
+//
 // It is added rather than substituted. A requested context too large to fit in the memory
 // free right now fails to probe, and substituting it would then leave one point -- which
 // probeCalibration rightly discards -- where the fixed pair would have produced a line.

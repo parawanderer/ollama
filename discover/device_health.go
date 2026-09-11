@@ -71,7 +71,15 @@ func classifyUnavailable(p deviceProbe) ml.UnavailableDevice {
 	switch p.Status {
 	case nvmlErrorResetRequired:
 		d.Reason = "reset_required"
-		d.Recovery = "reset the GPU (nvidia-smi -r); every process holding /dev/nvidia* must exit first"
+		// Deliberately does not name nvidia-smi -r. That is the documented fix and it is
+		// REFUSED on consumer and workstation cards -- an RTX PRO 6000 answers "GPU
+		// 00000000:03:00.0: Not Supported" while its PCI reset_method reads "flr bus", so
+		// the kernel can reset a device the vendor tool will not. Naming one tool that
+		// fails on the commonest hardware reads as a dead end rather than a first step.
+		d.Recovery = "the GPU needs a reset: free the driver (stop anything using it, unload the " +
+			"kernel modules), then reset it. nvidia-smi -r is refused on many consumer and " +
+			"workstation cards; a PCIe function-level reset via sysfs works where the device " +
+			"supports it, and a cold power cycle always does"
 	case nvmlErrorGPUIsLost:
 		d.Reason = "lost"
 		d.Recovery = "the driver can no longer reach the device; a reset may work, otherwise reseat and power-cycle"

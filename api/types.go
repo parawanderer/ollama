@@ -2028,6 +2028,24 @@ type ModelEvent struct {
 type GPUProcess struct {
 	PID        int    `json:"pid"`
 	UsedMemory uint64 `json:"used_memory"`
+
+	// Name is the process's executable name, when it can be read.
+	Name string `json:"name,omitempty"`
+
+	// Runner is set when this process is one of ollama's model runners, naming the model it
+	// serves as /api/ps does. Its used_memory minus that model's bytes on this device is the
+	// runner's own overhead there -- the CUDA context, measured rather than assumed.
+	Runner *GPUProcessRunner `json:"runner,omitempty"`
+
+	// OllamaHelper is set when ollama started this process but it serves no model: a fit
+	// probe or device discovery, each holding a context for about a second. It is not
+	// another tenant.
+	OllamaHelper bool `json:"ollama_helper,omitempty"`
+}
+
+// GPUProcessRunner identifies the model a runner process serves.
+type GPUProcessRunner struct {
+	Model string `json:"model"`
 }
 
 type GPUInfo struct {
@@ -2053,6 +2071,14 @@ type GPUInfo struct {
 	// loaded on it is otherwise unattributable: a consumer can only name it by size, which
 	// is a guess that happens to hold on the machine it was calibrated on.
 	Processes []GPUProcess `json:"processes,omitempty"`
+
+	// ProcessesScope says which processes Processes can include. "all": every process on
+	// the device. "pid_namespace": only processes in ollama's own PID namespace -- the
+	// normal case in a container, where another container's or the host's process on this
+	// device is not listed at all, though its memory still counts as used. So under
+	// "pid_namespace" an empty or short list does not mean nothing else is on the card.
+	// Omitted when unknown.
+	ProcessesScope string `json:"processes_scope,omitempty"`
 
 	// PhysicalMemory is the amount of video memory the device reports having. It is never
 	// smaller than TotalMemory: the driver reserves a portion of the card for itself which

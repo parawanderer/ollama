@@ -10,3 +10,8 @@ import "github.com/ollama/ollama/ml"
 func ComputeProcesses(pciIDs []string) map[string][]ml.DeviceProcess {
 	return nil
 }
+
+// ProcessesScope is unknown where processes are not reported.
+func ProcessesScope() string {
+	return ""
+}

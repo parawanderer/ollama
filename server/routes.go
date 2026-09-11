@@ -2759,14 +2759,24 @@ func (s *Server) InfoHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, *s.infoResponse())
 }
 
-// gpuProcesses converts device process attribution for the API.
-func gpuProcesses(procs []ml.DeviceProcess) []api.GPUProcess {
+// gpuProcesses converts device process attribution for the API, marking which processes
+// are ollama's own runners and which model each serves. The join is by pid, which is
+// sound because NVML reports pids in the caller's namespace -- measured in the container
+// here: NVML said 960, the runner's pid inside the container, where the host knows it as
+// 414316.
+func gpuProcesses(procs []ml.DeviceProcess, runners map[int]string) []api.GPUProcess {
 	if len(procs) == 0 {
 		return nil
 	}
 	out := make([]api.GPUProcess, 0, len(procs))
 	for _, p := range procs {
-		out = append(out, api.GPUProcess{PID: p.PID, UsedMemory: p.UsedMemory})
+		gp := api.GPUProcess{PID: p.PID, UsedMemory: p.UsedMemory, Name: p.Name}
+		if model, ok := runners[p.PID]; ok {
+			gp.Runner = &api.GPUProcessRunner{Model: model}
+		} else if p.OllamaChild {
+			gp.OllamaHelper = true
+		}
+		out = append(out, gp)
 	}
 	return out
 }
@@ -2790,6 +2800,8 @@ func (s *Server) infoResponse() *api.InfoResponse {
 		}
 	}
 	processes := discover.ComputeProcesses(pciIDs)
+	runnerPIDs := s.sched.runnerPIDs()
+	processesScope := discover.ProcessesScope()
 
 	gpus := make([]api.GPUInfo, len(devices))
 	for i, dev := range devices {
@@ -2802,7 +2814,8 @@ func (s *Server) infoResponse() *api.InfoResponse {
 			Name:               dev.Name,
 			TotalMemory:        dev.TotalMemory,
 			PhysicalMemory:     dev.PhysicalMemory,
-			Processes:          gpuProcesses(processes[dev.PCIID]),
+			Processes:          gpuProcesses(processes[dev.PCIID], runnerPIDs),
+			ProcessesScope:     processesScope,
 			FreeMemory:         dev.FreeMemory,
 			Runner:             dev.Library,
 		}

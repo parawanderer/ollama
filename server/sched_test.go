@@ -2071,6 +2071,7 @@ func TestSchedLlamaServerEvictsExistingOnPending(t *testing.T) {
 }
 
 type mockLlm struct {
+	pid                      int // 0 reports -1, as before
 	grantedSeq, grantedTotal int
 	memVRAM                  api.MemoryBreakdown
 	memHost                  api.MemoryBreakdown
@@ -2178,8 +2179,13 @@ func (s *mockLlm) GrantedContext() (perSlot, total int) { return s.grantedSeq, s
 
 func (s *mockLlm) Activity(ctx context.Context, busy bool) *api.RunnerActivity { return s.activity }
 
-func (s *mockLlm) SetOnGenerationDone(func(api.GenerationTimings))    {}
-func (s *mockLlm) Pid() int                                           { return -1 }
+func (s *mockLlm) SetOnGenerationDone(func(api.GenerationTimings)) {}
+func (s *mockLlm) Pid() int {
+	if s.pid != 0 {
+		return s.pid
+	}
+	return -1
+}
 func (s *mockLlm) GetPort() int                                       { return -1 }
 func (s *mockLlm) GetDeviceInfos(ctx context.Context) []ml.DeviceInfo { return nil }
 func (s *mockLlm) HasExited() bool                                    { return false }

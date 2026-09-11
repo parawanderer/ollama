@@ -644,7 +644,14 @@ func probeNVIDIADriverMajorLinux() (int, error) {
 // cached; this changes whenever a process starts or stops, so it is read at the moment it
 // is reported or it describes the past.
 func ComputeProcesses(pciIDs []string) map[string][]ml.DeviceProcess {
-	return nvmlComputeProcessesByPCI(pciIDs)
+	out := nvmlComputeProcessesByPCI(pciIDs)
+	self := os.Getpid()
+	for _, procs := range out {
+		for i := range procs {
+			procs[i].Name, procs[i].OllamaChild = describeProcess(procRoot, procs[i].PID, self)
+		}
+	}
+	return out
 }
 
 // nvmlComputeProcessesByPCI reports which processes hold memory on each device.

@@ -30,6 +30,12 @@ type DeviceID struct {
 type DeviceProcess struct {
 	PID        int    `json:"pid"`
 	UsedMemory uint64 `json:"used_memory"`
+
+	// Name is the process's executable name, and OllamaChild whether this ollama started it
+	// (a model runner, a fit probe, or device discovery). Both read from /proc; empty when
+	// it cannot answer.
+	Name        string `json:"name,omitempty"`
+	OllamaChild bool   `json:"ollama_child,omitempty"`
 }
 
 type DeviceInfo struct {

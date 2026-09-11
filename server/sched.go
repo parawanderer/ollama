@@ -2750,6 +2750,31 @@ func (s *Scheduler) LoadingModel() string {
 	return ""
 }
 
+// runnerPIDs maps each resident runner's process id to the model it serves, named as
+// /api/ps names it. Reads only fields fixed when the runner was created -- llama is never
+// reassigned and its process starts in its constructor -- so no runner lock is taken, and
+// a runner busy loading does not stall /api/info.
+func (s *Scheduler) runnerPIDs() map[int]string {
+	s.loadedMu.Lock()
+	defer s.loadedMu.Unlock()
+	out := make(map[int]string, len(s.loaded))
+	for _, r := range s.loaded {
+		if r.llama == nil {
+			continue
+		}
+		pid := r.llama.Pid()
+		if pid <= 0 {
+			continue
+		}
+		name := model.ParseName(r.name).DisplayShortest()
+		if name == "" {
+			name = r.name
+		}
+		out[pid] = name
+	}
+	return out
+}
+
 func (s *Scheduler) loadedModels() []loadedModel {
 	s.loadedMu.Lock()
 	runners := make([]*runnerRef, 0, len(s.loaded))

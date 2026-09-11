@@ -1,0 +1,7 @@
+//go:build !linux
+
+package discover
+
+import "github.com/ollama/ollama/ml"
+
+func busStateFor(pciID string) *ml.DeviceBusState { return nil }

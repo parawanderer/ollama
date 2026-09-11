@@ -9,6 +9,7 @@ package discover
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 static void * ollama_dlopen(const char * path, int global) {
 	return dlopen(path, RTLD_NOW | (global ? RTLD_GLOBAL : RTLD_LOCAL));
@@ -150,6 +151,71 @@ static int ollama_call_nvml_device_get_compute_procs(void * fn, void * device, u
 		used[i] = infos[i].usedGpuMemory;
 	}
 	return (int) count;
+}
+
+// nvmlPciInfo_t. The leading fields are stable and busIdLegacy is the "0000:01:00.0" form
+// ollama already uses for PCIID. The layout was verified against the running library rather
+// than transcribed from a header, and the trailing pad absorbs whatever NVML has appended
+// since -- it only ever appends.
+typedef struct {
+	char busIdLegacy[16];
+	unsigned int domain;
+	unsigned int bus;
+	unsigned int device;
+	unsigned int pciDeviceId;
+	unsigned int pciSubSystemId;
+	char busId[32];
+	char pad[64];
+} ollama_nvml_pci_info_t;
+
+typedef int (*ollama_nvml_device_get_count_fn)(unsigned int *);
+typedef int (*ollama_nvml_device_get_handle_by_index_fn)(unsigned int, void **);
+typedef int (*ollama_nvml_device_get_name_fn)(void *, char *, unsigned int);
+typedef int (*ollama_nvml_device_get_uuid_fn)(void *, char *, unsigned int);
+typedef int (*ollama_nvml_device_get_pci_info_fn)(void *, ollama_nvml_pci_info_t *);
+typedef int (*ollama_nvml_device_get_temperature_fn)(void *, int, unsigned int *);
+typedef const char * (*ollama_nvml_error_string_fn)(int);
+
+static int ollama_call_nvml_device_get_count(void * fn, unsigned int * count) {
+	return ((ollama_nvml_device_get_count_fn) fn)(count);
+}
+
+static int ollama_call_nvml_device_get_handle_by_index(void * fn, unsigned int index, void ** device) {
+	return ((ollama_nvml_device_get_handle_by_index_fn) fn)(index, device);
+}
+
+static int ollama_call_nvml_device_get_name(void * fn, void * device, char * name, unsigned int len) {
+	return ((ollama_nvml_device_get_name_fn) fn)(device, name, len);
+}
+
+static int ollama_call_nvml_device_get_uuid(void * fn, void * device, char * uuid, unsigned int len) {
+	return ((ollama_nvml_device_get_uuid_fn) fn)(device, uuid, len);
+}
+
+static int ollama_call_nvml_device_get_pci_bus_id_legacy(void * fn, void * device, char * out, unsigned int len) {
+	ollama_nvml_pci_info_t info;
+	memset(&info, 0, sizeof(info));
+	int ret = ((ollama_nvml_device_get_pci_info_fn) fn)(device, &info);
+	if (ret == 0) {
+		strncpy(out, info.busIdLegacy, len - 1);
+		out[len - 1] = 0;
+	}
+	return ret;
+}
+
+// Temperature is the health probe. See the note on deviceProbe.Status in device_health.go
+// for why it is this call and not memory, power or utilization.
+//
+// The 0 is NVML_TEMPERATURE_GPU. Do not write that as an inline C comment: this whole
+// block is one Go comment, Go comments do not nest, and a nested terminator ends the cgo
+// preamble right here. The errors then surface as Go syntax errors twenty lines below,
+// pointing at code that is completely fine.
+static int ollama_call_nvml_device_get_temperature(void * fn, void * device, unsigned int * temp) {
+	return ((ollama_nvml_device_get_temperature_fn) fn)(device, 0, temp);
+}
+
+static const char * ollama_call_nvml_error_string(void * fn, int status) {
+	return ((ollama_nvml_error_string_fn) fn)(status);
 }
 
 static int ollama_call_nvml_device_get_memory_info(void * fn, void * device, unsigned long long * total, unsigned long long * free) {
@@ -829,4 +895,113 @@ func boolToCInt(v bool) C.int {
 		return 1
 	}
 	return 0
+}
+
+// UnavailableDevices reports GPUs the machine has that the compute backends did not offer.
+//
+// known is the set of PCI addresses discovery DID return, in ml.DeviceInfo.PCIID form.
+// Anything NVML enumerates and that set does not contain is a device that physically
+// exists and cannot be used -- see the note on ml.UnavailableDevice for why that comparison
+// is the whole detector, and why the absence of such a device is otherwise unreportable.
+//
+// Returns nil on any failure to ask, and that is deliberate: this is a diagnostic, and a
+// diagnostic that invents devices when its own plumbing breaks is worse than one that stays
+// quiet. An empty result means "nothing to report OR could not look", which is why the
+// caller does not present it as "all devices healthy".
+func UnavailableDevices(known []string) []ml.UnavailableDevice {
+	nvml, err := dlopenFirst([]string{"libnvidia-ml.so.1", "libnvidia-ml.so"}, false)
+	if err != nil {
+		slog.Debug("NVML unavailable, cannot check for unusable devices", "error", err)
+		return nil
+	}
+
+	initFn, initErr := dlsym(nvml, "nvmlInit_v2")
+	shutdownFn, shutdownErr := dlsym(nvml, "nvmlShutdown")
+	countFn, countErr := dlsym(nvml, "nvmlDeviceGetCount_v2")
+	handleFn, handleErr := dlsym(nvml, "nvmlDeviceGetHandleByIndex_v2")
+	nameFn, nameErr := dlsym(nvml, "nvmlDeviceGetName")
+	uuidFn, uuidErr := dlsym(nvml, "nvmlDeviceGetUUID")
+	pciFn, pciErr := dlsym(nvml, "nvmlDeviceGetPciInfo_v3")
+	tempFn, tempErr := dlsym(nvml, "nvmlDeviceGetTemperature")
+	if err := cmp.Or(initErr, shutdownErr, countErr, handleErr, nameErr, uuidErr, pciErr, tempErr); err != nil {
+		slog.Debug("NVML missing a symbol needed to check device health", "error", err)
+		return nil
+	}
+	// nvmlErrorString is looked up separately: without it the reason is still known, only
+	// the driver's own wording for it is missing, which is not worth losing the report for.
+	errStrFn, _ := dlsym(nvml, "nvmlErrorString")
+
+	if ret := C.ollama_call_nvml_init(initFn); ret != 0 {
+		slog.Debug("nvmlInit_v2 failed", "status", int(ret))
+		return nil
+	}
+	defer C.ollama_call_nvml_shutdown(shutdownFn)
+
+	var count C.uint
+	if ret := C.ollama_call_nvml_device_get_count(countFn, &count); ret != 0 {
+		slog.Debug("nvmlDeviceGetCount_v2 failed", "status", int(ret))
+		return nil
+	}
+
+	usable := make(map[string]bool, len(known))
+	for _, pci := range known {
+		usable[strings.ToLower(pci)] = true
+	}
+
+	var out []ml.UnavailableDevice
+	for i := range uint(count) {
+		var handle unsafe.Pointer
+		if ret := C.ollama_call_nvml_device_get_handle_by_index(handleFn, C.uint(i), &handle); ret != 0 {
+			slog.Debug("NVML could not open a device it had counted", "index", i, "status", int(ret))
+			continue
+		}
+
+		pci := nvmlString(64, func(buf *C.char, n C.uint) C.int {
+			return C.ollama_call_nvml_device_get_pci_bus_id_legacy(pciFn, handle, buf, n)
+		})
+		if pci == "" || usable[strings.ToLower(pci)] {
+			continue
+		}
+
+		// This device exists and no backend offered it. Ask it something that reads live
+		// state, because that is what a faulted device cannot answer.
+		var temp C.uint
+		status := int(C.ollama_call_nvml_device_get_temperature(tempFn, handle, &temp))
+
+		detail := ""
+		if errStrFn != nil && status != nvmlSuccess {
+			if s := C.ollama_call_nvml_error_string(errStrFn, C.int(status)); s != nil {
+				detail = C.GoString(s)
+			}
+		}
+
+		probe := deviceProbe{
+			PCIID: pci,
+			Name: nvmlString(96, func(buf *C.char, n C.uint) C.int {
+				return C.ollama_call_nvml_device_get_name(nameFn, handle, buf, n)
+			}),
+			UUID: nvmlString(96, func(buf *C.char, n C.uint) C.int {
+				return C.ollama_call_nvml_device_get_uuid(uuidFn, handle, buf, n)
+			}),
+			Status:           status,
+			DetailFromDriver: detail,
+			Bus:              busStateFor(pci),
+		}
+
+		device := classifyUnavailable(probe)
+		slog.Warn("a GPU is present but cannot be used",
+			"pci_id", device.PCIID, "name", device.Name, "reason", device.Reason, "detail", device.Detail)
+		out = append(out, device)
+	}
+	return out
+}
+
+// nvmlString runs one of NVML's fill-a-buffer calls and returns what it wrote, or "".
+func nvmlString(size int, fill func(*C.char, C.uint) C.int) string {
+	buf := (*C.char)(C.malloc(C.size_t(size)))
+	defer C.free(unsafe.Pointer(buf))
+	if ret := fill(buf, C.uint(size)); ret != 0 {
+		return ""
+	}
+	return C.GoString(buf)
 }

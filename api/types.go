@@ -1672,6 +1672,15 @@ type EventFrame struct {
 	// T is milliseconds since this connection's hello frame.
 	T int64 `json:"t"`
 
+	// UnavailableGPUs appears on the hello frame, carrying any GPU the machine has that
+	// cannot be used. It is on hello and not only on an edge because the fault it reports
+	// is almost always OLDER than the connection: the case that prompted it began at 05:51
+	// and was still unreported when a client connected hours later. An edge-only design is
+	// silent in exactly that situation, which is the common one -- hardware does not wait
+	// for a subscriber. Transitions still arrive, as an `info` frame whose
+	// compute.unavailable_gpus has changed.
+	UnavailableGPUs []UnavailableGPU `json:"unavailable_gpus,omitempty"`
+
 	// ServerTime, Box and RetainedMs appear on the hello frame only. Box identifies the
 	// machine so a client can drop history it collected from a different one, and
 	// RetainedMs says how much backfill can be served rather than leaving it to guess.
@@ -1926,6 +1935,78 @@ type ComputeInfo struct {
 	SystemCompute SystemComputeInfo `json:"system_compute"`
 
 	SupportedGPUs []GPUInfo `json:"supported_gpus"`
+
+	// UnavailableGPUs are devices the machine has that cannot be used for inference.
+	//
+	// They are reported SEPARATELY from SupportedGPUs on purpose. A faulted card is not a
+	// GPU with a flag set: nothing may be placed on it, its memory may not be counted, and
+	// every existing consumer iterating SupportedGPUs is already correct. Folding the two
+	// lists together and adding a state field would make every one of those consumers wrong
+	// until it learned about the field -- failing open, on hardware that is broken.
+	//
+	// A non-empty list is the answer to "why does this machine have fewer GPUs than I
+	// expected". An empty one means "nothing to report OR the server could not look", and
+	// is deliberately not a claim that every device is healthy; the detector returns
+	// nothing when its own plumbing is unavailable rather than inventing a verdict.
+	UnavailableGPUs []UnavailableGPU `json:"unavailable_gpus,omitempty"`
+}
+
+// UnavailableGPU is a GPU the machine has that cannot be used, and why.
+//
+// This exists because the failure is otherwise undetectable from the API. A GPU the driver
+// has marked as faulted is not reported as broken, it is reported as ABSENT -- it vanishes
+// from the compute API entirely -- so a client sees a healthy machine with fewer cards and
+// cannot distinguish that from a machine that always had fewer cards. On this box a GPU sat
+// in that state for five and a half hours while /api/info reported a perfectly healthy
+// single-GPU server.
+type UnavailableGPU struct {
+	// PCIID is the bus address, comparable with what the rest of the API reports, so this
+	// device can be tied to a slot rather than only to a name shared with its twin.
+	PCIID string `json:"pci_id,omitempty"`
+
+	// Name and UUID usually survive the fault, so the card can be named. When a machine has
+	// two identical GPUs the UUID is what distinguishes the broken one.
+	Name string `json:"name,omitempty"`
+	UUID string `json:"uuid,omitempty"`
+
+	// Reason is a stable token to branch on. Detail is the driver's own wording, passed
+	// through unparaphrased so it can be searched for verbatim in vendor documentation --
+	// "GPU requires reset" is the vendor's string, not ours.
+	Reason string `json:"reason"`
+	Detail string `json:"detail,omitempty"`
+
+	// Recovery is the operator action the reason implies, in plain words. Empty means no
+	// known action, which is NOT the same as nothing being wrong.
+	Recovery string `json:"recovery,omitempty"`
+
+	// Bus is the PCIe view, read without the driver's help. It is what separates a card
+	// whose firmware has hung -- still enumerated, link up, no errors -- from one that has
+	// fallen off the bus. Those look the same from the driver and have different causes:
+	// one wants a GPU reset, the other wants someone to check the power connector.
+	Bus *GPUBusState `json:"bus,omitempty"`
+}
+
+// GPUBusState is what PCIe says about a device, independent of its driver.
+type GPUBusState struct {
+	// Present is whether the kernel still enumerates the device at all.
+	Present bool `json:"present"`
+
+	// LinkSpeed and LinkWidth are the link's state at the moment it was read, not its
+	// capability: an idle card drops to 2.5 GT/s under ASPM and clocks back up under load.
+	// Do not render these as a limit.
+	LinkSpeed  string `json:"link_speed,omitempty"`
+	LinkWidth  int    `json:"link_width,omitempty"`
+	PowerState string `json:"power_state,omitempty"`
+
+	// MaxLinkSpeed and MaxLinkWidth are the capability. Note a width below the maximum is
+	// usually BY DESIGN on a two-GPU desktop -- the board splits 16 CPU lanes x8/x8 -- so
+	// "current < max" is not a fault condition and must not be drawn as one.
+	MaxLinkSpeed string `json:"max_link_speed,omitempty"`
+	MaxLinkWidth int    `json:"max_link_width,omitempty"`
+
+	// AER counters. Non-zero points at the slot, riser or cabling rather than the card.
+	PCIeFatalErrors    int `json:"pcie_fatal_errors"`
+	PCIeNonFatalErrors int `json:"pcie_nonfatal_errors"`
 }
 
 // InfoResponse is the response returned from [Client.Info].

@@ -615,3 +615,73 @@ type FilteredRunnerDiscovery interface {
 	// This routine will not query the underlying device and will return immediately
 	GetActiveDeviceIDs() []DeviceID
 }
+
+// UnavailableDevice is a GPU the machine has that cannot be used for inference.
+//
+// It exists because the failure it describes is otherwise invisible: a GPU in a fault state
+// is not reported as broken, it is reported as ABSENT, and a caller cannot tell a one-GPU
+// machine from a two-GPU machine with a dead card. That is the worst shape a hardware fault
+// can take in a UI, because everything renders correctly and the number is simply wrong.
+//
+// The discriminator is that the compute API and the management API disagree. A device the
+// driver has marked as needing a reset is hidden from CUDA entirely -- cuDeviceGetCount
+// stops counting it -- while NVML still enumerates it with its name and UUID intact. So a
+// device present in NVML and missing from the backend is, by construction, a device that
+// exists and cannot be used, and no error code is needed to notice it.
+type UnavailableDevice struct {
+	// PCIID is the bus address, in the same form DeviceInfo.PCIID uses, so the two can be
+	// compared and a caller can look the device up in sysfs.
+	PCIID string `json:"pci_id,omitempty"`
+
+	// Name and UUID survive most faults -- they are read from the board rather than
+	// computed by the firmware that has stopped answering -- so a broken device can be
+	// named rather than described as a hole in the list.
+	Name string `json:"name,omitempty"`
+	UUID string `json:"uuid,omitempty"`
+
+	// Reason is a stable machine-readable token; Detail is the driver's own wording for
+	// the same thing, which is not translated or paraphrased here so that it can be
+	// searched for verbatim in vendor documentation.
+	Reason string `json:"reason"`
+	Detail string `json:"detail,omitempty"`
+
+	// Recovery is the operator action the reason implies, where one is known. Empty means
+	// this code does not know how to fix it, which is different from nothing being wrong.
+	Recovery string `json:"recovery,omitempty"`
+
+	// Bus is what the PCIe layer says about the device, read from sysfs and so available
+	// without the driver's cooperation. It is what separates a device whose firmware has
+	// hung -- still enumerated, link up, no errors -- from one that has fallen off the bus,
+	// which look identical from the driver's side and have completely different causes.
+	Bus *DeviceBusState `json:"bus,omitempty"`
+}
+
+// DeviceBusState is the PCIe view of a device, independent of its driver.
+type DeviceBusState struct {
+	// Present is whether the device is still enumerated at all. False on a device that has
+	// fallen off the bus, which is a power or seating fault rather than a GPU fault.
+	Present bool `json:"present"`
+
+	// LinkSpeed and LinkWidth are what the link is negotiated at RIGHT NOW, and on an idle
+	// GPU that is not a capability. These cards drop to 2.5 GT/s (Gen1) under ASPM when
+	// they have nothing to do and clock back up under load, so an instantaneous reading
+	// presented as a limit would report a healthy idle card as catastrophically degraded.
+	// Compare against MaxLinkSpeed/MaxLinkWidth, and only then with the caveat below.
+	LinkSpeed  string `json:"link_speed,omitempty"`
+	LinkWidth  int    `json:"link_width,omitempty"`
+	PowerState string `json:"power_state,omitempty"`
+
+	// MaxLinkSpeed and MaxLinkWidth are what the link is capable of.
+	//
+	// A width below the maximum is NOT necessarily a fault, and this is the trap in
+	// reporting it: a board that partitions 16 CPU lanes across two slots gives each card
+	// x8 of a x16-capable link BY DESIGN. Calling that "degraded" describes the intended
+	// configuration of most two-GPU desktops as a hardware problem.
+	MaxLinkSpeed string `json:"max_link_speed,omitempty"`
+	MaxLinkWidth int    `json:"max_link_width,omitempty"`
+
+	// The AER counters. Non-zero means the link itself is reporting errors, which points
+	// at the slot, the riser or the cabling rather than at the card.
+	FatalErrors    int `json:"pcie_fatal_errors"`
+	NonFatalErrors int `json:"pcie_nonfatal_errors"`
+}

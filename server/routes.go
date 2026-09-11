@@ -2650,6 +2650,9 @@ func (s *Server) EventsHandler(c *gin.Context) {
 		// A client that requested more than this has a gap, and must be able to see that
 		// rather than draw a line across a period nobody measured.
 		RetainedMs: reach.Milliseconds(),
+		// Any GPU the machine has and cannot use. Sent up front because this fault
+		// predates the connection far more often than not.
+		UnavailableGPUs: s.unavailableGPUsNow(),
 	}) {
 		return
 	}
@@ -2797,9 +2800,71 @@ func (s *Server) infoResponse() *api.InfoResponse {
 				FreeMemory:  sysInfo.FreeMemory,
 				FreeSwap:    sysInfo.FreeSwap,
 			},
-			SupportedGPUs: gpus,
+			SupportedGPUs:   gpus,
+			UnavailableGPUs: unavailableGPUs(devices),
 		},
 	}
+}
+
+// unavailableGPUsNow reports unusable devices against the currently discovered set.
+//
+// It goes through the same cache /api/info uses, so opening an event stream costs no extra
+// NVML work when the two are read together -- which they are, constantly, by the sampler.
+func (s *Server) unavailableGPUsNow() []api.UnavailableGPU {
+	if s.sched == nil {
+		return nil
+	}
+	return unavailableGPUs(s.sched.cachedDevices(context.Background()))
+}
+
+// unavailableGPUs asks which devices the machine has that discovery did not return.
+//
+// It is keyed off the devices discovery DID find, so it costs one NVML enumeration and no
+// subprocess. Devices without a PCI address are skipped rather than passed as an empty
+// string: an empty key would match nothing and every real device would then be reported as
+// unavailable, which is the loudest possible way to be wrong.
+func unavailableGPUs(found []ml.DeviceInfo) []api.UnavailableGPU {
+	known := make([]string, 0, len(found))
+	for _, dev := range found {
+		if dev.PCIID != "" {
+			known = append(known, dev.PCIID)
+		}
+	}
+
+	unusable := discover.CachedUnavailableDevices(known)
+	if len(unusable) == 0 {
+		return nil
+	}
+
+	out := make([]api.UnavailableGPU, 0, len(unusable))
+	for _, d := range unusable {
+		out = append(out, unavailableGPU(d))
+	}
+	return out
+}
+
+func unavailableGPU(d ml.UnavailableDevice) api.UnavailableGPU {
+	gpu := api.UnavailableGPU{
+		PCIID:    d.PCIID,
+		Name:     d.Name,
+		UUID:     d.UUID,
+		Reason:   d.Reason,
+		Detail:   d.Detail,
+		Recovery: d.Recovery,
+	}
+	if d.Bus != nil {
+		gpu.Bus = &api.GPUBusState{
+			Present:            d.Bus.Present,
+			LinkSpeed:          d.Bus.LinkSpeed,
+			LinkWidth:          d.Bus.LinkWidth,
+			PowerState:         d.Bus.PowerState,
+			MaxLinkSpeed:       d.Bus.MaxLinkSpeed,
+			MaxLinkWidth:       d.Bus.MaxLinkWidth,
+			PCIeFatalErrors:    d.Bus.FatalErrors,
+			PCIeNonFatalErrors: d.Bus.NonFatalErrors,
+		}
+	}
+	return gpu
 }
 
 func (s *Server) ChatHandler(c *gin.Context) {

@@ -1,0 +1,10 @@
+srv  get_availabl: updating prompt cache
+srv   prompt_save:  - saving prompt with length 21763, total state size = 5441.001 MiB (draft: 0.000 MiB)
+srv         alloc:  - making room for prompt cache entry, removing oldest entry (size = 1638.076 MiB)
+srv         alloc:  - making room for prompt cache entry, removing oldest entry (size = 6.252 MiB)
+srv         alloc:  - making room for prompt cache entry, removing oldest entry (size = 5434.500 MiB)
+srv          load:  - looking for better prompt, base f_keep = 0.000, f_sim = 0.000
+srv          load:    - prompt with length   21763, lcp =       3, f_keep = 0.000, f_sim = 0.000
+srv        update:  - cache state: 1 prompts, 5441.001 MiB (limits: 8192.000 MiB, 32768 tokens, 32768 est)
+srv        update:    - prompt 0x5f9365e70b30:   21763 tokens, checkpoints:  0,  5441.001 MiB
+srv  get_availabl: prompt cache update took 1299.92 ms

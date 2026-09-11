@@ -1009,6 +1009,65 @@ type GenerationTimings struct {
 
 	// Decoded is how many tokens were generated.
 	Decoded int `json:"decoded"`
+
+	// PromptCacheSwap is what the engine did with its host-RAM prompt cache before this
+	// request could start. Absent when it did nothing, which is the common case: a request
+	// that continues the conversation already in the slot touches no cache.
+	//
+	// It is reported here because it is invisible everywhere else. The swap happens while the
+	// engine picks a slot, before prefill starts, so it is inside neither PromptMs nor EvalMs:
+	// measured on qwen3:32b, a turn whose PromptMs was 24 ms took 650 ms, 510 of them moving
+	// the other conversation's 1.6 GB cache out to RAM and this one's back in.
+	PromptCacheSwap *PromptCacheSwap `json:"prompt_cache_swap,omitempty"`
+}
+
+// PromptCacheSwap describes one swap in llama-server's host-RAM prompt cache
+// (--cache-ram): the conversation that held the slot is saved to RAM, and this request's
+// conversation is restored from it if it is there.
+//
+// Read Restored and Evicted together. Restored true is the cache working: the prompt was
+// read back rather than recomputed, and PromptTokensCached says how much of it. Restored
+// false with Evicted > 0 on a conversation that was here before is the cache thrashing --
+// making room for the save threw out the very entry this request needed, so it paid a full
+// prefill *and* the save. It happens once two conversations no longer fit in the limit.
+type PromptCacheSwap struct {
+	// Ms is how long the engine spent on the swap, as it measured it.
+	Ms float64 `json:"ms"`
+
+	// SavedTokens and SavedBytes describe the conversation moved out of the slot into RAM.
+	// Both absent when nothing was saved: an empty slot, or a state too large to keep.
+	SavedTokens int    `json:"saved_tokens,omitempty"`
+	SavedBytes  uint64 `json:"saved_bytes,omitempty"`
+
+	// Restored says whether this request's conversation was found in the cache and read
+	// back into the slot.
+	Restored bool `json:"restored"`
+
+	// Evicted is how many cached conversations were dropped to make room, and EvictedBytes
+	// how much RAM they held.
+	Evicted      int    `json:"evicted,omitempty"`
+	EvictedBytes uint64 `json:"evicted_bytes,omitempty"`
+
+	// TooLarge is set when the outgoing conversation's state exceeded the whole cache limit,
+	// so it was not saved at all. That conversation will be recomputed in full next time.
+	TooLarge bool `json:"too_large,omitempty"`
+}
+
+// PromptCacheState is how much of llama-server's host-RAM prompt cache is occupied: the
+// conversations parked there while another one holds the slot.
+//
+// This is host memory, not VRAM, and it is per runner -- every loaded model has its own
+// cache and its own limit.
+type PromptCacheState struct {
+	// Entries is how many conversations are parked, Tokens their combined length, and Bytes
+	// the RAM they hold.
+	Entries int    `json:"entries"`
+	Tokens  int    `json:"tokens"`
+	Bytes   uint64 `json:"bytes"`
+
+	// LimitBytes is the cache's size limit. Two conversations that together exceed it
+	// cannot take turns without recomputing each other; see PromptCacheSwap.
+	LimitBytes uint64 `json:"limit_bytes"`
 }
 
 // RunnerActivity says what a resident model is *doing*, as distinct from what it is holding.
@@ -1058,6 +1117,11 @@ type RunnerActivity struct {
 
 	// Decoded is how many tokens have been generated for the task in flight. Zero while idle.
 	Decoded int `json:"decoded,omitempty"`
+
+	// PromptCache is the occupancy of the runner's host-RAM prompt cache, as the engine last
+	// reported it. Absent until the first request, which is when the engine first reports
+	// it -- there is no way to ask for it.
+	PromptCache *PromptCacheState `json:"prompt_cache,omitempty"`
 }
 
 // ModelPlacement says which part of a model went where, for a load split across devices.

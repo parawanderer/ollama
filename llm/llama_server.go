@@ -158,8 +158,12 @@ type llamaServerRunner struct {
 	// callback rather than an emission at each of the three handlers that produce a
 	// completion: this is the only point all of them pass through, and a hand-written copy
 	// per handler is the shape that has silently lost a field three times here already.
-	genMu            sync.Mutex
-	onGeneration     func(api.GenerationTimings)
+	genMu        sync.Mutex
+	onGeneration func(api.GenerationTimings)
+
+	// promptCache follows the engine's host-RAM prompt cache from its log: the swap each
+	// request paid for, and how full the cache is.
+	promptCache      promptCacheTracker
 	gpuLayers        uint64 // model layers loaded on GPU, parsed from llama-server logs
 	gpuLayerOverflow int    // number of GPU-selected layers partially overflowed to CPU
 	status           *StatusWriter
@@ -419,6 +423,7 @@ func llamaServerParams(launch llamaServerLaunchConfig, port int) []string {
 		"-np", strconv.Itoa(launch.numParallel),
 	}
 	params = appendLlamaServerLogArgs(params)
+	params = appendCacheRAMArgs(params, envconfig.CacheRAM())
 	params = appendJinjaArgs(params, launch.config)
 
 	params = appendMMProjArgs(params, launch)
@@ -705,6 +710,21 @@ func appendLoadModeArgs(params []string, opts api.Options, gpus []ml.DeviceInfo)
 	}
 
 	return params
+}
+
+// appendCacheRAMArgs passes OLLAMA_CACHE_RAM through as --cache-ram. Unset passes nothing,
+// so llama-server keeps its own default. A value that is not an integer of at least -1 is
+// dropped with a warning rather than handed over: llama-server would refuse to start, and
+// a typo in an env var should cost the cache size, not every load.
+func appendCacheRAMArgs(params []string, value string) []string {
+	if value == "" {
+		return params
+	}
+	if n, err := strconv.Atoi(value); err != nil || n < -1 {
+		slog.Warn("ignoring OLLAMA_CACHE_RAM: want MiB as an integer, -1 for no limit or 0 to disable", "value", value)
+		return params
+	}
+	return append(params, "--cache-ram", value)
 }
 
 func appendMainGPUArgs(params []string, opts api.Options) []string {
@@ -1663,6 +1683,14 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 	}
 	defer s.sem.Release(1)
 
+	// A swap can only be pinned on this request while it is the only one the engine is
+	// serving. With more slots the engine interleaves them and the log does not say whose
+	// swap is whose, so none is reported rather than a guess.
+	attributeSwap := s.launch.numParallel == 1
+	if attributeSwap {
+		s.promptCache.begin()
+	}
+
 	req.Options.NumPredict = boundedNumPredict(req.Options.NumPredict, s.options.NumCtx)
 
 	status, err := s.getServerStatusRetry(ctx)
@@ -1842,7 +1870,11 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 					doneReason = DoneReasonLength
 				}
 
-				s.notifyGeneration(lsResp.Timings)
+				var swap *api.PromptCacheSwap
+				if attributeSwap {
+					swap = s.promptCache.take()
+				}
+				s.notifyGeneration(lsResp.Timings, swap)
 
 				finalResp = CompletionResponse{
 					Content:               lsResp.Content,
@@ -3210,6 +3242,7 @@ func deviceName(backendName string) string {
 
 func (w *memoryParsingWriter) Write(b []byte) (int, error) {
 	if w.runner != nil {
+		w.runner.promptCache.observe(b)
 		if len(b) > 0 && w.runner.loadTracking.Load() {
 			w.runner.noteLoadActivity(time.Now())
 		}
@@ -3597,7 +3630,7 @@ func (s *llamaServerRunner) SetOnGenerationDone(fn func(api.GenerationTimings)) 
 	s.genMu.Unlock()
 }
 
-func (s *llamaServerRunner) notifyGeneration(t llamaServerTimings) {
+func (s *llamaServerRunner) notifyGeneration(t llamaServerTimings, swap *api.PromptCacheSwap) {
 	s.genMu.Lock()
 	fn := s.onGeneration
 	s.genMu.Unlock()
@@ -3612,6 +3645,7 @@ func (s *llamaServerRunner) notifyGeneration(t llamaServerTimings) {
 		PromptMs:           t.PromptMS,
 		EvalMs:             t.PredictMS,
 		Decoded:            t.PredictN,
+		PromptCacheSwap:    swap,
 	})
 }
 
@@ -3626,7 +3660,7 @@ func (s *llamaServerRunner) Activity(ctx context.Context, busy bool) *api.Runner
 	if !s.activityAt.IsZero() && time.Since(s.activityAt) < activityTTL(s.activityCached, busy) {
 		cached := s.activityCached
 		s.activityMu.Unlock()
-		return cached
+		return withPromptCache(cached, s.promptCache.snapshot())
 	}
 	s.activityMu.Unlock()
 
@@ -3637,7 +3671,19 @@ func (s *llamaServerRunner) Activity(ctx context.Context, busy bool) *api.Runner
 	// serve /slots is asked at most once per TTL rather than on every request.
 	s.activityCached, s.activityAt = activity, time.Now()
 	s.activityMu.Unlock()
-	return activity
+	return withPromptCache(activity, s.promptCache.snapshot())
+}
+
+// withPromptCache attaches the cache occupancy to a /slots reading. It comes from the log,
+// not the poll, so it is joined on the way out -- onto a copy, because the cached reading is
+// shared between callers.
+func withPromptCache(activity *api.RunnerActivity, state *api.PromptCacheState) *api.RunnerActivity {
+	if activity == nil {
+		return nil
+	}
+	out := *activity
+	out.PromptCache = state
+	return &out
 }
 
 func (s *llamaServerRunner) pollActivity(ctx context.Context) *api.RunnerActivity {

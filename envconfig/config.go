@@ -220,6 +220,10 @@ var (
 	DebugLogRequests = Bool("OLLAMA_DEBUG_LOG_REQUESTS")
 	// KvCacheType is the quantization type for the K/V cache.
 	KvCacheType = String("OLLAMA_KV_CACHE_TYPE")
+	// CacheRAM is the host-RAM prompt cache per runner, in MiB, passed to llama-server as
+	// --cache-ram: -1 for no limit, 0 to disable. Unset leaves llama-server's default (8192).
+	// It is per runner, so the worst case is this times the number of loaded models.
+	CacheRAM = String("OLLAMA_CACHE_RAM")
 	// NoHistory disables readline history.
 	NoHistory = Bool("OLLAMA_NOHISTORY")
 	// NoPrune disables pruning of model blobs on startup.
@@ -341,6 +345,7 @@ func AsMap() map[string]EnvVar {
 		"OLLAMA_GO_TEMPLATE":            {"OLLAMA_GO_TEMPLATE", GoTemplate(true), "Enable Modelfile TEMPLATE based rendering when available"},
 		"OLLAMA_FLASH_ATTENTION":        {"OLLAMA_FLASH_ATTENTION", FlashAttention(false), "Enabled flash attention"},
 		"OLLAMA_KV_CACHE_TYPE":          {"OLLAMA_KV_CACHE_TYPE", KvCacheType(), "Quantization type for the K/V cache (default: f16)"},
+		"OLLAMA_CACHE_RAM":              {"OLLAMA_CACHE_RAM", CacheRAM(), "Host-RAM prompt cache per loaded model, in MiB; -1 no limit, 0 off (default: llama-server's, 8192)"},
 		"OLLAMA_GPU_OVERHEAD":           {"OLLAMA_GPU_OVERHEAD", GpuOverhead(), "Reserve a portion of VRAM per GPU (bytes)"},
 		"OLLAMA_SINGLE_GPU_FIT_PERCENT": {"OLLAMA_SINGLE_GPU_FIT_PERCENT", SingleGPUFitPercent(), "Max % of one GPU's free VRAM a model may use and still be packed onto a single GPU (default 80)"},
 		"OLLAMA_NO_ARCH_ESTIMATE":       {"OLLAMA_NO_ARCH_ESTIMATE", NoArchEstimate(), "Drop per-architecture KV arithmetic from the VRAM prior and measure instead (test switch)"},

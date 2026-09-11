@@ -1901,4 +1901,17 @@ type InfoResponse struct {
 	Models SystemModelInfo `json:"models"`
 
 	ComputeInfo ComputeInfo `json:"compute"`
+
+	// LoadStallTimeoutMs is how long the server lets a load make no progress before giving
+	// up on it, from OLLAMA_LOAD_TIMEOUT. Zero means it waits forever.
+	//
+	// It is published so a client does not have to invent a ceiling of its own. A load has
+	// no bounded duration -- it depends on how much of the weights are in page cache and on
+	// the context size, neither of which a client can see, and the same 142 GB model took
+	// 38.8 s warm and 64.2 s cold here. So this is a STALL bound, not a total: a load that
+	// keeps progressing legitimately runs longer, and the server itself will not kill it.
+	//
+	// A client wanting a backstop should use this plus a margin, and treat a load as failed
+	// only when nothing has progressed for that long -- not when it has merely taken a while.
+	LoadStallTimeoutMs int64 `json:"load_stall_timeout_ms"`
 }

@@ -2763,6 +2763,9 @@ func (s *Server) infoResponse() *api.InfoResponse {
 	sysInfo := s.sched.getSystemInfoFn()
 	return &api.InfoResponse{
 		Version: version.Version,
+		// Published so a client can derive a backstop instead of hardcoding one. See the
+		// field comment: it is a stall bound, not a bound on how long a load may take.
+		LoadStallTimeoutMs: envconfig.LoadTimeout().Milliseconds(),
 		Models: api.SystemModelInfo{
 			Store:          envconfig.Models(),
 			Count:          len(ms),

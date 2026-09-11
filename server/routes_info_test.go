@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -269,5 +270,26 @@ func TestInfoHandlerOmitsPhysicalMemoryWhenUnknown(t *testing.T) {
 
 	if gpu := got.ComputeInfo.SupportedGPUs[0]; gpu.PhysicalMemory != 0 {
 		t.Errorf("physical_memory: got %d, want 0 for a backend that doesn't distinguish it", gpu.PhysicalMemory)
+	}
+}
+
+// TestInfoPublishesTheLoadStallTimeout pins the field a client derives a load backstop from.
+//
+// A load has no bounded duration: it depends on how much of the weights are in page cache
+// and on the context size, neither of which a client can see. The same 142 GB model took
+// 38.8 s warm and 64.2 s cold on this box, and qwen3.8:27b spent 1.0 s on weights against
+// 4.3 s building context. So a client cannot compute a ceiling, and hardcoding one means
+// inventing a number the server already holds -- which then drifts from it.
+//
+// It is a STALL bound. A load that keeps progressing runs longer and the server does not
+// kill it, so a client must treat this as "nothing has moved for this long", never as
+// "this has taken too long".
+func TestInfoPublishesTheLoadStallTimeout(t *testing.T) {
+	t.Setenv("OLLAMA_LOAD_TIMEOUT", "7m")
+	got := infoResponse(t, infoTestServer(t))
+
+	if want := (7 * time.Minute).Milliseconds(); got.LoadStallTimeoutMs != want {
+		t.Errorf("load_stall_timeout_ms = %d, want %d (the server's own OLLAMA_LOAD_TIMEOUT, "+
+			"not a constant of the client's)", got.LoadStallTimeoutMs, want)
 	}
 }

@@ -2393,6 +2393,25 @@ func (s *Server) processResponse() *api.ProcessResponse {
 		models = append(models, row)
 	}
 
+	// A load in flight has no runner yet, so nothing above produced a row for it. Add one,
+	// unless the runner has since appeared under the same name -- the two overlap briefly at
+	// the end of a load, and a duplicate row reads as two copies of one model.
+	//
+	// Without this, /api/ps returns an empty list for the whole of a long load: measured at
+	// 64 s on a 142 GB model, answering every poll in under a millisecond and saying nothing
+	// is there, while the request that triggered the load had not yet received a byte. A
+	// client cannot tell that apart from a dead server, and this is the only endpoint it can
+	// ask. The event stream carries load.start, but a poller is not obliged to subscribe.
+	if loading := s.sched.LoadingModel(); loading != "" {
+		if !slices.ContainsFunc(models, func(m api.ProcessModelResponse) bool {
+			return m.Name == loading
+		}) {
+			models = append(models, api.ProcessModelResponse{
+				Name: loading, Model: loading, State: "loading",
+			})
+		}
+	}
+
 	slices.SortStableFunc(models, func(i, j api.ProcessModelResponse) int {
 		// longest duration remaining listed first
 		return cmp.Compare(j.ExpiresAt.Unix(), i.ExpiresAt.Unix())

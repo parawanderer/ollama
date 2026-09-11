@@ -206,3 +206,61 @@ func TestPsHandlerReportsMemoryBreakdown(t *testing.T) {
 		}
 	}
 }
+
+// TestPsHandlerReportsALoadInFlight covers the window a poller could not see into.
+//
+// The runner object is built only after the load returns, so for the whole of a long load
+// /api/ps produced an empty list — measured at 64 s on a 142 GB model, answering in under a
+// millisecond and reporting nothing, while the request that triggered the load had not yet
+// received a byte. That is indistinguishable from a dead server, and /api/ps is the only
+// endpoint a poller is obliged to have.
+func TestPsHandlerReportsALoadInFlight(t *testing.T) {
+	s := &Server{sched: &Scheduler{loaded: map[string]*runnerRef{}}}
+	s.sched.setLoadingModel("qwen3:235b")
+
+	got := s.processResponse()
+	if len(got.Models) != 1 {
+		t.Fatalf("expected the loading model to be reported, got %d rows", len(got.Models))
+	}
+	if got.Models[0].Name != "qwen3:235b" || got.Models[0].State != "loading" {
+		t.Errorf("row = %+v, want qwen3:235b in state loading", got.Models[0])
+	}
+	// Nothing else is known yet, and claiming otherwise is worse than saying nothing: a
+	// zero size beside a "loading" state reads as a model that occupies nothing.
+	if got.Models[0].SizeVRAM != 0 || got.Models[0].Memory != nil {
+		t.Errorf("row carries figures it cannot know: %+v", got.Models[0])
+	}
+
+	s.sched.clearLoadingModel()
+	if len(s.processResponse().Models) != 0 {
+		t.Error("the loading row outlived the load")
+	}
+}
+
+// TestPsHandlerDoesNotDuplicateALoadingModel pins the overlap at the end of a load, where
+// the runner exists and the loading flag has not yet been cleared. Two rows for one model
+// reads as two copies of it, and a panel drawing per-model bands would draw it twice.
+func TestPsHandlerDoesNotDuplicateALoadingModel(t *testing.T) {
+	dev := ml.DeviceID{ID: "0", Library: "CUDA"}
+	runner := &runnerRef{
+		model:     &Model{ShortName: "qwen3:235b"},
+		gpus:      []ml.DeviceID{dev},
+		totalSize: 40 * format.GigaByte,
+		vramSize:  40 * format.GigaByte,
+		expiresAt: time.Now().Add(5 * time.Minute),
+		llama: &fakeRunner{
+			vram:  map[ml.DeviceID]uint64{dev: 40 * format.GigaByte},
+			total: 40 * format.GigaByte, gpuTotal: 40 * format.GigaByte,
+		},
+	}
+	s := &Server{sched: &Scheduler{loaded: map[string]*runnerRef{"m": runner}}}
+	s.sched.setLoadingModel("qwen3:235b")
+
+	got := s.processResponse()
+	if len(got.Models) != 1 {
+		t.Fatalf("expected one row for one model, got %d: %+v", len(got.Models), got.Models)
+	}
+	if got.Models[0].State == "loading" {
+		t.Error("the resident row was replaced by the loading placeholder")
+	}
+}

@@ -88,6 +88,15 @@ type Scheduler struct {
 	// -- which is exactly the period the sampler most needs to run fast.
 	loadsInFlight atomic.Int64
 
+	// loadingModel is the display name of the model whose load is in flight, or empty.
+	//
+	// It exists because the runner object is built only after the load returns, so /api/ps
+	// had nothing to report for the whole of a long load -- measured, an empty list for 64 s
+	// while a 142 GB model loaded. A client polling it saw "no models" while its own request
+	// hung, which is indistinguishable from a dead server. The scheduler knows the name from
+	// the moment it publishes load.start; this is that same knowledge, readable by a poll.
+	loadingModel atomic.Pointer[string]
+
 	// events publishes model lifecycle transitions to /api/events subscribers, and ring
 	// retains them so a client that reconnects can be told what it missed rather than
 	// having a gap drawn over.
@@ -1169,6 +1178,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			// work actually starts, or it lands a millisecond before completion.
 			loadStartedAt = time.Now().UTC()
 			s.loadsInFlight.Add(1)
+			s.setLoadingModel(model.ParseName(req.model.Name).DisplayShortest())
 			s.publishEvent(api.ModelEvent{Type: EventLoadStart, Model: req.model.Name, At: loadStartedAt})
 
 			// A load has two halves and they cost quite differently. Reading and
@@ -1378,6 +1388,7 @@ iGPUScan:
 		if err = llama.WaitUntilRunning(req.ctx); err != nil {
 			slog.Error("error loading llama server", "error", err)
 			s.loadsInFlight.Add(-1)
+			s.clearLoadingModel()
 			s.publishEvent(api.ModelEvent{
 				Type:       EventLoadFailed,
 				Model:      req.model.Name,
@@ -1427,6 +1438,7 @@ iGPUScan:
 			}
 		}
 		s.loadsInFlight.Add(-1)
+		s.clearLoadingModel()
 		// A spill is reported rather than merely recorded. It is the visible consequence of
 		// a prediction that was too low, and it is otherwise silent: the load succeeds, the
 		// model answers, and the only trace is that it is slow.
@@ -2519,6 +2531,22 @@ type loadedModel struct {
 
 // loadedModels returns a snapshot of the currently loaded models for status
 // reporting without exposing the scheduler's internal runner bookkeeping.
+func (s *Scheduler) setLoadingModel(name string) {
+	s.loadingModel.Store(&name)
+}
+
+func (s *Scheduler) clearLoadingModel() {
+	s.loadingModel.Store(nil)
+}
+
+// LoadingModel is the model currently being loaded, or "" if none.
+func (s *Scheduler) LoadingModel() string {
+	if p := s.loadingModel.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
 func (s *Scheduler) loadedModels() []loadedModel {
 	s.loadedMu.Lock()
 	runners := make([]*runnerRef, 0, len(s.loaded))

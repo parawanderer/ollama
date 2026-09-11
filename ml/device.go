@@ -709,3 +709,49 @@ func (d DeviceInfo) MemoryBandwidth() uint64 {
 	}
 	return uint64(d.MemoryBusWidthBits) / 8 * uint64(d.MemoryClockMaxMHz) * 1_000_000 * 2
 }
+
+// Topology is how the GPUs a backend offered are connected to each other, pair by pair.
+//
+// Per PAIR, not per device, because that is how the hardware is: consumer NVLink is 2-way, so
+// a four-card machine can hold two NVLinked pairs with PCIe between them, and any per-device
+// field would claim the wrong thing about half the pairs.
+type Topology struct {
+	// Status is "measured" (every pair classified), "partial" (some pairs could not be) or
+	// "unavailable" (nothing could be read). Detail carries the driver's own words when it is
+	// not measured. A client draws nothing unless Status is "measured".
+	Status string
+	Detail string
+
+	// GPUs are bus addresses. Every unordered pair of them appears in Links exactly once, so
+	// a client can check coverage -- n(n-1)/2 entries -- and a missing pair is a bug, never a
+	// silent "PCIe".
+	GPUs  []string
+	Links []TopologyLink
+}
+
+// TopologyLink is one pair of GPUs and what connects them.
+type TopologyLink struct {
+	A, B string
+
+	// Type is "nvlink", "xgmi", "pcie" or "unknown". Path is the vendor tool's own vocabulary
+	// for the route: nvidia-smi's NV#, PIX, PXB, PHB, NODE, SYS.
+	Type string
+	Path string
+
+	NVLinkCount   int
+	NVLinkVersion int
+
+	// PCIePath is the PCIe route even when an NVLink bridge carries the traffic: it is what a
+	// placement falls back on when the bridge is absent or down.
+	PCIePath string
+
+	// Bandwidth, when present, says where it came from. "derived_from_pcie_link" is computed
+	// from the narrower end's link capability; "kfd_io_link" is read from the AMD driver.
+	// NVLink bandwidth is never derived from a table of versions, and is absent until it can
+	// be read from a real machine.
+	Bandwidth       uint64
+	BandwidthSource string
+
+	// Reason explains an "unknown" pair, or anything else a client should not infer.
+	Reason string
+}

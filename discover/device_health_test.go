@@ -1,6 +1,8 @@
 package discover
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/ollama/ollama/ml"
@@ -201,5 +203,39 @@ func TestPCIeGenerationFromTheKernelsStrings(t *testing.T) {
 		if got := pcieGeneration(speed); got != want {
 			t.Errorf("pcieGeneration(%q) = %d, want %d", speed, got, want)
 		}
+	}
+}
+
+// Read from this box: each card reports x16 and the root port above it reports x8, because the
+// board splits 16 CPU lanes between two slots. The installed link cannot exceed x8, so that is
+// the maximum -- reporting the card's x16 would describe a link that cannot exist.
+func TestPCIeMaxLinkIsTheNarrowerOfCardAndPort(t *testing.T) {
+	root := t.TempDir()
+	port := filepath.Join(root, "devices", "pci0000:00", "0000:00:01.1")
+	card := filepath.Join(port, "0000:01:00.0")
+	for dir, vals := range map[string][2]string{
+		port: {"32.0 GT/s PCIe", "8"},
+		card: {"32.0 GT/s PCIe", "16"},
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeFakeSysfsFile(t, dir, "max_link_speed", vals[0]+"\n")
+		writeFakeSysfsFile(t, dir, "max_link_width", vals[1]+"\n")
+	}
+	busDir := filepath.Join(root, "bus", "pci", "devices")
+	if err := os.MkdirAll(busDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(card, filepath.Join(busDir, "0000:01:00.0")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	old := sysfsPCIRoot
+	sysfsPCIRoot = busDir
+	t.Cleanup(func() { sysfsPCIRoot = old })
+
+	gen, width := PCIeMaxLink("0000:01:00.0")
+	if gen != 5 || width != 8 {
+		t.Errorf("PCIeMaxLink = Gen%d x%d, want Gen5 x8: the port, not the card, limits the width", gen, width)
 	}
 }

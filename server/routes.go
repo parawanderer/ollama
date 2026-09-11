@@ -2860,8 +2860,26 @@ func (s *Server) infoResponse() *api.InfoResponse {
 			},
 			SupportedGPUs:   gpus,
 			UnavailableGPUs: unavailableGPUs(devices),
+			Topology:        gpuTopology(devices),
 		},
 	}
+}
+
+// gpuTopology converts the discovered topology to its wire form.
+func gpuTopology(devices []ml.DeviceInfo) *api.GPUTopology {
+	t := discover.CachedTopology(devices)
+	if t == nil {
+		return nil
+	}
+	out := &api.GPUTopology{Status: t.Status, Detail: t.Detail, GPUs: t.GPUs, Links: []api.GPULink{}}
+	for _, l := range t.Links {
+		out.Links = append(out.Links, api.GPULink{
+			A: l.A, B: l.B, Type: l.Type, Path: l.Path,
+			NVLinkCount: l.NVLinkCount, NVLinkVersion: l.NVLinkVersion, PCIePath: l.PCIePath,
+			Bandwidth: l.Bandwidth, BandwidthSource: l.BandwidthSource, Reason: l.Reason,
+		})
+	}
+	return out
 }
 
 // unavailableGPUsNow reports unusable devices against the currently discovered set.

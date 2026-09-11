@@ -130,17 +130,39 @@ func nvidiaGPUsInSysfs() []string {
 	return out
 }
 
-// PCIeMaxLink reports the PCIe generation and width a device's link is capable of, from sysfs
-// and so for any vendor, or zeros when unknown.
+// PCIeMaxLink reports the fastest PCIe link a device can have as installed -- the lower of
+// the card's capability and its upstream port's -- from sysfs, for any vendor, or zeros.
 //
-// Capability only. The current link is deliberately not offered here: an idle card drops to
-// Gen1 under ASPM, so an instantaneous reading presented beside a capability would read as a
-// fault on a healthy machine.
+// The card alone is the wrong answer, and on this box it is wrong in the direction a user
+// would believe: each RTX PRO 6000 reports x16, while the root port above it (00:01.1,
+// 00:01.3) reports x8, because the board splits its 16 CPU lanes between two slots. The link
+// can never train wider than the narrower end, so "max x16" would describe a link that
+// cannot exist. The same holds for speed: a Gen5 card in a Gen4 slot runs at Gen4.
+//
+// Capability only. The current link is deliberately not offered: an idle card drops to Gen1
+// under ASPM, so an instantaneous reading beside a capability reads as a fault.
 func PCIeMaxLink(pciID string) (generation, width int) {
 	if pciID == "" {
 		return 0, 0
 	}
 	dir := filepath.Join(sysfsPCIRoot, pciID)
+	generation, width = linkCapability(dir)
+
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return generation, width
+	}
+	portGen, portWidth := linkCapability(filepath.Dir(resolved))
+	if portGen > 0 && (generation == 0 || portGen < generation) {
+		generation = portGen
+	}
+	if portWidth > 0 && (width == 0 || portWidth < width) {
+		width = portWidth
+	}
+	return generation, width
+}
+
+func linkCapability(dir string) (generation, width int) {
 	generation = pcieGeneration(readTrimmed(filepath.Join(dir, "max_link_speed")))
 	width, _ = strconv.Atoi(readTrimmed(filepath.Join(dir, "max_link_width")))
 	return generation, width

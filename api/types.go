@@ -2033,6 +2033,53 @@ type ComputeInfo struct {
 	// is deliberately not a claim that every device is healthy; the detector returns
 	// nothing when its own plumbing is unavailable rather than inventing a verdict.
 	UnavailableGPUs []UnavailableGPU `json:"unavailable_gpus,omitempty"`
+
+	// Topology is how the supported GPUs connect, pair by pair. Absent with no GPU.
+	Topology *GPUTopology `json:"topology,omitempty"`
+}
+
+// GPUTopology is the interconnect between every pair of supported GPUs.
+//
+// Checkable on the wire: every unordered pair of GPUs appears in Links exactly once, so a
+// client can verify n(n-1)/2 entries, and a pair that could not be classified is present as
+// "unknown" with a reason rather than omitted. Draw nothing unless Status is "measured".
+type GPUTopology struct {
+	// Status is "measured", "partial" (some pairs unknown) or "unavailable" (nothing read).
+	Status string `json:"status"`
+	Detail string `json:"detail,omitempty"`
+
+	GPUs  []string  `json:"gpus"`
+	Links []GPULink `json:"links"`
+}
+
+// GPULink is one pair of GPUs and what connects them.
+type GPULink struct {
+	A string `json:"a"`
+	B string `json:"b"`
+
+	// Type is "nvlink", "xgmi", "pcie" or "unknown". NVLink sits an order of magnitude above
+	// every PCIe route, so it must not share a scale with them.
+	Type string `json:"type"`
+	// Path is the vendor tool's own word for the route: NV# (a bonded set of # NVLinks),
+	// PIX, PXB, PHB, NODE, SYS from nvidia-smi; XGMI or PCIE from KFD.
+	Path string `json:"path,omitempty"`
+
+	NVLinkCount   int `json:"nvlink_count,omitempty"`
+	NVLinkVersion int `json:"nvlink_version,omitempty"`
+
+	// PCIePath is the PCIe route beneath an NVLink bridge -- what a placement falls back on
+	// if the bridge is absent or down.
+	PCIePath string `json:"pcie_path,omitempty"`
+
+	// Bandwidth is one direction's peak. BandwidthSource says where it came from:
+	// "derived_from_pcie_link" (the narrower end's link capability, by the PCIe spec) or
+	// "kfd_io_link" (read from the AMD driver). NVLink bandwidth is absent: it is never
+	// derived from a table, and no machine this was built on could read it.
+	Bandwidth       uint64 `json:"bandwidth_bytes_per_sec,omitempty"`
+	BandwidthSource string `json:"bandwidth_source,omitempty"`
+
+	// Reason explains an "unknown" pair, or a link a client should not over-read.
+	Reason string `json:"reason,omitempty"`
 }
 
 // UnavailableGPU is a GPU the machine has that cannot be used, and why.

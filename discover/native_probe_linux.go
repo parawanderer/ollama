@@ -214,6 +214,40 @@ static int ollama_call_nvml_device_get_temperature(void * fn, void * device, uns
 	return ((ollama_nvml_device_get_temperature_fn) fn)(device, 0, temp);
 }
 
+typedef int (*ollama_nvml_topology_ancestor_fn)(void *, void *, int *);
+typedef int (*ollama_nvml_p2p_status_fn)(void *, void *, int, int *);
+typedef int (*ollama_nvml_nvlink_state_fn)(void *, unsigned int, int *);
+typedef int (*ollama_nvml_nvlink_version_fn)(void *, unsigned int, unsigned int *);
+typedef int (*ollama_nvml_nvlink_remote_pci_fn)(void *, unsigned int, ollama_nvml_pci_info_t *);
+
+static int ollama_call_nvml_topology_ancestor(void * fn, void * a, void * b, int * level) {
+	return ((ollama_nvml_topology_ancestor_fn) fn)(a, b, level);
+}
+
+// The 2 is NVML_P2P_CAPS_INDEX_NVLINK, from nvml.h.
+static int ollama_call_nvml_p2p_nvlink(void * fn, void * a, void * b, int * status) {
+	return ((ollama_nvml_p2p_status_fn) fn)(a, b, 2, status);
+}
+
+static int ollama_call_nvml_nvlink_state(void * fn, void * dev, unsigned int link, int * active) {
+	return ((ollama_nvml_nvlink_state_fn) fn)(dev, link, active);
+}
+
+static int ollama_call_nvml_nvlink_version(void * fn, void * dev, unsigned int link, unsigned int * version) {
+	return ((ollama_nvml_nvlink_version_fn) fn)(dev, link, version);
+}
+
+static int ollama_call_nvml_nvlink_remote_pci(void * fn, void * dev, unsigned int link, char * out, unsigned int len) {
+	ollama_nvml_pci_info_t info;
+	memset(&info, 0, sizeof(info));
+	int ret = ((ollama_nvml_nvlink_remote_pci_fn) fn)(dev, link, &info);
+	if (ret == 0) {
+		strncpy(out, info.busIdLegacy, len - 1);
+		out[len - 1] = 0;
+	}
+	return ret;
+}
+
 typedef int (*ollama_nvml_device_get_uint_fn)(void *, unsigned int *);
 typedef int (*ollama_nvml_device_get_max_clock_fn)(void *, int, unsigned int *);
 
@@ -1134,4 +1168,138 @@ func nvmlMemoryInterfaceByPCI(pciIDs []string) map[string]nvmlMemoryInterface {
 		out[pci] = nvmlMemoryInterface{busWidthBits: int(bus), clockMaxMHz: int(clock)}
 	}
 	return out
+}
+
+// nvmlNVLinkMaxLinks is NVML_NVLINK_MAX_LINKS from nvml.h (CUDA 13.0).
+const nvmlNVLinkMaxLinks = 18
+
+const nvmlErrorInvalidArgument = 2
+
+// nvidiaTopology asks NVML how each pair of these NVIDIA GPUs is connected.
+//
+// The NVLink path cannot be exercised on the machine this was written on -- its GPUs have no
+// NVLink PHY, so link 0 answers NOT_SUPPORTED -- so every NVLink branch is built to fail loud:
+// a call that fails for any reason other than "this card has no NVLink" makes the pair
+// unknown, with the driver's own words, rather than letting it fall through to "pcie".
+func nvidiaTopology(pciIDs []string) *ml.Topology {
+	pciIDs = sortedPCIIDs(pciIDs)
+	nvml, err := dlopenFirst([]string{"libnvidia-ml.so.1", "libnvidia-ml.so"}, false)
+	if err != nil {
+		return unavailableTopology(pciIDs, "NVML is not available: "+err.Error())
+	}
+	initFn, initErr := dlsym(nvml, "nvmlInit_v2")
+	shutdownFn, shutdownErr := dlsym(nvml, "nvmlShutdown")
+	handleFn, handleErr := dlsym(nvml, "nvmlDeviceGetHandleByPciBusId_v2")
+	ancestorFn, ancestorErr := dlsym(nvml, "nvmlDeviceGetTopologyCommonAncestor")
+	if err := cmp.Or(initErr, shutdownErr, handleErr, ancestorErr); err != nil {
+		return unavailableTopology(pciIDs, "NVML is missing a topology call: "+err.Error())
+	}
+	// The NVLink calls are optional: a driver without them cannot report NVLink, which is
+	// reported per pair below rather than hidden.
+	stateFn, _ := dlsym(nvml, "nvmlDeviceGetNvLinkState")
+	versionFn, _ := dlsym(nvml, "nvmlDeviceGetNvLinkVersion")
+	remoteFn, _ := dlsym(nvml, "nvmlDeviceGetNvLinkRemotePciInfo_v2")
+	p2pFn, _ := dlsym(nvml, "nvmlDeviceGetP2PStatus")
+	errStrFn, _ := dlsym(nvml, "nvmlErrorString")
+	errString := func(status int) string {
+		if errStrFn != nil {
+			if s := C.ollama_call_nvml_error_string(errStrFn, C.int(status)); s != nil {
+				return fmt.Sprintf("%s (%d)", C.GoString(s), status)
+			}
+		}
+		return fmt.Sprintf("NVML status %d", status)
+	}
+
+	if ret := C.ollama_call_nvml_init(initFn); ret != 0 {
+		return unavailableTopology(pciIDs, "nvmlInit failed: "+errString(int(ret)))
+	}
+	defer C.ollama_call_nvml_shutdown(shutdownFn)
+
+	handles := make(map[string]unsafe.Pointer, len(pciIDs))
+	handleErrs := make(map[string]string)
+	for _, pci := range pciIDs {
+		cpci := C.CString(pci)
+		var h unsafe.Pointer
+		ret := C.ollama_call_nvml_device_get_handle_by_pci_bus_id(handleFn, cpci, &h)
+		C.free(unsafe.Pointer(cpci))
+		if ret != 0 {
+			handleErrs[pci] = errString(int(ret))
+			continue
+		}
+		handles[pci] = h
+	}
+
+	t := &ml.Topology{GPUs: pciIDs}
+	forEachPair(pciIDs, func(a, b string) {
+		ha, okA := handles[a]
+		hb, okB := handles[b]
+		if !okA || !okB {
+			t.Links = append(t.Links, ml.TopologyLink{A: a, B: b, Type: "unknown",
+				Reason: "NVML could not open a device of this pair: " + cmp.Or(handleErrs[a], handleErrs[b])})
+			return
+		}
+
+		var p nvidiaPairProbe
+		var level C.int
+		p.PCIeStatus = int(C.ollama_call_nvml_topology_ancestor(ancestorFn, ha, hb, &level))
+		p.PCIeLevel = int(level)
+
+		if stateFn == nil || remoteFn == nil {
+			p.FailStatus, p.FailDetail = -1, "this driver's NVML has no NVLink state calls"
+		} else {
+			for link := range uint(nvmlNVLinkMaxLinks) {
+				var active C.int
+				st := int(C.ollama_call_nvml_nvlink_state(stateFn, ha, C.uint(link), &active))
+				if st == nvmlErrorNotSupported {
+					p.NVLinkAbsent = link == 0
+					break
+				}
+				if st == nvmlErrorInvalidArgument {
+					break
+				}
+				if st != nvmlSuccess {
+					p.FailStatus, p.FailDetail = st, errString(st)
+					break
+				}
+				if active != 1 {
+					continue
+				}
+				buf := (*C.char)(C.malloc(64))
+				rst := int(C.ollama_call_nvml_nvlink_remote_pci(remoteFn, ha, C.uint(link), buf, 64))
+				remote := C.GoString(buf)
+				C.free(unsafe.Pointer(buf))
+				if rst != nvmlSuccess {
+					p.FailStatus, p.FailDetail = rst, errString(rst)
+					break
+				}
+				if strings.EqualFold(remote, b) {
+					p.DirectLinks++
+					if versionFn != nil {
+						var v C.uint
+						if C.ollama_call_nvml_nvlink_version(versionFn, ha, C.uint(link), &v) == 0 {
+							p.Version = int(v)
+						}
+					}
+				}
+			}
+		}
+		if !p.NVLinkAbsent && p.FailStatus == 0 && p.DirectLinks == 0 && p2pFn != nil {
+			var status C.int
+			if C.ollama_call_nvml_p2p_nvlink(p2pFn, ha, hb, &status) == 0 && status == 0 {
+				p.P2PNVLink = true
+			}
+		}
+
+		l := classifyNVIDIAPair(a, b, p)
+		if l.Type == "pcie" {
+			genA, widthA := PCIeMaxLink(a)
+			genB, widthB := PCIeMaxLink(b)
+			if bw := pcieLinkBandwidth(min(genA, genB), min(widthA, widthB)); bw > 0 {
+				l.Bandwidth, l.BandwidthSource = bw, "derived_from_pcie_link"
+			}
+		}
+		t.Links = append(t.Links, l)
+	})
+	t.Status, t.Detail = topologyStatus(t.Links)
+	return t
 }

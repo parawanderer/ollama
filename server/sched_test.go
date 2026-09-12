@@ -320,6 +320,70 @@ func TestSchedRequestsSameModelSameRequest(t *testing.T) {
 	}
 }
 
+// A request served by an already-loaded runner is one generation, so it must announce
+// one. gen.start was published twice here, so a client counting generations counted every
+// reuse double.
+func TestReusingALoadedRunnerAnnouncesOneGeneration(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer done()
+	s := InitScheduler(ctx)
+	s.waitForRecovery = 10 * time.Millisecond
+	s.getGpuFn = getGpuFn
+	s.getSystemInfoFn = getSystemInfoFn
+	a := newScenarioRequest(t, ctx, "ollama-model-1", 10, &api.Duration{Duration: time.Minute}, nil)
+	b := newScenarioRequest(t, ctx, "ollama-model-1", 11, &api.Duration{Duration: time.Minute}, nil)
+	b.req.model = a.req.model
+
+	s.newServerFn = a.newServer
+	s.pendingReqCh <- a.req
+	s.Run(ctx)
+	var runner *runnerRef
+	select {
+	case runner = <-a.req.successCh:
+	case err := <-a.req.errCh:
+		t.Fatal(err.Error())
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+
+	// Let the first request finish, so the second is the idle-to-busy transition that
+	// announces a generation.
+	a.ctxDone()
+	require.Eventually(t, func() bool {
+		runner.refMu.Lock()
+		defer runner.refMu.Unlock()
+		return runner.refCount == 0
+	}, 300*time.Millisecond, 5*time.Millisecond)
+
+	events, unsubscribe := s.events.Subscribe()
+	defer unsubscribe()
+	s.pendingReqCh <- b.req
+	select {
+	case resp := <-b.req.successCh:
+		require.Equal(t, a.srv, resp.llama, "the second request must reuse the loaded runner")
+	case err := <-b.req.errCh:
+		t.Fatal(err.Error())
+	case <-ctx.Done():
+		t.Fatal("timeout")
+	}
+
+	starts := 0
+	drain := time.After(50 * time.Millisecond)
+	for draining := true; draining; {
+		select {
+		case ev := <-events:
+			if ev.Type == EventGenStart {
+				starts++
+			}
+		case <-drain:
+			draining = false
+		}
+	}
+	if starts != 1 {
+		t.Fatalf("%d gen.start events for one reused request, want 1", starts)
+	}
+}
+
 func TestSchedRequestsSimpleReloadSameModel(t *testing.T) {
 	ctx, done := context.WithTimeout(t.Context(), 5000*time.Millisecond)
 	defer done()
@@ -2472,6 +2536,44 @@ func TestSchedLoadFilesCalibrationAtTheGrantedContext(t *testing.T) {
 	require.Equal(t, uint64(3<<30), got,
 		"calibration was not filed at the granted total (25088): calibration's axis is "+
 			"context x slots, so the per-slot figure would halve every multi-slot sample")
+}
+
+// unmeasuredLlm is a runner whose engine reported no buffer sizes, so its MemorySize is the
+// file-size fallback rather than a measurement.
+type unmeasuredLlm struct{ *mockLlm }
+
+func (unmeasuredLlm) MemoryMeasured() bool { return false }
+
+// A load whose memory figure is the file-size fallback must not be filed as a measurement:
+// every later load of the same invocation would be placed from a number the load never
+// reported.
+func TestSchedLoadDoesNotRecordTheFileSizeFallback(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer done()
+
+	s := InitScheduler(ctx)
+	scenario := newScenarioRequestWithContext(t, ctx, "unmeasured", 10, nil, map[ml.DeviceID]uint64{}, 131072)
+	// A real context, or Record rejects the sample for that reason instead and the test
+	// passes whether or not the guard exists (it did, the first time it was written).
+	scenario.req.opts.NumCtx = 8192
+	scenario.srv.contextLength = 8192
+	scenario.srv.totalSize = 3 << 30
+	s.newServerFn = func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *ggml.GGML, adapters []string, projectors []string, opts api.Options, numParallel int, config llm.LlamaServerConfig) (llm.LlamaServer, error) {
+		srv, err := scenario.newServer(systemInfo, gpus, model, f, adapters, projectors, opts, numParallel, config)
+		return unmeasuredLlm{srv.(*mockLlm)}, err
+	}
+
+	s.load(scenario.req, ml.SystemInfo{}, nil, false)
+
+	var runner *runnerRef
+	select {
+	case err := <-scenario.req.errCh:
+		t.Fatal(err)
+	case runner = <-scenario.req.successCh:
+	}
+	if n := s.vramCalibration.SampleCount(runner.calibrationKey); n != 0 {
+		t.Fatalf("%d samples recorded from a load whose memory was the file-size fallback, want 0", n)
+	}
 }
 
 // TestSchedFailedLoadEndsWhatItAnnounced is the regression for a phantom load. A client that

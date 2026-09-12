@@ -90,15 +90,19 @@ func TestSettlePlacement(t *testing.T) {
 	}
 }
 
-func TestSettlePlacementKeepsAnEarlierProbe(t *testing.T) {
+// probed labels where the prediction came from, so it describes the final placement only.
+// A probe of the placement that was abandoned contributed nothing to the number: after a
+// move onto an already-calibrated placement the source is calibration. (This test used to
+// assert the opposite, which let the label say "probe" about a calibrated figure.)
+func TestSettlePlacementLabelsTheFinalMeasurement(t *testing.T) {
 	measure := func(placed []ml.DeviceInfo, opts api.Options, _ uint64, decideOnly bool) (api.Options, llm.CalibrationKey, uint64, bool) {
 		if decideOnly {
 			return opts, llm.CalibrationKey{}, 100 * gib, true // probed here, then moved away
 		}
 		return opts, llm.CalibrationKey{}, 120 * gib, false // already calibrated
 	}
-	if _, _, _, _, probed := settlePlacement(40*gib, placeByEstimate, measure); !probed {
-		t.Fatal("the first placement's probe was forgotten after the move")
+	if _, _, _, _, probed := settlePlacement(40*gib, placeByEstimate, measure); probed {
+		t.Fatal("the abandoned placement's probe was reported as the source of the prediction")
 	}
 }
 

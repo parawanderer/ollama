@@ -745,7 +745,7 @@ func settlePlacement(
 	measure func(placed []ml.DeviceInfo, opts api.Options, estimate uint64, decideOnly bool) (api.Options, llm.CalibrationKey, uint64, bool),
 ) (gpus []ml.DeviceInfo, opts api.Options, key llm.CalibrationKey, predicted uint64, probed bool) {
 	gpus, opts = place(estimate)
-	_, _, cost, decided := measure(gpus, opts, estimate, true)
+	_, _, cost, _ := measure(gpus, opts, estimate, true)
 	if cost != estimate {
 		if moved, movedOpts := place(cost); !sameDevices(moved, gpus) {
 			slog.Info("the measurement moved the placement; measuring it where it will run",
@@ -754,8 +754,12 @@ func settlePlacement(
 			gpus, opts, estimate = moved, movedOpts, cost
 		}
 	}
+	// probed describes the final measurement only. It labels where the prediction came
+	// from, and a probe of a placement that was then abandoned -- or one that failed --
+	// contributed nothing to it: after a move onto an already-calibrated placement, the
+	// number is calibration, whatever was probed on the way.
 	opts, key, predicted, probed = measure(gpus, opts, estimate, false)
-	return gpus, opts, key, predicted, probed || decided
+	return gpus, opts, key, predicted, probed
 }
 
 func sameDevices(a, b []ml.DeviceInfo) bool {
@@ -951,7 +955,6 @@ func (s *Scheduler) processPending(ctx context.Context) {
 						logutil.Trace("using existing loaded runner", "model", pendingKey)
 						if pending.useLoadedRunner(runner, s.finishedReqCh) {
 							s.publishEvent(api.ModelEvent{Type: EventBusyStart, Model: runner.name})
-							s.publishEvent(api.ModelEvent{Type: EventGenStart, Model: runner.name})
 							s.publishEvent(api.ModelEvent{Type: EventGenStart, Model: runner.name})
 						}
 						break
@@ -1330,7 +1333,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 						vram, measuredCtx, ok := s.probeOnce(req.ctx, req, f, opts, placed, numParallel, predictedCtx)
 						decided.key, decided.ctx, decided.vram, decided.ran = key, measuredCtx, vram, true
 						if !ok {
-							return opts, key, predictLlamaServerVRAM(s.vramCalibration, key, req, f, predictedCtx), true
+							return opts, key, predictLlamaServerVRAM(s.vramCalibration, key, req, f, predictedCtx), false
 						}
 						return opts, key, vram, true
 					}
@@ -1731,7 +1734,18 @@ iGPUScan:
 		if _, grantedTotal := llama.GrantedContext(); grantedTotal > 0 {
 			recordedCtx = grantedTotal
 		}
-		if loadedTotal > 0 {
+		// Only a figure the engine reported. With no buffer lines parsed, MemorySize falls
+		// back to the model file's size, and filing that as a measurement would put a number
+		// that never came from the load into the line every later load is placed from.
+		measured := true
+		if m, ok := llama.(interface{ MemoryMeasured() bool }); ok {
+			measured = m.MemoryMeasured()
+		}
+		if loadedTotal > 0 && !measured {
+			slog.Warn("not recording this load's memory: the engine reported no buffer sizes, so the figure is the file size",
+				"model", req.model.ModelPath)
+		}
+		if loadedTotal > 0 && measured {
 			s.vramCalibration.Record(runner.calibrationKey, recordedCtx, loadedTotal)
 			if s.vramCalibrationPath != "" {
 				go s.vramCalibration.Persist(s.vramCalibrationPath)

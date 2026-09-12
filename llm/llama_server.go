@@ -2929,6 +2929,14 @@ func (s *llamaServerRunner) MemoryBreakdownByGPU(id ml.DeviceID) api.MemoryBreak
 
 // MemorySize returns total and GPU memory usage parsed from llama-server's
 // post-load log output. Full model-layer offload is reported as 100% GPU.
+// MemoryMeasured reports whether MemorySize comes from buffer sizes the engine reported,
+// rather than from the model file's size, which is its fallback when none were parsed.
+func (s *llamaServerRunner) MemoryMeasured() bool {
+	s.memoryMu.RLock()
+	defer s.memoryMu.RUnlock()
+	return s.memTotal > 0
+}
+
 func (s *llamaServerRunner) MemorySize() (total, vram uint64) {
 	s.memoryMu.RLock()
 	memTotal := s.memTotal

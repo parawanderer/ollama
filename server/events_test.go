@@ -172,8 +172,8 @@ func TestEventFrameCopiesEveryCommonField(t *testing.T) {
 		Placement: &api.ModelPlacement{
 			NumLayers: 4,
 			Devices: []api.PlacementRange{
-				{Device: "CUDA0", FirstLayer: 0, LastLayer: 1, Layers: 2},
-				{Device: "CUDA1", FirstLayer: 2, LastLayer: 3, Layers: 2},
+				{Device: "CUDA0", GPUID: "0", FirstLayer: 0, LastLayer: 1, Layers: 2},
+				{Device: "CUDA1", GPUID: "1", FirstLayer: 2, LastLayer: 3, Layers: 2},
 			},
 			SWALayers: []int{1, 3},
 		},

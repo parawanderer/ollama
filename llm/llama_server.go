@@ -2885,15 +2885,27 @@ func (s *llamaServerRunner) LayerPlacement() *api.ModelPlacement {
 	}
 	slices.Sort(layers)
 
+	// The log names devices as the child saw them, which is renumbered from zero when its
+	// visible devices were filtered. Report ollama's own names, as every other per-device
+	// figure does.
+	hostName, gpuID := make(map[string]string, len(s.gpus)), make(map[string]string, len(s.gpus))
+	for i, gpu := range s.gpus {
+		hostName[s.deviceLogName(i)], gpuID[s.deviceLogName(i)] = gpu.Name, gpu.ID
+	}
+
 	out := &api.ModelPlacement{NumLayers: len(layers)}
 	for _, l := range layers {
-		dev := s.layerDevice[l]
+		logged := s.layerDevice[l]
+		dev, ok := hostName[logged]
+		if !ok {
+			dev = logged // the CPU, or a device this runner was not told about
+		}
 		if n := len(out.Devices); n > 0 && out.Devices[n-1].Device == dev && out.Devices[n-1].LastLayer == l-1 {
 			out.Devices[n-1].LastLayer = l
 			out.Devices[n-1].Layers++
 		} else {
 			out.Devices = append(out.Devices, api.PlacementRange{
-				Device: dev, FirstLayer: l, LastLayer: l, Layers: 1,
+				Device: dev, GPUID: gpuID[logged], FirstLayer: l, LastLayer: l, Layers: 1,
 			})
 		}
 		if s.layerSWA[l] {

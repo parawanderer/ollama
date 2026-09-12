@@ -2,8 +2,11 @@ package llm
 
 import (
 	"context"
+	"io"
+	"reflect"
 	"testing"
 
+	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/ml"
 )
 
@@ -48,6 +51,32 @@ func TestGetDeviceInfosFilteredChildRenumbers(t *testing.T) {
 	want := uint64(100<<30) - used
 	if infos[0].FreeMemory != want {
 		t.Errorf("free memory: got %d, want %d", infos[0].FreeMemory, want)
+	}
+}
+
+// The layer placement has the same mismatch: the child logs its layers on "CUDA0", and
+// /api/ps used to report exactly that for a model alone on the host's second card.
+// The output layer on the CPU keeps the engine's name, which is also ollama's.
+func TestLayerPlacementFilteredChildRenumbers(t *testing.T) {
+	r := newSecondDeviceRunner(15 << 30)
+	r.layerDevice, r.layerSWA = map[int]string{}, map[int]bool{}
+	r.memBreakdownByDevice = map[string]api.MemoryBreakdown{}
+	w := &memoryParsingWriter{inner: io.Discard, runner: r}
+	for _, line := range []string{
+		"load_tensors: layer   0 assigned to device CPU, is_swa = 0\n",
+		"load_tensors: layer   1 assigned to device CUDA0, is_swa = 0\n",
+		"load_tensors: layer   2 assigned to device CUDA0, is_swa = 0\n",
+	} {
+		w.Write([]byte(line))
+	}
+
+	got := r.LayerPlacement()
+	want := []api.PlacementRange{
+		{Device: "CPU", FirstLayer: 0, LastLayer: 0, Layers: 1},
+		{Device: "CUDA1", GPUID: "1", FirstLayer: 1, LastLayer: 2, Layers: 2},
+	}
+	if got == nil || !reflect.DeepEqual(got.Devices, want) {
+		t.Errorf("placement = %+v, want %+v", got, want)
 	}
 }
 

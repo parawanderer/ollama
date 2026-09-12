@@ -1276,12 +1276,18 @@ type ModelPlacement struct {
 
 // PlacementRange is one unbroken run of layers on one device.
 type PlacementRange struct {
-	// Device is the engine's name for it ("CUDA0"), which matches the keys used in the
-	// per-device memory breakdown. It is not the ollama device id.
-	Device     string `json:"device"`
-	FirstLayer int    `json:"first_layer"`
-	LastLayer  int    `json:"last_layer"`
-	Layers     int    `json:"layers"`
+	// Device is ollama's name for the device ("CUDA1"), the name discovery gives it, or
+	// "CPU". It is not necessarily the name in the engine's own log: a runner started on
+	// one card of several sees only that card and calls it CUDA0, whichever card it is.
+	Device string `json:"device"`
+
+	// GPUID joins this run to the model's entry in gpus[] and to /api/info. Omitted for
+	// the CPU.
+	GPUID string `json:"gpu_id,omitempty"`
+
+	FirstLayer int `json:"first_layer"`
+	LastLayer  int `json:"last_layer"`
+	Layers     int `json:"layers"`
 }
 
 // MemoryBreakdown splits what a load holds by what the memory is *for*, rather than by

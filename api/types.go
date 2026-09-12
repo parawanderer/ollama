@@ -253,6 +253,12 @@ type RequestShape struct {
 	Client string `json:"client,omitempty"`
 }
 
+// LeaseInfo names who holds a GPU lease and which devices, on lease.* events.
+type LeaseInfo struct {
+	Holder  string   `json:"holder"`
+	Devices []string `json:"devices"`
+}
+
 // GenerationMeta travels with a request to the runner and comes back when the generation
 // finishes: what the caller said the request was for, and what it looked like.
 type GenerationMeta struct {
@@ -1968,6 +1974,9 @@ type EventFrame struct {
 	// Shape is the request's form, on a gen.end frame. See RequestShape.
 	Shape *RequestShape `json:"shape,omitempty"`
 
+	// Lease is who holds a GPU lease and on which devices, on lease.* frames.
+	Lease *LeaseInfo `json:"lease,omitempty"`
+
 	// Memory splits SizeVRAM by what the memory holds; MemoryHost does the same for
 	// whatever spilled to the host. See the fields of the same name on ModelEvent.
 	Memory     *MemoryBreakdown `json:"memory,omitempty"`
@@ -2105,6 +2114,9 @@ type ModelEvent struct {
 	// Shape is the request's form, on a gen.end event. See RequestShape.
 	Shape *RequestShape `json:"shape,omitempty"`
 
+	// Lease is who holds a GPU lease and on which devices, on lease.* events.
+	Lease *LeaseInfo `json:"lease,omitempty"`
+
 	// Memory splits SizeVRAM by what the memory holds, and MemoryHost does the same for
 	// the part that did not fit on a device. On load.weights only Weights is populated,
 	// because nothing else has been allocated yet.
@@ -2209,6 +2221,10 @@ type GPUInfo struct {
 	// "pid_namespace" an empty or short list does not mean nothing else is on the card.
 	// Omitted when unknown.
 	ProcessesScope string `json:"processes_scope,omitempty"`
+
+	// Leased names the job holding this GPU through a lease (gpu-run), when one does.
+	// ollama places nothing on a leased GPU until the lease ends.
+	Leased string `json:"leased,omitempty"`
 
 	// PhysicalMemory is the amount of video memory the device reports having. It is never
 	// smaller than TotalMemory: the driver reserves a portion of the card for itself which

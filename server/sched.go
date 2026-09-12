@@ -151,6 +151,9 @@ type Scheduler struct {
 	// usage records every generation and load (server/usage.go); nil records nothing.
 	usage *usageStore
 
+	// leases are GPUs given to jobs outside ollama (server/lease.go).
+	leases leaseTable
+
 	// fitProbe measures a load without performing it; nil means llm.ProbeFitVRAM. Swapped
 	// only by tests, which cannot run llama-server.
 	fitProbe        func(ctx context.Context, gpus []ml.DeviceInfo, modelPath string, f *ggml.GGML, adapters, projectors []string, opts api.Options, numParallel int, kvCacheType string, config llm.LlamaServerConfig, numCtx int) (uint64, int, error)
@@ -892,7 +895,7 @@ func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, ses
 	s.loadedMu.Lock()
 	runner := s.loaded[key]
 	s.loadedMu.Unlock()
-	if runner != nil && !runner.needsReload(c, req) {
+	if runner != nil && !runner.needsReload(c, req) && !s.onLeasedDevice(runner) {
 		if req.useLoadedRunner(runner, s.finishedReqCh) {
 			s.publishEvent(api.ModelEvent{Type: EventBusyStart, Model: runner.name})
 			s.publishEvent(api.ModelEvent{Type: EventGenStart, Model: runner.name})
@@ -950,7 +953,7 @@ func (s *Scheduler) processPending(ctx context.Context) {
 				s.loadedMu.Unlock()
 
 				if runner != nil {
-					if runner.needsReload(ctx, pending) {
+					if runner.needsReload(ctx, pending) || s.onLeasedDevice(runner) {
 						slog.Debug("reloading", "runner", runner)
 						runnerToExpire = runner
 					} else {
@@ -973,7 +976,15 @@ func (s *Scheduler) processPending(ctx context.Context) {
 						gpus = []ml.DeviceInfo{}
 					} else {
 						logutil.Trace("refreshing GPU list", "model", pending.model.ModelPath)
-						gpus = s.getGpuFn(ctx, runnersSnapshot)
+						all := s.getGpuFn(ctx, runnersSnapshot)
+						gpus = s.withoutLeased(all)
+						// Every GPU is lent to a job. Falling back to the CPU would take the
+						// cores and memory bandwidth the job needs, so the request fails with
+						// the reason instead; a request that asked for the CPU still runs.
+						if len(all) > 0 && len(gpus) == 0 {
+							pending.errCh <- errAllGPUsLeased
+							break
+						}
 					}
 					logutil.Trace("refreshing system information", "model", pending.model.ModelPath)
 					systemInfo := s.getSystemInfoFn()
@@ -2466,6 +2477,9 @@ type runnerRef struct {
 	sessionDuration time.Duration
 	expireTimer     *time.Timer
 	expiresAt       time.Time
+	// leaseExpiring is set once a lease has asked for this runner to be unloaded, so the
+	// lease's polling does not ask again.
+	leaseExpiring bool
 
 	model        *Model
 	modelPath    string

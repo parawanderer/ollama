@@ -53,6 +53,12 @@ const (
 	EventGenStart = "gen.start"
 	EventGenEnd   = "gen.end"
 
+	// A job outside ollama asked for GPUs (lease.start), got them once ollama had vacated
+	// them (lease.granted), and finished (lease.end). See server/lease.go.
+	EventLeaseStart   = "lease.start"
+	EventLeaseGranted = "lease.granted"
+	EventLeaseEnd     = "lease.end"
+
 	EventBusyStart = "busy.start"
 	EventBusyEnd   = "busy.end"
 )

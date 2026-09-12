@@ -1915,6 +1915,7 @@ func (s *Server) GenerateRoutes() (http.Handler, error) {
 
 	// Inference
 	r.GET("/api/ps", s.PsHandler)
+	r.POST("/api/lease", s.LeaseHandler)
 	r.POST("/api/generate", s.withInferenceRequestLogging("/api/generate", s.GenerateHandler)...)
 	r.POST("/api/chat", s.withInferenceRequestLogging("/api/chat", s.ChatHandler)...)
 	r.POST("/api/embed", s.EmbedHandler)
@@ -2331,6 +2332,7 @@ func frameFromEvent(ev api.ModelEvent, started time.Time) api.EventFrame {
 		Timings:       ev.Timings,
 		Hint:          ev.Hint,
 		Shape:         ev.Shape,
+		Lease:         ev.Lease,
 		Estimate:      ev.Estimate,
 		Dropped:       ev.Dropped,
 		T:             ev.At.Sub(started).Milliseconds(),
@@ -2817,6 +2819,7 @@ func (s *Server) infoResponse() *api.InfoResponse {
 
 	gpus := make([]api.GPUInfo, len(devices))
 	for i, dev := range devices {
+		leased := s.sched.leases.holders()[dev.DeviceID]
 		gpus[i] = api.GPUInfo{
 			ID:                 dev.ID,
 			PCIID:              dev.PCIID,
@@ -2829,6 +2832,7 @@ func (s *Server) infoResponse() *api.InfoResponse {
 			PhysicalMemory:     dev.PhysicalMemory,
 			Processes:          gpuProcesses(processes[dev.PCIID], runnerPIDs),
 			ProcessesScope:     processesScope,
+			Leased:             leased,
 			FreeMemory:         dev.FreeMemory,
 			Runner:             dev.Library,
 		}

@@ -44,6 +44,16 @@ type deviceProbe struct {
 	Bus *ml.DeviceBusState
 }
 
+// faultedWhileOffered reports whether a device the compute backend offered has since
+// stopped being able to compute.
+//
+// Only the codes that mean exactly that. A healthy device can answer the temperature read
+// with NOT_SUPPORTED (no sensor) or NO_PERMISSION, and those must not turn a working card
+// into a reported fault.
+func faultedWhileOffered(status int) bool {
+	return status == nvmlErrorResetRequired || status == nvmlErrorGPUIsLost
+}
+
 // classifyUnavailable turns a probe into the reason a device cannot be used.
 //
 // The bus state is deliberately allowed to OVERRIDE the driver's code in one direction. A

@@ -1049,14 +1049,19 @@ func nvidiaUnavailableDevices(known []string) []ml.UnavailableDevice {
 		pci := nvmlString(64, func(buf *C.char, n C.uint) C.int {
 			return C.ollama_call_nvml_device_get_pci_bus_id_legacy(pciFn, handle, buf, n)
 		})
-		if pci == "" || usable[strings.ToLower(pci)] {
+		if pci == "" {
 			continue
 		}
 
-		// This device exists and no backend offered it. Ask it something that reads live
-		// state, because that is what a faulted device cannot answer.
+		// Ask it something that reads live state, because that is what a faulted device
+		// cannot answer. A device the backend did offer is asked too: discovery's answer is
+		// cached, and a card that faults after it was offered would otherwise go on being
+		// reported as usable until the next discovery.
 		var temp C.uint
 		status := int(C.ollama_call_nvml_device_get_temperature(tempFn, handle, &temp))
+		if usable[strings.ToLower(pci)] && !faultedWhileOffered(status) {
+			continue
+		}
 
 		detail := ""
 		if errStrFn != nil && status != nvmlSuccess {

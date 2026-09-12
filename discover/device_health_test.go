@@ -121,3 +121,20 @@ func indexOf(h, n string) int {
 	}
 	return -1
 }
+
+// A card the backend offered is asked about its health too, because discovery's answer is
+// cached. Only the codes meaning it can no longer compute may report it: a healthy offered
+// card answering NOT_SUPPORTED (no sensor) or NO_PERMISSION must stay usable.
+func TestAnOfferedDeviceIsReportedOnlyWhenItCannotCompute(t *testing.T) {
+	for status, want := range map[int]bool{
+		nvmlSuccess:            false,
+		nvmlErrorNotSupported:  false,
+		nvmlErrorNoPermission:  false,
+		nvmlErrorResetRequired: true, // the captured fault
+		nvmlErrorGPUIsLost:     true,
+	} {
+		if got := faultedWhileOffered(status); got != want {
+			t.Errorf("faultedWhileOffered(%d) = %v, want %v", status, got, want)
+		}
+	}
+}

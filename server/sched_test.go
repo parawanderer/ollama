@@ -2587,12 +2587,29 @@ func TestProbeCoversTheContextBeingLoaded(t *testing.T) {
 	if got := probeContextsFor(points, 262144); !slices.Equal(got, []int{8192, 131072, 262144}) {
 		t.Errorf("probe contexts for a 262144 load = %v, want the fixed pair plus 262144", got)
 	}
-	// Within the fixed range there is nothing to extrapolate, so nothing is added.
-	if got := probeContextsFor(points, 32768); !slices.Equal(got, []int{8192, 131072}) {
-		t.Errorf("probe contexts for a 32768 load = %v, want only the fixed pair", got)
-	}
-	// Added, never substituted: if 262144 turns out not to fit, the pair still makes a line.
+	// Beyond the range it is added, never substituted: if 262144 turns out not to fit, the
+	// pair still makes a line.
 	if got := probeContextsFor(points, 262144); got[0] != 8192 || got[1] != 131072 {
 		t.Errorf("the fixed points were replaced: %v", got)
+	}
+}
+
+// Inside the range the load's own context replaces the nearer point: still two probes, but
+// one of them is the measurement settlePlacement already took to decide where the load goes.
+func TestProbeUsesTheLoadedContextInsideTheRange(t *testing.T) {
+	points := [2]int{8192, 131072}
+	for _, tc := range []struct {
+		numCtx int
+		want   []int
+	}{
+		{32768, []int{32768, 131072}}, // nearer the bottom: keep the top for the span
+		{110592, []int{8192, 110592}}, // nearer the top: keep the bottom
+		{4096, []int{4096, 131072}},   // below the range
+		{8192, []int{8192, 131072}},   // on a point: the pair as it was
+		{131072, []int{8192, 131072}},
+	} {
+		if got := probeContextsFor(points, tc.numCtx); !slices.Equal(got, tc.want) {
+			t.Errorf("probe contexts for a %d load = %v, want %v", tc.numCtx, got, tc.want)
+		}
 	}
 }

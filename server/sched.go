@@ -133,8 +133,24 @@ type Scheduler struct {
 	deviceCache    []ml.DeviceInfo
 	deviceCacheAt  time.Time
 	deviceCacheTTL time.Duration
+	// deviceCacheLiveTTL replaces deviceCacheTTL while free memory is being read live from
+	// the driver, which is what the short TTL existed to keep current.
+	deviceCacheLiveTTL time.Duration
+	liveFreeMemory     atomic.Bool
+	// faultRediscoveredAt limits rediscovery for a fault to once per health verdict, so a
+	// faulted device that discovery goes on returning cannot make every read rediscover.
+	faultRediscoveredAt time.Time
+	// unavailableFn reports devices that exist and cannot be used; nil means
+	// discover.CachedUnavailableDevices. Swapped only by tests.
+	unavailableFn func(known []string) []ml.UnavailableDevice
+	// freeMemoryFn reads free memory live from the driver; nil means
+	// discover.FreeMemoryByPCI. Swapped only by tests.
+	freeMemoryFn func(pciIDs []string) map[string]uint64
 
-	loadFn          func(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool
+	loadFn func(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool
+	// fitProbe measures a load without performing it; nil means llm.ProbeFitVRAM. Swapped
+	// only by tests, which cannot run llama-server.
+	fitProbe        func(ctx context.Context, gpus []ml.DeviceInfo, modelPath string, f *ggml.GGML, adapters, projectors []string, opts api.Options, numParallel int, kvCacheType string, config llm.LlamaServerConfig, numCtx int) (uint64, int, error)
 	newServerFn     func(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, model string, f *ggml.GGML, adapters []string, projectors []string, opts api.Options, numParallel int, config llm.LlamaServerConfig) (llm.LlamaServer, error)
 	getGpuFn        func(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.DeviceInfo
 	getSystemInfoFn func() ml.SystemInfo
@@ -165,6 +181,8 @@ func InitScheduler(ctx context.Context) *Scheduler {
 		ring:            newFrameRing(retainedWindow),
 		samplerWake:     make(chan struct{}, 1),
 		deviceCacheTTL:  2 * time.Second,
+		// Ten minutes rather than never: a safety net for changes nothing here signals.
+		deviceCacheLiveTTL: 10 * time.Minute,
 	}
 	sched.loadFn = sched.load
 	return sched
@@ -263,15 +281,38 @@ func encodeForCompare(ps *api.ProcessResponse) string {
 // ask, which is the normal state of a multi-GPU host. Free memory is the only field that
 // moves, and the things that move it -- a load, an unload, an eviction -- all publish an
 // event, so the cache is dropped exactly when it stops being true rather than merely when
-// it gets old. The TTL then covers what ollama does not control, such as another process
-// on the same card.
+// it gets old.
+//
+// What ollama does not control, such as another process on the same card, is covered by
+// reading free memory live from the driver on every read. Where that works the short TTL
+// has nothing left to do, and it was expensive: discovery spawns a llama-server that
+// initialises every GPU, and the sampler's 15 s idle tick always found a 2 s cache stale,
+// so an idle box started one on both cards every ~16 s -- about 5,400 a day (measured
+// 2026-09-12). Both GSP faults on this box were a llama-server's first allocation on an
+// idle card. So the TTL is long while the live read works, and short only where it does not.
+//
+// The one thing the old churn did catch is a device that faults while cached, because
+// discovery stops returning it. That is now asked of the driver directly, through the same
+// 30 s health verdict unavailable_gpus uses, and a cached device that has faulted drops
+// the cache at once.
 func (s *Scheduler) cachedDevices(ctx context.Context) []ml.DeviceInfo {
+	ttl := s.deviceCacheTTL
+	if s.liveFreeMemory.Load() && s.deviceCacheLiveTTL > ttl {
+		ttl = s.deviceCacheLiveTTL
+	}
 	s.deviceCacheMu.Lock()
-	if s.deviceCache != nil && time.Since(s.deviceCacheAt) < s.deviceCacheTTL {
-		s.deviceCacheMu.Unlock()
+	cached := s.deviceCache
+	fresh := cached != nil && time.Since(s.deviceCacheAt) < ttl
+	mayCheckFaults := time.Since(s.faultRediscoveredAt) >= deviceFaultRecheck
+	s.deviceCacheMu.Unlock()
+	if fresh && (!mayCheckFaults || !s.anyFaulted(cached)) {
 		return s.devicesWithLiveFreeMemory()
 	}
-	s.deviceCacheMu.Unlock()
+	if fresh {
+		s.deviceCacheMu.Lock()
+		s.faultRediscoveredAt = time.Now()
+		s.deviceCacheMu.Unlock()
+	}
 
 	devices := s.getGpuFn(ctx, s.runnerDiscoverySnapshot())
 	s.deviceNames.observe(devices)
@@ -281,6 +322,37 @@ func (s *Scheduler) cachedDevices(ctx context.Context) []ml.DeviceInfo {
 	s.deviceCacheAt = time.Now()
 	s.deviceCacheMu.Unlock()
 	return s.devicesWithLiveFreeMemory()
+}
+
+// deviceFaultRecheck is how often a fault may trigger rediscovery: the life of one health
+// verdict (discover.unavailableTTL), since a sooner check would read the same verdict.
+const deviceFaultRecheck = 30 * time.Second
+
+// anyFaulted reports whether one of these devices, all of which discovery offered, can no
+// longer compute.
+func (s *Scheduler) anyFaulted(devices []ml.DeviceInfo) bool {
+	unavailable := s.unavailableFn
+	if unavailable == nil {
+		unavailable = discover.CachedUnavailableDevices
+	}
+	known := make([]string, 0, len(devices))
+	for _, d := range devices {
+		if d.PCIID != "" {
+			known = append(known, d.PCIID)
+		}
+	}
+	if len(known) == 0 {
+		return false
+	}
+	for _, u := range unavailable(known) {
+		for _, pci := range known {
+			if strings.EqualFold(u.PCIID, pci) {
+				slog.Warn("a GPU faulted while in use; re-discovering devices", "pci_id", u.PCIID, "reason", u.Reason)
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // devicesWithLiveFreeMemory returns the cached devices with free memory read from the
@@ -329,7 +401,12 @@ func (s *Scheduler) refreshFreeMemory() bool {
 		}
 	}
 
-	free := discover.FreeMemoryByPCI(ids)
+	readFree := s.freeMemoryFn
+	if readFree == nil {
+		readFree = discover.FreeMemoryByPCI
+	}
+	free := readFree(ids)
+	s.liveFreeMemory.Store(len(free) > 0)
 	if len(free) == 0 {
 		return false
 	}
@@ -473,15 +550,27 @@ const probeMinContext = 256
 // correcting a real error. It pays past 262144, where the line's error grows with distance:
 // -2.2 GiB at 1M on dsv4-flash.
 //
-// It is added rather than substituted. A requested context too large to fit in the memory
-// free right now fails to probe, and substituting it would then leave one point -- which
-// probeCalibration rightly discards -- where the fixed pair would have produced a line.
+// Beyond the points it is added rather than substituted. A requested context too large to
+// fit in the memory free right now fails to probe, and substituting it would then leave one
+// point -- which probeCalibration rightly discards -- where the fixed pair would have
+// produced a line.
+//
+// Between the points it replaces the nearer one, so the line is exact where this load uses
+// it and still spans the range. The worry above does not apply there: a context inside the
+// pair fits whenever the upper point does. This is also what keeps the placement decision
+// free. settlePlacement measures the load's own context to decide where the load goes, and
+// that measurement is then one of these points rather than an extra probe.
 func probeContextsFor(points [2]int, numCtx int) []int {
-	contexts := []int{points[0], points[1]}
-	if numCtx > points[1] {
-		contexts = append(contexts, numCtx)
+	switch {
+	case numCtx > points[1]:
+		return []int{points[0], points[1], numCtx}
+	case numCtx <= 0 || numCtx == points[0] || numCtx == points[1]:
+		return []int{points[0], points[1]}
+	case numCtx-points[0] > points[1]-numCtx:
+		return []int{points[0], numCtx}
+	default:
+		return []int{numCtx, points[1]}
 	}
-	return contexts
 }
 
 func probePoints(trainCtx, numParallel int) ([2]int, bool) {
@@ -525,7 +614,11 @@ func probePoints(trainCtx, numParallel int) ([2]int, bool) {
 // probed line landed within 590 MiB. The metadata line is now only the first guess that
 // placement starts from, and settlePlacement corrects the placement when the measurement
 // disagrees with it.
-func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey, req *LlmRequest, f *ggml.GGML, launchOpts api.Options, gpus []ml.DeviceInfo, numParallel int, numCtx int) bool {
+//
+// premeasured holds samples already taken for this key -- the one settlePlacement took to
+// decide the placement -- keyed by the context they were measured at. They count toward the
+// line and their contexts are not probed again.
+func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey, req *LlmRequest, f *ggml.GGML, launchOpts api.Options, gpus []ml.DeviceInfo, numParallel int, numCtx int, premeasured map[int]uint64) bool {
 	// Two distinct samples are what it takes to stop consulting the metadata: below that
 	// the slope still comes from the prior, and for these architectures the prior slope is
 	// the broken part. So the bar is a fitted line, not merely a calibrated answer -- one
@@ -544,35 +637,26 @@ func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey
 
 	started := time.Now()
 	var recorded int
+	var probes []string
+	for c, vram := range premeasured {
+		if vram > 0 {
+			s.vramCalibration.Record(key, c, vram)
+			recorded++
+		}
+	}
 	for _, probeCtx := range contexts {
-		// launchOpts, not req.opts: the placement decision writes the split mode, the main
-		// device and the offload count into it, and those are part of the invocation being
-		// measured. Probing with the request's own options measures a load that was never
-		// going to run -- on qwen3.8:27b at 128k that reported 15.86 GiB against 23.86 for
-		// the same model probed as it would actually be launched.
-		vram, measuredCtx, err := llm.ProbeFitVRAM(ctx, gpus, req.model.ModelPath, f, req.model.AdapterPaths, req.model.ProjectorPaths,
-			launchOpts, numParallel, envconfig.KvCacheType(), llamaServerConfigForModel(req.model), probeCtx)
-		if err != nil {
-			// Not fitting is worth saying out loud: it is the reason this load is about
-			// to be placed from a lower bound, and it is recoverable -- the probe runs
-			// before the pre-flight eviction, so a model resident right now can be what
-			// denies it. The next load, once that model has gone, will measure normally.
-			if errors.Is(err, llm.ErrFitProbeWouldNotFit) {
-				slog.Info("could not measure this model without loading it: it does not fit in the memory free right now",
-					"model", req.model.ModelPath, "num_ctx", probeCtx)
-			} else {
-				slog.Debug("could not measure model memory without loading it", "model", req.model.ModelPath, "num_ctx", probeCtx, "error", err)
-			}
+		// A context already measured is not asked again, including one that failed: the
+		// memory free has not changed in the moments since.
+		if _, done := premeasured[probeCtx]; done {
 			continue
 		}
-		// Filed at the context the probe measured, not the one it asked for: llama.cpp
-		// rounds each slot up to a multiple of 256, so a probe point off that grid measures
-		// a larger cache than its label says. No model on this box trains at an unaligned
-		// context, so today the two agree -- the point is not to depend on that.
-		if measuredCtx > 0 {
-			probeCtx = measuredCtx
+		probeStarted := time.Now()
+		vram, measuredCtx, ok := s.probeOnce(ctx, req, f, launchOpts, gpus, numParallel, probeCtx)
+		probes = append(probes, fmt.Sprintf("%d:%s", probeCtx, time.Since(probeStarted).Round(time.Millisecond)))
+		if !ok {
+			continue
 		}
-		s.vramCalibration.Record(key, probeCtx, vram)
+		s.vramCalibration.Record(key, measuredCtx, vram)
 		recorded++
 	}
 
@@ -591,9 +675,48 @@ func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey
 		"model", req.model.ModelPath,
 		"architecture", f.KV().Architecture(),
 		"contexts", contexts,
+		"reused", len(premeasured),
+		"probes", probes,
 		"took", time.Since(started).Round(time.Millisecond),
-		"reason", "this architecture's metadata does not describe everything it allocates")
+		"reason", "no measurement of this model in this configuration yet")
 	return true
+}
+
+// probeOnce measures one context without loading the model, and reports the context the
+// measurement is filed at.
+func (s *Scheduler) probeOnce(ctx context.Context, req *LlmRequest, f *ggml.GGML, launchOpts api.Options, gpus []ml.DeviceInfo, numParallel, numCtx int) (vram uint64, measuredCtx int, ok bool) {
+	// launchOpts, not req.opts: the placement decision writes the split mode, the main
+	// device and the offload count into it, and those are part of the invocation being
+	// measured. Probing with the request's own options measures a load that was never
+	// going to run -- on qwen3.8:27b at 128k that reported 15.86 GiB against 23.86 for
+	// the same model probed as it would actually be launched.
+	probe := s.fitProbe
+	if probe == nil {
+		probe = llm.ProbeFitVRAM
+	}
+	vram, measuredCtx, err := probe(ctx, gpus, req.model.ModelPath, f, req.model.AdapterPaths, req.model.ProjectorPaths,
+		launchOpts, numParallel, envconfig.KvCacheType(), llamaServerConfigForModel(req.model), numCtx)
+	if err != nil {
+		// Not fitting is worth saying out loud: it is the reason this load is about
+		// to be placed from a lower bound, and it is recoverable -- the probe runs
+		// before the pre-flight eviction, so a model resident right now can be what
+		// denies it. The next load, once that model has gone, will measure normally.
+		if errors.Is(err, llm.ErrFitProbeWouldNotFit) {
+			slog.Info("could not measure this model without loading it: it does not fit in the memory free right now",
+				"model", req.model.ModelPath, "num_ctx", numCtx)
+		} else {
+			slog.Debug("could not measure model memory without loading it", "model", req.model.ModelPath, "num_ctx", numCtx, "error", err)
+		}
+		return 0, numCtx, false
+	}
+	// Filed at the context the probe measured, not the one it asked for: llama.cpp
+	// rounds each slot up to a multiple of 256, so a probe point off that grid measures
+	// a larger cache than its label says. No model on this box trains at an unaligned
+	// context, so today the two agree -- the point is not to depend on that.
+	if measuredCtx <= 0 {
+		measuredCtx = numCtx
+	}
+	return vram, measuredCtx, true
 }
 
 // settlePlacement chooses where a load runs, measures what it costs there, and moves it once
@@ -610,28 +733,29 @@ func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey
 // So the measurement gets one chance to move the placement, and the new placement is
 // measured in turn. One move, not a loop: a second disagreement is left to the fit check
 // that follows, rather than letting two estimates chase each other.
+//
+// The first placement is only asked what the load itself costs (decideOnly), not measured
+// in full, because it may be about to be abandoned. Measured in full, the abandoned
+// placement cost 11.8 s of a 22 s load (gemma4:26b at 262144, 2026-09-12): three probes on
+// two cards, all thrown away. The one probe it does take is not wasted when the placement
+// stands, because it is at one of the contexts the full measurement uses (probeContextsFor).
 func settlePlacement(
 	estimate uint64,
 	place func(estimate uint64) ([]ml.DeviceInfo, api.Options),
-	measure func(placed []ml.DeviceInfo, opts api.Options, estimate uint64) (api.Options, llm.CalibrationKey, uint64, bool),
+	measure func(placed []ml.DeviceInfo, opts api.Options, estimate uint64, decideOnly bool) (api.Options, llm.CalibrationKey, uint64, bool),
 ) (gpus []ml.DeviceInfo, opts api.Options, key llm.CalibrationKey, predicted uint64, probed bool) {
-	for attempt := 0; ; attempt++ {
-		gpus, opts = place(estimate)
-		var measuredHere bool
-		opts, key, predicted, measuredHere = measure(gpus, opts, estimate)
-		probed = probed || measuredHere
-		if attempt > 0 || predicted == estimate {
-			return gpus, opts, key, predicted, probed
+	gpus, opts = place(estimate)
+	_, _, cost, decided := measure(gpus, opts, estimate, true)
+	if cost != estimate {
+		if moved, movedOpts := place(cost); !sameDevices(moved, gpus) {
+			slog.Info("the measurement moved the placement; measuring it where it will run",
+				"estimate", format.HumanBytes2(estimate), "measured", format.HumanBytes2(cost),
+				"devices", len(gpus), "moved_to", len(moved))
+			gpus, opts, estimate = moved, movedOpts, cost
 		}
-		moved, _ := place(predicted)
-		if sameDevices(moved, gpus) {
-			return gpus, opts, key, predicted, probed
-		}
-		slog.Info("the measurement moved the placement; measuring it where it will run",
-			"estimate", format.HumanBytes2(estimate), "measured", format.HumanBytes2(predicted),
-			"devices", len(gpus), "moved_to", len(moved))
-		estimate = predicted
 	}
+	opts, key, predicted, probed = measure(gpus, opts, estimate, false)
+	return gpus, opts, key, predicted, probed || decided
 }
 
 func sameDevices(a, b []ml.DeviceInfo) bool {
@@ -1174,11 +1298,19 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			bootstrapKey := vramCalibrationKey(req, gpus, numParallel)
 			predicted := predictLlamaServerVRAM(s.vramCalibration, bootstrapKey, req, f, predictedCtx)
 			var probed bool
+			// The one measurement settlePlacement takes to decide the placement, kept so the
+			// full measurement of that same invocation does not take it again.
+			var decided struct {
+				key  llm.CalibrationKey
+				ctx  int
+				vram uint64 // 0 when the probe ran and could not measure
+				ran  bool
+			}
 			loadGpus, launchOpts, calibrationKey, predicted, probed = settlePlacement(predicted,
 				func(estimate uint64) ([]ml.DeviceInfo, api.Options) {
 					return selectLlamaServerPlacement(systemInfo, gpus, estimate, req.opts)
 				},
-				func(placed []ml.DeviceInfo, opts api.Options, estimate uint64) (api.Options, llm.CalibrationKey, uint64, bool) {
+				func(placed []ml.DeviceInfo, opts api.Options, estimate uint64, decideOnly bool) (api.Options, llm.CalibrationKey, uint64, bool) {
 					availableForBatch, _, _ := availableMemoryForPlacement(systemInfo, placed, opts)
 					req.applyAutomaticGenerationBatch(completion, predictedCtx, estimate, availableForBatch, llm.LlamaServerFlashAttention(placed), placed)
 					opts.NumBatch = req.opts.NumBatch
@@ -1187,7 +1319,27 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 					// that will actually run, and the measurement it produces is filed where
 					// the next prediction for the same invocation will look.
 					key := vramCalibrationKey(req, placed, numParallel)
-					probed := s.probeCalibration(req.ctx, key, req, f, opts, placed, numParallel, predictedCtx)
+
+					if decideOnly {
+						// Where the load goes depends only on what it costs at its own context,
+						// so that is all this asks. An invocation already calibrated is not
+						// probed at all.
+						if s.vramCalibration.SampleCount(key) >= 2 {
+							return opts, key, predictLlamaServerVRAM(s.vramCalibration, key, req, f, predictedCtx), false
+						}
+						vram, measuredCtx, ok := s.probeOnce(req.ctx, req, f, opts, placed, numParallel, predictedCtx)
+						decided.key, decided.ctx, decided.vram, decided.ran = key, measuredCtx, vram, true
+						if !ok {
+							return opts, key, predictLlamaServerVRAM(s.vramCalibration, key, req, f, predictedCtx), true
+						}
+						return opts, key, vram, true
+					}
+
+					var premeasured map[int]uint64
+					if decided.ran && decided.key == key {
+						premeasured = map[int]uint64{decided.ctx: decided.vram}
+					}
+					probed := s.probeCalibration(req.ctx, key, req, f, opts, placed, numParallel, predictedCtx, premeasured)
 					return opts, key, predictLlamaServerVRAM(s.vramCalibration, key, req, f, predictedCtx), probed
 				})
 

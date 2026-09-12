@@ -503,6 +503,9 @@ type ResponsesTool struct {
 type ResponsesRequest struct {
 	Model string `json:"model"`
 
+	// Hint is ollama's request hint (api.RequestHint); not part of the OpenAI API.
+	Hint *api.RequestHint `json:"hint,omitempty"`
+
 	// originally: optional, default is false
 	// for us: not supported
 	Background bool `json:"background"`
@@ -810,6 +813,7 @@ func FromResponsesRequest(r ResponsesRequest) (*api.ChatRequest, error) {
 		Tools:    tools,
 		Format:   format,
 		Think:    think,
+		Hint:     r.Hint,
 	}, nil
 }
 

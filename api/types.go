@@ -127,6 +127,8 @@ type GenerateRequest struct {
 	// each with an associated log probability. Only applies when Logprobs is true.
 	// Valid values are 0-20. Default is 0 (only return the selected token's logprob).
 	TopLogprobs int `json:"top_logprobs,omitempty"`
+	// Hint is what the caller says this request is for. See RequestHint.
+	Hint *RequestHint `json:"hint,omitempty"`
 }
 
 // ChatRequest describes a request sent by [Client.Chat].
@@ -185,6 +187,50 @@ type ChatRequest struct {
 	// text. Chunks are not tokens: the thinking and tool-call parsers regroup text, so a
 	// chunk can carry several tokens or wait for more. Thinking tokens are counted too.
 	StreamMetrics bool `json:"stream_metrics,omitempty"`
+
+	// Hint is what the caller says this request is for. See RequestHint.
+	Hint *RequestHint `json:"hint,omitempty"`
+}
+
+// RequestHint is what a caller says a request is for. It is optional and advisory: today it is
+// only recorded, on the gen.end event, so how each kind of use actually behaves (context used,
+// time spent waiting on the model, gaps between requests) can be measured per use and per
+// session. Placement and keep-alive may act on it later; a hint never makes a request fail.
+type RequestHint struct {
+	// Use is the kind of work: "interactive" (a person reading), "agent" (a program looping
+	// over tool calls), "batch" (throughput, nobody waiting) or "utility" (small side tasks
+	// such as titles or search queries). Other values are recorded as sent, so a newer
+	// client never breaks an older server.
+	Use string `json:"use,omitempty"`
+
+	// Session is an opaque id grouping requests that belong together, such as one
+	// conversation or one agent run. ollama has no notion of a session otherwise, and the
+	// gaps between one session's requests are what a learned keep-alive is fitted to.
+	Session string `json:"session,omitempty"`
+}
+
+// hintLimits bound what a caller can put in a hint, since it is copied into every event.
+const (
+	hintUseMax     = 32
+	hintSessionMax = 128
+)
+
+// Sanitized returns the hint trimmed to its limits, or nil if nothing is left.
+func (h *RequestHint) Sanitized() *RequestHint {
+	if h == nil {
+		return nil
+	}
+	out := RequestHint{Use: strings.TrimSpace(h.Use), Session: strings.TrimSpace(h.Session)}
+	if len(out.Use) > hintUseMax {
+		out.Use = out.Use[:hintUseMax]
+	}
+	if len(out.Session) > hintSessionMax {
+		out.Session = out.Session[:hintSessionMax]
+	}
+	if out.Use == "" && out.Session == "" {
+		return nil
+	}
+	return &out
 }
 
 type Tools []Tool
@@ -1855,6 +1901,9 @@ type EventFrame struct {
 	// Timings is how a generation divided, on a gen.end frame. See ModelEvent.
 	Timings *GenerationTimings `json:"timings,omitempty"`
 
+	// Hint is what the caller said the request was for, on a gen.end frame, when it said.
+	Hint *RequestHint `json:"hint,omitempty"`
+
 	// Memory splits SizeVRAM by what the memory holds; MemoryHost does the same for
 	// whatever spilled to the host. See the fields of the same name on ModelEvent.
 	Memory     *MemoryBreakdown `json:"memory,omitempty"`
@@ -1985,6 +2034,9 @@ type ModelEvent struct {
 	// fresh load, 2056 ms total against 161.6 of prefill and 115.7 of decode -- so nearly all
 	// of it. Attribute the remainder to neither phase.
 	Timings *GenerationTimings `json:"timings,omitempty"`
+
+	// Hint is what the caller said the request was for, on a gen.end event, when it said.
+	Hint *RequestHint `json:"hint,omitempty"`
 
 	// Memory splits SizeVRAM by what the memory holds, and MemoryHost does the same for
 	// the part that did not fit on a device. On load.weights only Weights is populated,

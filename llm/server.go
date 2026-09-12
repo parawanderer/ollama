@@ -92,7 +92,7 @@ type LlamaServer interface {
 
 	// SetOnGenerationDone registers a callback fired when a completion finishes, with the
 	// engine's own measurement of how it divided between prefill and decode.
-	SetOnGenerationDone(func(api.GenerationTimings))
+	SetOnGenerationDone(func(api.GenerationTimings, *api.RequestHint))
 
 	// LayerPlacement reports which device each layer landed on, or nil when the runner
 	// was not asked to collect it (see envconfig.LayerPlacement).
@@ -263,6 +263,9 @@ type CompletionRequest struct {
 
 	// TopLogprobs specifies the number of most likely alternative tokens to return (0-20)
 	TopLogprobs int
+
+	// Hint is the caller's request hint, passed back on the generation-done callback.
+	Hint *api.RequestHint
 }
 
 type ChatRequest struct {
@@ -275,6 +278,8 @@ type ChatRequest struct {
 
 	Logprobs    bool
 	TopLogprobs int
+	// Hint is the caller's request hint, passed back on the generation-done callback.
+	Hint *api.RequestHint
 }
 
 type ChatResponse struct {

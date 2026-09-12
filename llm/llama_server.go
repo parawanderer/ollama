@@ -159,7 +159,7 @@ type llamaServerRunner struct {
 	// completion: this is the only point all of them pass through, and a hand-written copy
 	// per handler is the shape that has silently lost a field three times here already.
 	genMu        sync.Mutex
-	onGeneration func(api.GenerationTimings)
+	onGeneration func(api.GenerationTimings, *api.RequestHint)
 
 	// promptCache follows the engine's host-RAM prompt cache from its log: the swap each
 	// request paid for, and how full the cache is.
@@ -1874,7 +1874,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 				if attributeSwap {
 					swap = s.promptCache.take()
 				}
-				s.notifyGeneration(lsResp.Timings, swap)
+				s.notifyGeneration(lsResp.Timings, swap, req.Hint)
 
 				finalResp = CompletionResponse{
 					Content:               lsResp.Content,
@@ -2059,6 +2059,13 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 	}
 	defer s.sem.Release(1)
 
+	// The same attribution as Completion: with one slot, any swap logged during this request
+	// is this request's.
+	attributeSwap := s.launch.numParallel == 1
+	if attributeSwap {
+		s.promptCache.begin()
+	}
+
 	req.Options.NumPredict = boundedNumPredict(req.Options.NumPredict, s.options.NumCtx)
 
 	status, err := s.getServerStatusRetry(ctx)
@@ -2185,6 +2192,14 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 				resp.PromptEvalDuration = time.Duration(lsResp.Timings.PromptMS * float64(time.Millisecond))
 				resp.EvalCount = lsResp.Timings.PredictN
 				resp.EvalDuration = time.Duration(lsResp.Timings.PredictMS * float64(time.Millisecond))
+				// gen.end was only ever emitted from Completion, so a model served through the
+				// engine's own chat template produced none, and the event record had a hole
+				// for every such model.
+				var swap *api.PromptCacheSwap
+				if attributeSwap {
+					swap = s.promptCache.take()
+				}
+				s.notifyGeneration(lsResp.Timings, swap, req.Hint)
 				toolCalls, err := accumulatedToolCalls(toolCalls)
 				if err != nil {
 					return err
@@ -3632,13 +3647,13 @@ const activityRequestTimeout = 2 * time.Second
 
 // SetOnGenerationDone registers a callback fired when a completion finishes, carrying the
 // engine's measurement of how it divided. Replaces any previous callback.
-func (s *llamaServerRunner) SetOnGenerationDone(fn func(api.GenerationTimings)) {
+func (s *llamaServerRunner) SetOnGenerationDone(fn func(api.GenerationTimings, *api.RequestHint)) {
 	s.genMu.Lock()
 	s.onGeneration = fn
 	s.genMu.Unlock()
 }
 
-func (s *llamaServerRunner) notifyGeneration(t llamaServerTimings, swap *api.PromptCacheSwap) {
+func (s *llamaServerRunner) notifyGeneration(t llamaServerTimings, swap *api.PromptCacheSwap, hint *api.RequestHint) {
 	s.genMu.Lock()
 	fn := s.onGeneration
 	s.genMu.Unlock()
@@ -3654,7 +3669,7 @@ func (s *llamaServerRunner) notifyGeneration(t llamaServerTimings, swap *api.Pro
 		EvalMs:             t.PredictMS,
 		Decoded:            t.PredictN,
 		PromptCacheSwap:    swap,
-	})
+	}, hint)
 }
 
 // Activity reports what this runner is doing, from llama-server's /slots endpoint, or nil if

@@ -182,7 +182,7 @@ func TestCompletionReportsThePromptCacheSwapItCaused(t *testing.T) {
 		launch:  llamaServerLaunchConfig{numParallel: 1},
 	}
 	var got []api.GenerationTimings
-	runner.SetOnGenerationDone(func(t api.GenerationTimings) { got = append(got, t) })
+	runner.SetOnGenerationDone(func(t api.GenerationTimings, _ *api.RequestHint) { got = append(got, t) })
 
 	run := func() {
 		opts := api.DefaultOptions()
@@ -242,7 +242,7 @@ func TestCompletionReportsNoSwapWithParallelSlots(t *testing.T) {
 		launch:  llamaServerLaunchConfig{numParallel: 2},
 	}
 	var got *api.PromptCacheSwap
-	runner.SetOnGenerationDone(func(t api.GenerationTimings) { got = t.PromptCacheSwap })
+	runner.SetOnGenerationDone(func(t api.GenerationTimings, _ *api.RequestHint) { got = t.PromptCacheSwap })
 	opts := api.DefaultOptions()
 	if err := runner.Completion(t.Context(), CompletionRequest{Prompt: "p", Options: &opts}, func(CompletionResponse) {}); err != nil {
 		t.Fatal(err)
@@ -291,5 +291,67 @@ func TestLaunchPassesCacheRAMOnlyWhenSet(t *testing.T) {
 	t.Setenv("OLLAMA_CACHE_RAM", "32768")
 	if p := strings.Join(llamaServerParams(launch, 0), " "); !strings.Contains(p, "--cache-ram 32768") {
 		t.Fatalf("OLLAMA_CACHE_RAM=32768 did not reach the launch: %s", p)
+	}
+}
+
+// The engine's own chat template path (Chat, not Completion) used to finish without firing the
+// generation callback, so models served that way produced no gen.end at all. It must fire, with
+// the prompt-cache swap it caused and the caller's hint.
+func TestChatReportsGenerationDoneWithItsHint(t *testing.T) {
+	var runner *llamaServerRunner
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			fmt.Fprint(w, `{"status":"ok"}`)
+		case "/slots":
+			fmt.Fprint(w, `[{"id":0,"n_ctx":32768,"is_processing":false}]`)
+		case "/v1/chat/completions":
+			log := &memoryParsingWriter{inner: io.Discard, runner: runner}
+			log.Write(readFixture(t, "prompt_cache_restore.log"))
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"hi"}}]}`)
+			fmt.Fprintln(w)
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{},"finish_reason":"stop"}],"timings":{"cache_n":6503,"prompt_n":21,"prompt_ms":24,"predicted_n":8,"predicted_ms":120}}`)
+			fmt.Fprintln(w)
+			fmt.Fprintln(w, `data: [DONE]`)
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	var port int
+	fmt.Sscanf(srv.URL[strings.LastIndex(srv.URL, ":")+1:], "%d", &port)
+	runner = &llamaServerRunner{
+		port:    port,
+		cmd:     fakeRunningCmd(),
+		sem:     semaphore.NewWeighted(1),
+		options: api.Options{Runner: api.Runner{NumCtx: 32768}},
+		launch:  llamaServerLaunchConfig{numParallel: 1},
+	}
+	var got []api.GenerationTimings
+	var hints []*api.RequestHint
+	runner.SetOnGenerationDone(func(t api.GenerationTimings, h *api.RequestHint) {
+		got = append(got, t)
+		hints = append(hints, h)
+	})
+
+	opts := api.DefaultOptions()
+	hint := &api.RequestHint{Use: "agent", Session: "run-7"}
+	if err := runner.Chat(t.Context(), ChatRequest{Messages: []api.Message{{Role: "user", Content: "hi"}}, Options: &opts, Hint: hint},
+		func(ChatResponse) {}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("generation callback fired %d times, want 1", len(got))
+	}
+	if got[0].Decoded != 8 || got[0].PromptMs != 24 {
+		t.Errorf("timings not carried: %+v", got[0])
+	}
+	if got[0].PromptCacheSwap == nil {
+		t.Error("the swap this request caused was not attributed to it")
+	}
+	if hints[0] != hint {
+		t.Errorf("hint = %+v, want the request's", hints[0])
 	}
 }

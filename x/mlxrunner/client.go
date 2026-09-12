@@ -570,7 +570,7 @@ func (c *Client) Activity(ctx context.Context, busy bool) *api.RunnerActivity { 
 // SetOnGenerationDone implements llm.LlamaServer. The MLX runner does not report a
 // prefill/decode split, so no callback is ever fired and no gen.end is emitted for it --
 // which is the right outcome: absent rather than invented.
-func (c *Client) SetOnGenerationDone(func(api.GenerationTimings)) {}
+func (c *Client) SetOnGenerationDone(func(api.GenerationTimings, *api.RequestHint)) {}
 
 var _ llm.LlamaServer = (*Client)(nil)
 

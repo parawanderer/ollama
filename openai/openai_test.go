@@ -1153,3 +1153,43 @@ func TestFromChatRequest_ContinuousUsageStats(t *testing.T) {
 		t.Fatalf("the wire name did not parse: %+v", parsed.StreamOptions)
 	}
 }
+
+// ollama's request hint is not part of the OpenAI API, so clients send it as an extra body
+// field; it must survive the conversion to the native request on every OpenAI endpoint.
+func TestRequestHintSurvivesConversion(t *testing.T) {
+	var chat ChatCompletionRequest
+	if err := json.Unmarshal([]byte(`{"model":"m","messages":[{"role":"user","content":"hi"}],"hint":{"use":"agent","session":"s"}}`), &chat); err != nil {
+		t.Fatal(err)
+	}
+	native, err := FromChatRequest(chat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if native.Hint == nil || native.Hint.Use != "agent" || native.Hint.Session != "s" {
+		t.Errorf("chat completions: hint = %+v", native.Hint)
+	}
+
+	var comp CompletionRequest
+	if err := json.Unmarshal([]byte(`{"model":"m","prompt":"p","hint":{"use":"batch"}}`), &comp); err != nil {
+		t.Fatal(err)
+	}
+	gen, err := FromCompleteRequest(comp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gen.Hint == nil || gen.Hint.Use != "batch" {
+		t.Errorf("completions: hint = %+v", gen.Hint)
+	}
+
+	var resp ResponsesRequest
+	if err := json.Unmarshal([]byte(`{"model":"m","input":"hi","hint":{"use":"interactive"}}`), &resp); err != nil {
+		t.Fatal(err)
+	}
+	rnative, err := FromResponsesRequest(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rnative.Hint == nil || rnative.Hint.Use != "interactive" {
+		t.Errorf("responses: hint = %+v", rnative.Hint)
+	}
+}

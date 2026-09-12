@@ -2243,7 +2243,7 @@ func (s *mockLlm) GrantedContext() (perSlot, total int) { return s.grantedSeq, s
 
 func (s *mockLlm) Activity(ctx context.Context, busy bool) *api.RunnerActivity { return s.activity }
 
-func (s *mockLlm) SetOnGenerationDone(func(api.GenerationTimings)) {}
+func (s *mockLlm) SetOnGenerationDone(func(api.GenerationTimings, *api.RequestHint)) {}
 func (s *mockLlm) Pid() int {
 	if s.pid != 0 {
 		return s.pid

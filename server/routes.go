@@ -565,6 +565,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 			genTruncate := (req.Truncate == nil || *req.Truncate) && !m.IsMLX()
 			if m.HasChatTemplate && chatModeForModel(m) == chatExecutionModeNative {
 				nativeReq, err := prepareNativeChatRequest(c.Request.Context(), m, r, opts, llm.ChatRequest{
+					Hint:        req.Hint.Sanitized(),
 					Messages:    values.Messages,
 					Format:      req.Format,
 					Options:     opts,
@@ -665,6 +666,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		var parserErr error
 
 		if err := r.Completion(ctx, llm.CompletionRequest{
+			Hint:            req.Hint.Sanitized(),
 			Prompt:          prompt,
 			Media:           media,
 			Format:          req.Format,
@@ -2320,6 +2322,7 @@ func frameFromEvent(ev api.ModelEvent, started time.Time) api.EventFrame {
 		WeightsOnDisk: ev.WeightsOnDisk,
 		Placement:     ev.Placement,
 		Timings:       ev.Timings,
+		Hint:          ev.Hint,
 		Estimate:      ev.Estimate,
 		Dropped:       ev.Dropped,
 		T:             ev.At.Sub(started).Milliseconds(),
@@ -3310,6 +3313,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			var parserErr error
 
 			err := r.Completion(ctx, llm.CompletionRequest{
+				Hint:                       req.Hint.Sanitized(),
 				Prompt:                     prompt,
 				Media:                      media,
 				Format:                     currentFormat,
@@ -3506,6 +3510,7 @@ func prepareNativeChatRequest(ctx context.Context, m *Model, r llm.LlamaServer, 
 func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model, r llm.LlamaServer, opts *api.Options, msgs []api.Message, checkpointStart, checkpointLoaded time.Time) {
 	truncate := req.Truncate == nil || *req.Truncate
 	nativeReq, err := prepareNativeChatRequest(c.Request.Context(), m, r, opts, llm.ChatRequest{
+		Hint:        req.Hint.Sanitized(),
 		Messages:    msgs,
 		Tools:       req.Tools,
 		Format:      req.Format,

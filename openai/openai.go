@@ -113,24 +113,25 @@ type Reasoning struct {
 }
 
 type ChatCompletionRequest struct {
-	Model            string          `json:"model"`
-	Messages         []Message       `json:"messages"`
-	Stream           bool            `json:"stream"`
-	StreamOptions    *StreamOptions  `json:"stream_options"`
-	MaxTokens        *int            `json:"max_tokens"`
-	Seed             *int            `json:"seed"`
-	Stop             any             `json:"stop"`
-	Temperature      *float64        `json:"temperature"`
-	FrequencyPenalty *float64        `json:"frequency_penalty"`
-	PresencePenalty  *float64        `json:"presence_penalty"`
-	TopP             *float64        `json:"top_p"`
-	ResponseFormat   *ResponseFormat `json:"response_format"`
-	Tools            []api.Tool      `json:"tools"`
-	Reasoning        *Reasoning      `json:"reasoning,omitempty"`
-	ReasoningEffort  *string         `json:"reasoning_effort,omitempty"`
-	Logprobs         *bool           `json:"logprobs"`
-	TopLogprobs      int             `json:"top_logprobs"`
-	DebugRenderOnly  bool            `json:"_debug_render_only"`
+	Model            string           `json:"model"`
+	Messages         []Message        `json:"messages"`
+	Stream           bool             `json:"stream"`
+	StreamOptions    *StreamOptions   `json:"stream_options"`
+	Hint             *api.RequestHint `json:"hint,omitempty"`
+	MaxTokens        *int             `json:"max_tokens"`
+	Seed             *int             `json:"seed"`
+	Stop             any              `json:"stop"`
+	Temperature      *float64         `json:"temperature"`
+	FrequencyPenalty *float64         `json:"frequency_penalty"`
+	PresencePenalty  *float64         `json:"presence_penalty"`
+	TopP             *float64         `json:"top_p"`
+	ResponseFormat   *ResponseFormat  `json:"response_format"`
+	Tools            []api.Tool       `json:"tools"`
+	Reasoning        *Reasoning       `json:"reasoning,omitempty"`
+	ReasoningEffort  *string          `json:"reasoning_effort,omitempty"`
+	Logprobs         *bool            `json:"logprobs"`
+	TopLogprobs      int              `json:"top_logprobs"`
+	DebugRenderOnly  bool             `json:"_debug_render_only"`
 }
 
 type ChatCompletion struct {
@@ -156,20 +157,21 @@ type ChatCompletionChunk struct {
 
 // TODO (https://github.com/ollama/ollama/issues/5259): support []string, []int and [][]int
 type CompletionRequest struct {
-	Model            string         `json:"model"`
-	Prompt           string         `json:"prompt"`
-	FrequencyPenalty float32        `json:"frequency_penalty"`
-	MaxTokens        *int           `json:"max_tokens"`
-	PresencePenalty  float32        `json:"presence_penalty"`
-	Seed             *int           `json:"seed"`
-	Stop             any            `json:"stop"`
-	Stream           bool           `json:"stream"`
-	StreamOptions    *StreamOptions `json:"stream_options"`
-	Temperature      *float32       `json:"temperature"`
-	TopP             float32        `json:"top_p"`
-	Suffix           string         `json:"suffix"`
-	Logprobs         *int           `json:"logprobs"`
-	DebugRenderOnly  bool           `json:"_debug_render_only"`
+	Model            string           `json:"model"`
+	Prompt           string           `json:"prompt"`
+	Hint             *api.RequestHint `json:"hint,omitempty"`
+	FrequencyPenalty float32          `json:"frequency_penalty"`
+	MaxTokens        *int             `json:"max_tokens"`
+	PresencePenalty  float32          `json:"presence_penalty"`
+	Seed             *int             `json:"seed"`
+	Stop             any              `json:"stop"`
+	Stream           bool             `json:"stream"`
+	StreamOptions    *StreamOptions   `json:"stream_options"`
+	Temperature      *float32         `json:"temperature"`
+	TopP             float32          `json:"top_p"`
+	Suffix           string           `json:"suffix"`
+	Logprobs         *int             `json:"logprobs"`
+	DebugRenderOnly  bool             `json:"_debug_render_only"`
 }
 
 type Completion struct {
@@ -737,6 +739,7 @@ func FromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 		TopLogprobs:     r.TopLogprobs,
 		DebugRenderOnly: r.DebugRenderOnly,
 		StreamMetrics:   r.Stream && r.StreamOptions != nil && r.StreamOptions.ContinuousUsageStats,
+		Hint:            r.Hint,
 	}, nil
 }
 
@@ -861,6 +864,7 @@ func FromCompleteRequest(r CompletionRequest) (api.GenerateRequest, error) {
 		Logprobs:        logprobs,
 		TopLogprobs:     topLogprobs,
 		DebugRenderOnly: r.DebugRenderOnly,
+		Hint:            r.Hint,
 	}, nil
 }
 

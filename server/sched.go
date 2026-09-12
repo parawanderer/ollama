@@ -1486,10 +1486,10 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 				// One registration for the life of the runner. The name is captured here
 				// rather than read at fire time because the runner outlives this request.
 				modelName := req.model.Name
-				llama.SetOnGenerationDone(func(t api.GenerationTimings) {
+				llama.SetOnGenerationDone(func(t api.GenerationTimings, hint *api.RequestHint) {
 					timings := t
 					s.publishEvent(api.ModelEvent{
-						Type: EventGenEnd, Model: modelName, Timings: &timings,
+						Type: EventGenEnd, Model: modelName, Timings: &timings, Hint: hint,
 					})
 				})
 			}

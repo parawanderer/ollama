@@ -2292,6 +2292,79 @@ type ComputeInfo struct {
 
 	// Topology is how the supported GPUs connect, pair by pair. Absent with no GPU.
 	Topology *GPUTopology `json:"topology,omitempty"`
+
+	// Profile is this machine's decode speed as ollama measured it. Absent with no GPU.
+	Profile *BoxProfile `json:"profile,omitempty"`
+}
+
+// BoxProfile is the machine's decode speed, measured by timing a model ollama writes itself:
+// a llama-architecture model of zero weights, of several shapes, on each GPU and across each
+// set of GPUs. Nothing is downloaded, and it is measured once for each combination of GPUs,
+// driver and engine, the first time the server is idle with nothing else on the GPUs.
+//
+// One GPU's time per decoded token is TokenOverheadMs + LayerOverheadUs × layers + bytes read
+// ÷ BandwidthBytesPerSec. Across N GPUs under tensor split, only the bandwidth term divides by
+// N, and each layer adds two reductions at the link's cost.
+type BoxProfile struct {
+	// State is "measured", "pending" (not measured yet: it waits for the server to be idle)
+	// or "measuring".
+	State string `json:"state"`
+
+	MeasuredAt *time.Time `json:"measured_at,omitempty"`
+
+	Devices []ProfileDevice `json:"devices,omitempty"`
+
+	// Links are the device sets tensor split was measured across: every pair, and all the
+	// devices together when there are more than two.
+	Links []ProfileLink `json:"links,omitempty"`
+
+	// Failures are the measurements that could not be made, with the reason. A failure is a
+	// result: it is not retried until the GPUs, driver or engine change.
+	Failures []ProfileFailure `json:"failures,omitempty"`
+}
+
+// ProfileDevice is one GPU's measured decode speed.
+type ProfileDevice struct {
+	ID    string `json:"gpu_id"`
+	PCIID string `json:"pci_id,omitempty"`
+
+	// BandwidthBytesPerSec is the memory bandwidth decode achieves, which is below the rated
+	// figure: 90% of it on the machine this was built on.
+	BandwidthBytesPerSec uint64 `json:"bandwidth_bytes_per_sec"`
+
+	// TokenOverheadMs is the fixed cost of a token, and LayerOverheadUs the cost of a layer
+	// beyond reading its weights. The second is not small: 25 µs a layer was 1.6 ms of a
+	// 64-layer model's 14.5 ms per token.
+	TokenOverheadMs float64 `json:"token_overhead_ms"`
+	LayerOverheadUs float64 `json:"layer_overhead_us"`
+
+	// FitErrorPct is the worst disagreement between the three numbers above and the four
+	// timings they were fitted to.
+	FitErrorPct float64 `json:"fit_error_pct"`
+}
+
+// ProfileLink is the cost of tensor split's reductions across one set of devices.
+type ProfileLink struct {
+	PCIIDs []string `json:"pci_ids"`
+
+	// Reductions is the cost of one reduction, measured at each model width. It grows with
+	// width, so a model's cost is read between the two.
+	Reductions []LinkReduction `json:"reductions"`
+}
+
+// LinkReduction is the cost of one reduction for a model of the given width (embedding
+// length).
+type LinkReduction struct {
+	Width int     `json:"width"`
+	Us    float64 `json:"us"`
+}
+
+// ProfileFailure is a measurement that could not be made.
+type ProfileFailure struct {
+	// What is "device" or "tensor_split".
+	What   string   `json:"what"`
+	PCIIDs []string `json:"pci_ids"`
+	Error  string   `json:"error"`
 }
 
 // GPUTopology is the interconnect between every pair of supported GPUs.

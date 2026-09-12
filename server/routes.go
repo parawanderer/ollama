@@ -2032,6 +2032,10 @@ func Serve(ln net.Listener) error {
 	} else {
 		sched.usage = u
 	}
+	// Measured once per GPUs, driver and engine, when the server is quiet; kept beside the
+	// other stores so a new machine starts fresh.
+	sched.profiler = newBoxProfiler(filepath.Join(envconfig.Models(), "box-profile.json"))
+	go sched.profiler.run(schedCtx, sched.profileCandidates)
 
 	sched.psFn = s.processResponse
 	sched.infoFn = s.infoResponse
@@ -2072,6 +2076,10 @@ func Serve(ln net.Listener) error {
 	// This will log warnings to the log in case we have problems with detected GPUs
 	gpus := discover.GPUDevices(ctx, nil)
 	discover.LogDetails(gpus)
+	// The same call the scheduler makes, so its result seeds the scheduler's cache rather than
+	// being thrown away. That is what lets the box profile, which never starts discovery
+	// itself, run on a server no client has asked anything yet.
+	s.sched.seedDeviceCache(gpus)
 
 	var totalVRAM uint64
 	for _, gpu := range gpus {
@@ -2897,6 +2905,7 @@ func (s *Server) infoResponse() *api.InfoResponse {
 			SupportedGPUs:   gpus,
 			UnavailableGPUs: unavailableGPUs(devices, s.sched.deviceNames),
 			Topology:        gpuTopology(devices),
+			Profile:         s.sched.profiler.report(devices),
 		},
 	}
 }

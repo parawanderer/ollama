@@ -215,6 +215,7 @@ func (s *Server) LeaseHandler(c *gin.Context) {
 		return
 	}
 
+	s.sched.profiler.preempt() // a job outranks measuring the machine
 	l := s.sched.leases.add(holder, devices)
 	pcis := make([]string, 0, len(devices))
 	for _, p := range devices {

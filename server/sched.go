@@ -154,6 +154,10 @@ type Scheduler struct {
 	// leases are GPUs given to jobs outside ollama (server/lease.go).
 	leases leaseTable
 
+	// profiler measures the machine's decode speed once, when it is quiet
+	// (server/box_profile.go); nil measures nothing.
+	profiler *boxProfiler
+
 	// fitProbe measures a load without performing it; nil means llm.ProbeFitVRAM. Swapped
 	// only by tests, which cannot run llama-server.
 	fitProbe        func(ctx context.Context, gpus []ml.DeviceInfo, modelPath string, f *ggml.GGML, adapters, projectors []string, opts api.Options, numParallel int, kvCacheType string, config llm.LlamaServerConfig, numCtx int) (uint64, int, error)
@@ -441,6 +445,20 @@ func (s *Scheduler) refreshFreeMemory() bool {
 	}
 	s.deviceCacheAt = time.Now()
 	return true
+}
+
+// seedDeviceCache stores a discovery made outside cachedDevices, as if cachedDevices had made
+// it, unless the cache already holds one.
+func (s *Scheduler) seedDeviceCache(devices []ml.DeviceInfo) {
+	s.deviceCacheMu.Lock()
+	seeded := s.deviceCache == nil && len(devices) > 0
+	if seeded {
+		s.deviceCache, s.deviceCacheAt = devices, time.Now()
+	}
+	s.deviceCacheMu.Unlock()
+	if seeded {
+		s.deviceNames.observe(devices)
+	}
 }
 
 // invalidateDeviceCache drops the cached discovery so the next reader re-reads. Called
@@ -931,6 +949,10 @@ func (s *Scheduler) processPending(ctx context.Context) {
 			slog.Debug("shutting down scheduler pending loop")
 			return
 		case pending := <-s.pendingReqCh:
+			// A measurement of the machine yields to any request, and its memory is free
+			// before this one is placed.
+			s.profiler.preempt()
+
 			// Block other requests until we get this pending request running
 			pending.schedAttempts++
 

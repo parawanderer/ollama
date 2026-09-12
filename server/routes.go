@@ -565,7 +565,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 			genTruncate := (req.Truncate == nil || *req.Truncate) && !m.IsMLX()
 			if m.HasChatTemplate && chatModeForModel(m) == chatExecutionModeNative {
 				nativeReq, err := prepareNativeChatRequest(c.Request.Context(), m, r, opts, llm.ChatRequest{
-					Hint:        req.Hint.Sanitized(),
+					Meta:        generateMeta(c, req),
 					Messages:    values.Messages,
 					Format:      req.Format,
 					Options:     opts,
@@ -666,7 +666,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		var parserErr error
 
 		if err := r.Completion(ctx, llm.CompletionRequest{
-			Hint:            req.Hint.Sanitized(),
+			Meta:            generateMeta(c, req),
 			Prompt:          prompt,
 			Media:           media,
 			Format:          req.Format,
@@ -2024,6 +2024,13 @@ func Serve(ln net.Listener) error {
 	sched.vramCalibrationPath = filepath.Join(envconfig.Models(), "vram-calibration.json")
 	sched.vramCalibration.Load(sched.vramCalibrationPath)
 	sched.deviceNames = newDeviceNames(filepath.Join(envconfig.Models(), "device-names.json"))
+	// The high-volume record: one row per generation and per load. Optional -- a server that
+	// cannot open it serves exactly the same, it just learns nothing.
+	if u, err := openUsageStore(filepath.Join(envconfig.Models(), "usage.db")); err != nil {
+		slog.Warn("usage store unavailable; generations will not be recorded", "error", err)
+	} else {
+		sched.usage = u
+	}
 
 	sched.psFn = s.processResponse
 	sched.infoFn = s.infoResponse
@@ -2323,6 +2330,7 @@ func frameFromEvent(ev api.ModelEvent, started time.Time) api.EventFrame {
 		Placement:     ev.Placement,
 		Timings:       ev.Timings,
 		Hint:          ev.Hint,
+		Shape:         ev.Shape,
 		Estimate:      ev.Estimate,
 		Dropped:       ev.Dropped,
 		T:             ev.At.Sub(started).Milliseconds(),
@@ -3313,7 +3321,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			var parserErr error
 
 			err := r.Completion(ctx, llm.CompletionRequest{
-				Hint:                       req.Hint.Sanitized(),
+				Meta:                       chatMeta(c, req),
 				Prompt:                     prompt,
 				Media:                      media,
 				Format:                     currentFormat,
@@ -3510,7 +3518,7 @@ func prepareNativeChatRequest(ctx context.Context, m *Model, r llm.LlamaServer, 
 func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model, r llm.LlamaServer, opts *api.Options, msgs []api.Message, checkpointStart, checkpointLoaded time.Time) {
 	truncate := req.Truncate == nil || *req.Truncate
 	nativeReq, err := prepareNativeChatRequest(c.Request.Context(), m, r, opts, llm.ChatRequest{
-		Hint:        req.Hint.Sanitized(),
+		Meta:        chatMeta(c, req),
 		Messages:    msgs,
 		Tools:       req.Tools,
 		Format:      req.Format,

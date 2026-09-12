@@ -159,7 +159,7 @@ type llamaServerRunner struct {
 	// completion: this is the only point all of them pass through, and a hand-written copy
 	// per handler is the shape that has silently lost a field three times here already.
 	genMu        sync.Mutex
-	onGeneration func(api.GenerationTimings, *api.RequestHint)
+	onGeneration func(api.GenerationTimings, *api.GenerationMeta)
 
 	// promptCache follows the engine's host-RAM prompt cache from its log: the swap each
 	// request paid for, and how full the cache is.
@@ -1874,7 +1874,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 				if attributeSwap {
 					swap = s.promptCache.take()
 				}
-				s.notifyGeneration(lsResp.Timings, swap, req.Hint)
+				s.notifyGeneration(lsResp.Timings, swap, req.Meta)
 
 				finalResp = CompletionResponse{
 					Content:               lsResp.Content,
@@ -2199,7 +2199,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 				if attributeSwap {
 					swap = s.promptCache.take()
 				}
-				s.notifyGeneration(lsResp.Timings, swap, req.Hint)
+				s.notifyGeneration(lsResp.Timings, swap, req.Meta)
 				toolCalls, err := accumulatedToolCalls(toolCalls)
 				if err != nil {
 					return err
@@ -3647,13 +3647,13 @@ const activityRequestTimeout = 2 * time.Second
 
 // SetOnGenerationDone registers a callback fired when a completion finishes, carrying the
 // engine's measurement of how it divided. Replaces any previous callback.
-func (s *llamaServerRunner) SetOnGenerationDone(fn func(api.GenerationTimings, *api.RequestHint)) {
+func (s *llamaServerRunner) SetOnGenerationDone(fn func(api.GenerationTimings, *api.GenerationMeta)) {
 	s.genMu.Lock()
 	s.onGeneration = fn
 	s.genMu.Unlock()
 }
 
-func (s *llamaServerRunner) notifyGeneration(t llamaServerTimings, swap *api.PromptCacheSwap, hint *api.RequestHint) {
+func (s *llamaServerRunner) notifyGeneration(t llamaServerTimings, swap *api.PromptCacheSwap, meta *api.GenerationMeta) {
 	s.genMu.Lock()
 	fn := s.onGeneration
 	s.genMu.Unlock()
@@ -3669,7 +3669,7 @@ func (s *llamaServerRunner) notifyGeneration(t llamaServerTimings, swap *api.Pro
 		EvalMs:             t.PredictMS,
 		Decoded:            t.PredictN,
 		PromptCacheSwap:    swap,
-	}, hint)
+	}, meta)
 }
 
 // Activity reports what this runner is doing, from llama-server's /slots endpoint, or nil if

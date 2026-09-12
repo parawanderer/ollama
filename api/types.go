@@ -223,6 +223,43 @@ type RequestHint struct {
 	Synthetic bool `json:"synthetic,omitempty"`
 }
 
+// RequestShape describes a request's form, never its content: how many messages, images and
+// tools it carried, what it asked for, and a pseudonymous id for the client that sent it. It
+// is what lets usage be learned from requests that carry no hint (by resemblance to the ones
+// that do), and it is safe to keep because nothing a person wrote is in it.
+type RequestShape struct {
+	// Endpoint is "chat" or "generate"; Surface is "native" or "openai" (the /v1 routes).
+	Endpoint string `json:"endpoint"`
+	Surface  string `json:"surface"`
+	Stream   bool   `json:"stream"`
+
+	Messages int  `json:"messages,omitempty"`
+	Images   int  `json:"images,omitempty"`
+	Tools    int  `json:"tools,omitempty"`
+	Format   bool `json:"format,omitempty"`
+	// Think is what the request asked for ("true", "false", "high", ...), empty when it did
+	// not say.
+	Think string `json:"think,omitempty"`
+
+	// The options the request itself set, not the model's defaults. Absent when not set.
+	NumCtx     *int `json:"num_ctx,omitempty"`
+	NumGPU     *int `json:"num_gpu,omitempty"`
+	NumPredict *int `json:"num_predict,omitempty"`
+	// KeepAliveS is the requested keep-alive in seconds; negative means forever.
+	KeepAliveS *int64 `json:"keep_alive_s,omitempty"`
+
+	// Client is a salted hash of the caller's address and user agent: stable on one server,
+	// meaningless anywhere else.
+	Client string `json:"client,omitempty"`
+}
+
+// GenerationMeta travels with a request to the runner and comes back when the generation
+// finishes: what the caller said the request was for, and what it looked like.
+type GenerationMeta struct {
+	Hint  *RequestHint
+	Shape *RequestShape
+}
+
 // hintLimits bound what a caller can put in a hint, since it is copied into every event.
 const (
 	hintUseMax     = 32
@@ -1928,6 +1965,9 @@ type EventFrame struct {
 	// Hint is what the caller said the request was for, on a gen.end frame, when it said.
 	Hint *RequestHint `json:"hint,omitempty"`
 
+	// Shape is the request's form, on a gen.end frame. See RequestShape.
+	Shape *RequestShape `json:"shape,omitempty"`
+
 	// Memory splits SizeVRAM by what the memory holds; MemoryHost does the same for
 	// whatever spilled to the host. See the fields of the same name on ModelEvent.
 	Memory     *MemoryBreakdown `json:"memory,omitempty"`
@@ -2061,6 +2101,9 @@ type ModelEvent struct {
 
 	// Hint is what the caller said the request was for, on a gen.end event, when it said.
 	Hint *RequestHint `json:"hint,omitempty"`
+
+	// Shape is the request's form, on a gen.end event. See RequestShape.
+	Shape *RequestShape `json:"shape,omitempty"`
 
 	// Memory splits SizeVRAM by what the memory holds, and MemoryHost does the same for
 	// the part that did not fit on a device. On load.weights only Weights is populated,

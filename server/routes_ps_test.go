@@ -142,7 +142,7 @@ func (f *fakeRunner) GrantedContext() (perSlot, total int) { return f.grantedSeq
 
 func (f *fakeRunner) Activity(ctx context.Context, busy bool) *api.RunnerActivity { return f.activity }
 
-func (f *fakeRunner) SetOnGenerationDone(func(api.GenerationTimings, *api.RequestHint)) {}
+func (f *fakeRunner) SetOnGenerationDone(func(api.GenerationTimings, *api.GenerationMeta)) {}
 
 // The split is reported per device and in aggregate, and both sum to the size_vram they
 // sit beside. That property is the whole reason a client can trust the breakdown: a UI

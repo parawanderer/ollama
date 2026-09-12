@@ -3,9 +3,11 @@ package server
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -2135,6 +2137,7 @@ func TestSchedLlamaServerEvictsExistingOnPending(t *testing.T) {
 }
 
 type mockLlm struct {
+	onGeneration             func(api.GenerationTimings, *api.GenerationMeta)
 	pid                      int // 0 reports -1, as before
 	grantedSeq, grantedTotal int
 	memVRAM                  api.MemoryBreakdown
@@ -2243,7 +2246,9 @@ func (s *mockLlm) GrantedContext() (perSlot, total int) { return s.grantedSeq, s
 
 func (s *mockLlm) Activity(ctx context.Context, busy bool) *api.RunnerActivity { return s.activity }
 
-func (s *mockLlm) SetOnGenerationDone(func(api.GenerationTimings, *api.RequestHint)) {}
+func (s *mockLlm) SetOnGenerationDone(fn func(api.GenerationTimings, *api.GenerationMeta)) {
+	s.onGeneration = fn
+}
 func (s *mockLlm) Pid() int {
 	if s.pid != 0 {
 		return s.pid
@@ -2564,6 +2569,57 @@ func TestSchedLoadWithoutGPUsDoesNotProbe(t *testing.T) {
 	}
 	if probes != 0 {
 		t.Fatalf("%d fit probes for a load with no GPU, want 0", probes)
+	}
+}
+
+// A load and each generation it serves are recorded in the usage store, with the placement the
+// runner was given and the caller's hint and request shape.
+func TestSchedRecordsUsage(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer done()
+
+	s := InitScheduler(ctx)
+	path := filepath.Join(t.TempDir(), "usage.db")
+	u, err := openUsageStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.usage = u
+	scenario := newScenarioRequestWithContext(t, ctx, "usage", 10, nil, map[ml.DeviceID]uint64{}, 131072)
+	scenario.req.opts.NumCtx = 8192
+	scenario.srv.contextLength = 8192
+	scenario.srv.totalSize = 3 << 30
+	s.newServerFn = scenario.newServer
+
+	s.load(scenario.req, ml.SystemInfo{}, nil, false)
+	select {
+	case err := <-scenario.req.errCh:
+		t.Fatal(err)
+	case <-scenario.req.successCh:
+	}
+	if scenario.srv.onGeneration == nil {
+		t.Fatal("the scheduler registered no generation callback")
+	}
+	scenario.srv.onGeneration(api.GenerationTimings{PromptTokens: 10, Decoded: 5, EvalMs: 50},
+		&api.GenerationMeta{Hint: &api.RequestHint{Use: "utility", Session: "s-1"}, Shape: &api.RequestShape{Endpoint: "chat"}})
+	u.close()
+
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var use, session, split string
+	var decoded int
+	if err := db.QueryRow(`SELECT hint_use, hint_session, decoded, split FROM generations`).Scan(&use, &session, &decoded, &split); err != nil {
+		t.Fatalf("no generation row: %v", err)
+	}
+	if use != "utility" || session != "s-1" || decoded != 5 || split != "cpu" {
+		t.Errorf("generation row: use=%q session=%q decoded=%d split=%q", use, session, decoded, split)
+	}
+	var loads int
+	if err := db.QueryRow(`SELECT count(*) FROM loads`).Scan(&loads); err != nil || loads != 1 {
+		t.Errorf("load rows = %d (%v), want 1", loads, err)
 	}
 }
 

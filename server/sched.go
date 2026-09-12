@@ -148,6 +148,9 @@ type Scheduler struct {
 	freeMemoryFn func(pciIDs []string) map[string]uint64
 
 	loadFn func(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool
+	// usage records every generation and load (server/usage.go); nil records nothing.
+	usage *usageStore
+
 	// fitProbe measures a load without performing it; nil means llm.ProbeFitVRAM. Swapped
 	// only by tests, which cannot run llama-server.
 	fitProbe        func(ctx context.Context, gpus []ml.DeviceInfo, modelPath string, f *ggml.GGML, adapters, projectors []string, opts api.Options, numParallel int, kvCacheType string, config llm.LlamaServerConfig, numCtx int) (uint64, int, error)
@@ -1269,6 +1272,9 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 	// ever looks.
 	var calibrationKey llm.CalibrationKey
 
+	// The estimate this load was placed from, kept for the usage record written when it completes.
+	var loadEstimate *api.LoadEstimate
+
 	// The context the prediction was made at, kept in scope so the measurement this load
 	// produces is recorded against the same value. req.opts.NumCtx is rewritten further
 	// down from what llama-server actually chose, so it cannot be recomputed later.
@@ -1407,6 +1413,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			// Emitted before load.start, because this is the decision that chose the
 			// devices the load is about to run on. A placement that later spills, or that
 			// leaves a second card idle, is otherwise unattributable from the stream.
+			loadEstimate = estimate
 			s.publishEvent(api.ModelEvent{Type: EventEstimate, Model: req.model.Name, Estimate: estimate})
 			slog.Info("predicted llama-server VRAM",
 				"model", req.model.ModelPath,
@@ -1496,10 +1503,20 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 				// One registration for the life of the runner. The name is captured here
 				// rather than read at fire time because the runner outlives this request.
 				modelName := req.model.Name
-				llama.SetOnGenerationDone(func(t api.GenerationTimings, hint *api.RequestHint) {
+				// Placement is fixed for the life of the runner, so it is captured once here.
+				devices, split, numBatch := usageDevices(loadGpus), usageSplit(loadGpus, launchOpts), launchOpts.NumBatch
+				runnerLlama := llama
+				llama.SetOnGenerationDone(func(t api.GenerationTimings, meta *api.GenerationMeta) {
 					timings := t
-					s.publishEvent(api.ModelEvent{
-						Type: EventGenEnd, Model: modelName, Timings: &timings, Hint: hint,
+					ev := api.ModelEvent{Type: EventGenEnd, Model: modelName, Timings: &timings}
+					if meta != nil {
+						ev.Hint, ev.Shape = meta.Hint, meta.Shape
+					}
+					s.publishEvent(ev)
+					numCtx, _ := runnerLlama.GrantedContext()
+					s.usage.recordGeneration(usageGeneration{
+						At: time.Now(), Model: modelName, Timings: timings, Meta: meta,
+						Devices: devices, NumCtx: numCtx, NumBatch: numBatch, Split: split,
 					})
 				})
 			}
@@ -1798,6 +1815,12 @@ iGPUScan:
 			complete.ContextMs = complete.DurationMs - complete.WeightsMs
 		}
 		s.publishEvent(complete)
+		s.usage.recordLoad(usageLoad{
+			At: time.Now(), Model: req.model.Name, Estimate: loadEstimate,
+			Devices: usageDevices(loadGpus), Split: usageSplit(loadGpus, launchOpts),
+			SizeVRAM: complete.SizeVRAM, SizeTotal: complete.SizeTotal,
+			WeightsMs: complete.WeightsMs, ContextMs: complete.ContextMs, TotalMs: complete.DurationMs,
+		})
 		go func() {
 			<-req.ctx.Done()
 			slog.Debug("context for request finished")

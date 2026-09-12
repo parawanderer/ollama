@@ -18,7 +18,9 @@ func TestChatHandlerPassesTheHintToTheRunner(t *testing.T) {
 	var got *api.RequestHint
 	mock := mockRunner{
 		CompletionFn: func(ctx context.Context, r llm.CompletionRequest, fn func(llm.CompletionResponse)) error {
-			got = r.Hint
+			if r.Meta != nil {
+				got = r.Meta.Hint
+			}
 			fn(llm.CompletionResponse{Content: "ok", Done: true, DoneReason: llm.DoneReasonStop})
 			return nil
 		},
@@ -64,7 +66,11 @@ func TestNativeChatPassesTheHintToTheRunner(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", w.Code, w.Body.String())
 	}
-	if h := mock.ChatRequest.Hint; h == nil || h.Use != "utility" || h.Session != "chat-9" {
+	var h *api.RequestHint
+	if mock.ChatRequest.Meta != nil {
+		h = mock.ChatRequest.Meta.Hint
+	}
+	if h == nil || h.Use != "utility" || h.Session != "chat-9" {
 		t.Fatalf("runner got hint %+v", h)
 	}
 }
@@ -74,7 +80,9 @@ func TestGenerateHandlerPassesTheHintToTheRunner(t *testing.T) {
 	var got *api.RequestHint
 	mock := mockRunner{
 		CompletionFn: func(ctx context.Context, r llm.CompletionRequest, fn func(llm.CompletionResponse)) error {
-			got = r.Hint
+			if r.Meta != nil {
+				got = r.Meta.Hint
+			}
 			fn(llm.CompletionResponse{Content: "ok", Done: true, DoneReason: llm.DoneReasonStop})
 			return nil
 		},

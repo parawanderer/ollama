@@ -182,7 +182,7 @@ func TestCompletionReportsThePromptCacheSwapItCaused(t *testing.T) {
 		launch:  llamaServerLaunchConfig{numParallel: 1},
 	}
 	var got []api.GenerationTimings
-	runner.SetOnGenerationDone(func(t api.GenerationTimings, _ *api.RequestHint) { got = append(got, t) })
+	runner.SetOnGenerationDone(func(t api.GenerationTimings, _ *api.GenerationMeta) { got = append(got, t) })
 
 	run := func() {
 		opts := api.DefaultOptions()
@@ -242,7 +242,7 @@ func TestCompletionReportsNoSwapWithParallelSlots(t *testing.T) {
 		launch:  llamaServerLaunchConfig{numParallel: 2},
 	}
 	var got *api.PromptCacheSwap
-	runner.SetOnGenerationDone(func(t api.GenerationTimings, _ *api.RequestHint) { got = t.PromptCacheSwap })
+	runner.SetOnGenerationDone(func(t api.GenerationTimings, _ *api.GenerationMeta) { got = t.PromptCacheSwap })
 	opts := api.DefaultOptions()
 	if err := runner.Completion(t.Context(), CompletionRequest{Prompt: "p", Options: &opts}, func(CompletionResponse) {}); err != nil {
 		t.Fatal(err)
@@ -330,15 +330,15 @@ func TestChatReportsGenerationDoneWithItsHint(t *testing.T) {
 		launch:  llamaServerLaunchConfig{numParallel: 1},
 	}
 	var got []api.GenerationTimings
-	var hints []*api.RequestHint
-	runner.SetOnGenerationDone(func(t api.GenerationTimings, h *api.RequestHint) {
+	var metas []*api.GenerationMeta
+	runner.SetOnGenerationDone(func(t api.GenerationTimings, m *api.GenerationMeta) {
 		got = append(got, t)
-		hints = append(hints, h)
+		metas = append(metas, m)
 	})
 
 	opts := api.DefaultOptions()
-	hint := &api.RequestHint{Use: "agent", Session: "run-7"}
-	if err := runner.Chat(t.Context(), ChatRequest{Messages: []api.Message{{Role: "user", Content: "hi"}}, Options: &opts, Hint: hint},
+	meta := &api.GenerationMeta{Hint: &api.RequestHint{Use: "agent", Session: "run-7"}}
+	if err := runner.Chat(t.Context(), ChatRequest{Messages: []api.Message{{Role: "user", Content: "hi"}}, Options: &opts, Meta: meta},
 		func(ChatResponse) {}); err != nil {
 		t.Fatal(err)
 	}
@@ -351,7 +351,7 @@ func TestChatReportsGenerationDoneWithItsHint(t *testing.T) {
 	if got[0].PromptCacheSwap == nil {
 		t.Error("the swap this request caused was not attributed to it")
 	}
-	if hints[0] != hint {
-		t.Errorf("hint = %+v, want the request's", hints[0])
+	if metas[0] != meta {
+		t.Errorf("meta = %+v, want the request's", metas[0])
 	}
 }

@@ -90,13 +90,52 @@ var (
 const fitProbeTimeout = 30 * time.Second
 
 // ErrFitProbeWouldNotFit reports that the model could not be placed as asked in the memory
-// free at the time, so llama-server began moving it to system memory instead.
+// free at the time, and that the probe therefore could not see all of what it would cost.
 //
 // llama-server does not fail in this situation -- it degrades, printing a fresh breakdown
 // for each fallback it tries (all experts to host, then dense layers back-to-front), each
 // one smaller than the last. A reader that simply takes the final breakdown records about
 // a gigabyte as the cost of a hundred-gigabyte model, and persists it.
+//
+// Its first projection, printed before it decides anything, is still the full load's cost,
+// and for a model without a projector it is accepted (acceptFitProbe). This error is left
+// for a model with one: its vision encoder reserves a graph only after the weights load,
+// which a probe that does not fit never reaches.
 var ErrFitProbeWouldNotFit = errors.New("model does not fit in the memory free right now, so it cannot be measured")
+
+// fitVerdict is what the fit pass concluded, as far as the probe read it.
+type fitVerdict int
+
+const (
+	fitNoVerdict fitVerdict = iota // the log ended, or was cut off, before any verdict
+	fitClean                       // it fits as asked
+	fitTooSmall                    // it does not fit in the memory free right now
+)
+
+// acceptFitProbe decides whether a probe's total is a measurement of the load.
+//
+// "Does not fit right now" is a statement about free memory, not about the model: the pass
+// prints what the load would use at full offload before it compares that with what is free,
+// and the probe stops reading there, before the fallbacks it then tries. So that figure is
+// the load's cost whatever else is resident. Rejecting it sent every model that did not fit
+// beside the ones already loaded -- the moment a placement decision matters most -- back to
+// the metadata estimate. Read live on 2026-09-11 for loads up to 180 GiB (dsv4-flash at 1M
+// tokens, two cards), with another model resident.
+//
+// Only an explicit verdict counts. A log with no verdict at all may be a pass that went on
+// degrading in wording nobody has seen, and its last number is the trap described above.
+func acceptFitProbe(total uint64, verdict fitVerdict, hasProjector bool) error {
+	switch {
+	case total == 0:
+		return errors.New("fit probe produced no memory breakdown")
+	case verdict == fitClean:
+		return nil
+	case verdict == fitTooSmall && !hasProjector:
+		return nil
+	default:
+		return ErrFitProbeWouldNotFit
+	}
+}
 
 // ProbeFitVRAM reports what a model would occupy at numCtx, by running llama-server's fit
 // pass and killing it as soon as it has answered. Nothing is loaded and no memory is
@@ -179,20 +218,23 @@ func ProbeFitVRAM(
 		}
 	}()
 
-	total, clean, measured := scanFitProbe(out, len(launch.projectors) > 0)
+	total, verdict, measured := scanFitProbe(out, len(launch.projectors) > 0)
 	close(done)
 	_ = cmd.Process.Kill()
 	_, _ = io.Copy(io.Discard, out)
 	_ = cmd.Wait()
 
-	switch {
-	case total == 0:
+	if total == 0 {
 		if err := ctx.Err(); err != nil {
 			return 0, 0, fmt.Errorf("fit probe did not report in %s: %w", fitProbeTimeout, err)
 		}
-		return 0, 0, errors.New("fit probe produced no memory breakdown")
-	case !clean:
-		return 0, 0, ErrFitProbeWouldNotFit
+	}
+	if err := acceptFitProbe(total, verdict, len(launch.projectors) > 0); err != nil {
+		return 0, 0, err
+	}
+	if verdict == fitTooSmall {
+		slog.Debug("measured a model that does not fit in the memory free right now; the pass's projection stands",
+			"model", modelPath, "num_ctx", numCtx, "vram", total)
 	}
 
 	slog.Debug("probed model memory without loading it", "model", modelPath, "num_ctx", numCtx, "measured_ctx", measured, "vram", total, "cmd", cmd)
@@ -207,8 +249,8 @@ func ProbeFitVRAM(
 // which is what makes the figure correspond to the configuration that was requested rather
 // than to whichever fallback was printed last.
 func scanFitBreakdown(r io.Reader, hasProjector bool) (total uint64, clean bool) {
-	total, clean, _ = scanFitProbe(r, hasProjector)
-	return total, clean
+	total, verdict, _ := scanFitProbe(r, hasProjector)
+	return total, verdict == fitClean
 }
 
 // scanFitProbe is scanFitBreakdown that also returns the context the probe measured -- the
@@ -216,7 +258,7 @@ func scanFitBreakdown(r io.Reader, hasProjector bool) (total uint64, clean bool)
 // rounded the same way a load is (each slot up to a multiple of 256), so the context it was
 // asked for is not necessarily the one its figure describes. The probe prints one context,
 // its dry run, and the first line wins: a draft model's context would follow it.
-func scanFitProbe(r io.Reader, hasProjector bool) (total uint64, clean bool, measuredCtx int) {
+func scanFitProbe(r io.Reader, hasProjector bool) (total uint64, result fitVerdict, measuredCtx int) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
@@ -226,7 +268,7 @@ func scanFitProbe(r io.Reader, hasProjector bool) (total uint64, clean bool, mea
 	// nothing.
 	var projected uint64
 	var current, projector, clipCompute uint64
-	var sawRow, verdict, sawClip bool
+	var sawRow, verdict, sawClip, clean bool
 	for scanner.Scan() {
 		line := scanner.Text()
 
@@ -251,7 +293,7 @@ func scanFitProbe(r io.Reader, hasProjector bool) (total uint64, clean bool, mea
 		// which happens after the fit pass has reported. Everything else stops at the
 		// verdict, so this costs about half a second and only for such models.
 		if verdict && (!hasProjector || sawClip) {
-			return pick(projected, total) + projector + clipCompute, clean, measuredCtx
+			return pick(projected, total) + projector + clipCompute, verdictOf(clean), measuredCtx
 		}
 
 		if match := fitBreakdownRegex.FindStringSubmatch(line); match != nil {
@@ -278,20 +320,27 @@ func scanFitProbe(r io.Reader, hasProjector bool) (total uint64, clean bool, mea
 		}
 		switch {
 		case fitTooSmallRegex.MatchString(line):
-			return pick(projected, total), false, measuredCtx
+			return pick(projected, total), fitTooSmall, measuredCtx
 		case fitCleanRegex.MatchString(line):
 			// Not returned here when a projector is configured: the figures that make up a
 			// vision model's total are still to come.
 			verdict, clean = true, pick(projected, total) > 0
 			if !hasProjector {
-				return pick(projected, total), clean, measuredCtx
+				return pick(projected, total), verdictOf(clean), measuredCtx
 			}
 		}
 	}
 	if sawRow {
 		total = current
 	}
-	return pick(projected, total) + projector + clipCompute, clean && verdict, measuredCtx
+	return pick(projected, total) + projector + clipCompute, verdictOf(clean && verdict), measuredCtx
+}
+
+func verdictOf(clean bool) fitVerdict {
+	if clean {
+		return fitClean
+	}
+	return fitNoVerdict
 }
 
 // pick prefers the pass's own total and falls back to the summed rows when it is absent.

@@ -79,12 +79,6 @@ type Scheduler struct {
 	// model is predicted from measurement instead of from metadata alone.
 	vramCalibration *llm.VRAMCalibration
 
-	// swaUndeclared holds models whose engine ran sliding-window layers their metadata did
-	// not declare -- see auditSlidingWindow. Such a model is measured from then on, whatever
-	// the metadata says. Keyed by model path.
-	swaUndeclaredMu sync.Mutex
-	swaUndeclared   map[string]bool
-
 	// vramCalibrationPath is where those measurements survive a restart. Without it every
 	// restart re-earns them by making one uninformed placement per model.
 	vramCalibrationPath string
@@ -407,81 +401,6 @@ func vramCalibrationKey(req *LlmRequest, gpus []ml.DeviceInfo, numParallel int) 
 	}
 }
 
-// modelNeedsMeasurement reports whether this load holds something the estimate cannot
-// describe, so a measurement is worth its half-second.
-//
-// The metadata answers for attention. It cannot answer for a projector: what one reserves is
-// sized for the largest image it will accept and what its encoder reserves is a graph, and
-// neither follows from the weights or the context. Measured on qwen2.5vl:3b at 8k, those two
-// were 2916 MiB of a 5207 MiB load.
-//
-// A projector is found three ways because it is declared three ways, and no one of them
-// covers the models on a single host. Some carry a separate projector file, and then the
-// model's own metadata holds no vision keys at all. Some carry the vision tensors inline,
-// and then there is no projector path. Only the third names it in the metadata.
-// auditSlidingWindow checks the metadata's account of a model against the engine's.
-//
-// The completeness check routes a model to be measured when its metadata carries a marker
-// the per-token estimate cannot model, sliding window among them. But it can only see keys,
-// and llama.cpp can also switch sliding windows on from its own per-architecture defaults
-// with no key at all. The engine's per-layer is_swa is the authority, so when it reports
-// sliding-window layers for a model whose metadata claimed to be complete, the estimate has
-// been treating those layers as full attention -- 89 GiB predicted against 10 used, the last
-// time a sliding-window model slipped through (gemma4:12b).
-//
-// Checked across every model on this box on 2026-09-11: each one carrying a sliding-window
-// key also carries attention.sliding_window, so this has not fired here. It is a net for the
-// architecture that arrives without the key, and it depends on OLLAMA_LAYER_PLACEMENT, which
-// is what makes the engine print is_swa at all.
-//
-// The load that notices has already recorded one calibration sample. One sample plus the
-// metadata's slope is worse than none for exactly this kind of model, so the flag makes the
-// next load measure a line instead.
-func (s *Scheduler) auditSlidingWindow(modelPath string, f *ggml.GGML, placement *api.ModelPlacement) {
-	if f == nil || placement == nil || len(placement.SWALayers) == 0 || !f.KV().KVCacheModelIsComplete() {
-		return
-	}
-	s.swaUndeclaredMu.Lock()
-	defer s.swaUndeclaredMu.Unlock()
-	if s.swaUndeclared[modelPath] {
-		return
-	}
-	if s.swaUndeclared == nil {
-		s.swaUndeclared = make(map[string]bool)
-	}
-	s.swaUndeclared[modelPath] = true
-	slog.Warn("the engine runs sliding-window layers this model's metadata does not declare; "+
-		"its memory will be measured rather than estimated from now on",
-		"model", modelPath, "architecture", f.KV().Architecture(),
-		"sliding_window_layers", len(placement.SWALayers), "layers", placement.NumLayers)
-}
-
-// shouldMeasure is whether a model's memory is measured by probe rather than taken from
-// its metadata: because the metadata admits it cannot describe the model, or because the
-// engine has shown that it did not.
-func (s *Scheduler) shouldMeasure(f *ggml.GGML, projectorPaths []string, modelPath string) bool {
-	return modelNeedsMeasurement(f, projectorPaths) || s.slidingWindowUndeclared(modelPath)
-}
-
-func (s *Scheduler) slidingWindowUndeclared(modelPath string) bool {
-	s.swaUndeclaredMu.Lock()
-	defer s.swaUndeclaredMu.Unlock()
-	return s.swaUndeclared[modelPath]
-}
-
-func modelNeedsMeasurement(f *ggml.GGML, projectorPaths []string) bool {
-	if f == nil {
-		return false
-	}
-	if !f.KV().KVCacheModelIsComplete() {
-		return true
-	}
-	if len(projectorPaths) > 0 {
-		return true
-	}
-	return len(f.Tensors().Items("v.")) > 0
-}
-
 // warnIfPredictionIsALowerBound reports a placement being decided from an estimate that
 // cannot account for this architecture, and that has no measurement to fall back on.
 //
@@ -580,23 +499,28 @@ func probePoints(trainCtx, numParallel int) ([2]int, bool) {
 	return [2]int{lower, ceiling}, true
 }
 
-// probeCalibration measures a model at two context lengths without loading it, for the
-// case where nothing else can answer: an architecture whose metadata does not describe
-// everything it allocates, and which has never been loaded here.
+// probeCalibration measures a model at two or three context lengths without loading it,
+// whenever the load's invocation has not been measured here yet.
 //
-// Without this the first load of such a model is placed from a lower bound, and a lower
-// bound is what overcommits a device. The probe costs about a second in total and turns
-// the first load into a calibrated one.
+// Without this the first load of a model is placed from its metadata, which is off by
+// hundreds of GiB for the architectures it cannot describe. The probe costs about a second
+// per point and turns the first load into a calibrated one.
 //
 // Samples are recorded exactly as a completed load's are, because they are the same
 // quantity: llama-server's fit pass reports what the load would hold, and replaying the
 // real invocation with only the context changed reproduced two real measurements to
 // within 0.01 GiB. That equivalence is the whole reason this is worth doing, and it is
 // entirely dependent on the invocation being identical -- see ProbeFitVRAM.
+//
+// Every model is measured, not only those whose metadata admits it cannot describe them.
+// That gate used to decide from metadata keys whether the metadata could be trusted, and it
+// was the last place the estimate was still believed: measured on 2026-09-11 across the 31
+// models here trained past 131072 (slop-zone notebooks/context-vs-vram.ipynb), the one model
+// it let through, qwen3:235b, was placed 9.3 GiB under what it uses at 262144, while every
+// probed line landed within 590 MiB. The metadata line is now only the first guess that
+// placement starts from, and settlePlacement corrects the placement when the measurement
+// disagrees with it.
 func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey, req *LlmRequest, f *ggml.GGML, launchOpts api.Options, gpus []ml.DeviceInfo, numParallel int, numCtx int) bool {
-	if !s.shouldMeasure(f, req.model.ProjectorPaths, req.model.ModelPath) {
-		return false
-	}
 	// Two distinct samples are what it takes to stop consulting the metadata: below that
 	// the slope still comes from the prior, and for these architectures the prior slope is
 	// the broken part. So the bar is a fitted line, not merely a calibrated answer -- one
@@ -664,6 +588,56 @@ func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey
 		"contexts", contexts,
 		"took", time.Since(started).Round(time.Millisecond),
 		"reason", "this architecture's metadata does not describe everything it allocates")
+	return true
+}
+
+// settlePlacement chooses where a load runs, measures what it costs there, and moves it once
+// if the measurement disagrees with the estimate the choice was made from.
+//
+// The first choice has to come from an estimate: the placement is part of the invocation a
+// probe measures, so the measurement cannot come first. On a model's first load that
+// estimate is its metadata, and the placement used to stand on it whatever the probe then
+// said. Both directions of that are on record here. The calibration store holds gemma4:31b
+// measured on two cards because a metadata estimate hundreds of GiB high split a 43 GiB
+// model; and an estimate that is low pins a model to one card, where it can only spill to the
+// CPU, because a single-card load does not see the other card.
+//
+// So the measurement gets one chance to move the placement, and the new placement is
+// measured in turn. One move, not a loop: a second disagreement is left to the fit check
+// that follows, rather than letting two estimates chase each other.
+func settlePlacement(
+	estimate uint64,
+	place func(estimate uint64) ([]ml.DeviceInfo, api.Options),
+	measure func(placed []ml.DeviceInfo, opts api.Options, estimate uint64) (api.Options, llm.CalibrationKey, uint64, bool),
+) (gpus []ml.DeviceInfo, opts api.Options, key llm.CalibrationKey, predicted uint64, probed bool) {
+	for attempt := 0; ; attempt++ {
+		gpus, opts = place(estimate)
+		var measuredHere bool
+		opts, key, predicted, measuredHere = measure(gpus, opts, estimate)
+		probed = probed || measuredHere
+		if attempt > 0 || predicted == estimate {
+			return gpus, opts, key, predicted, probed
+		}
+		moved, _ := place(predicted)
+		if sameDevices(moved, gpus) {
+			return gpus, opts, key, predicted, probed
+		}
+		slog.Info("the measurement moved the placement; measuring it where it will run",
+			"estimate", format.HumanBytes2(estimate), "measured", format.HumanBytes2(predicted),
+			"devices", len(gpus), "moved_to", len(moved))
+		estimate = predicted
+	}
+}
+
+func sameDevices(a, b []ml.DeviceInfo) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].DeviceID != b[i].DeviceID {
+			return false
+		}
+	}
 	return true
 }
 
@@ -1194,17 +1168,23 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			// probe run before them would measure a different load than the one that runs.
 			bootstrapKey := vramCalibrationKey(req, gpus, numParallel)
 			predicted := predictLlamaServerVRAM(s.vramCalibration, bootstrapKey, req, f, predictedCtx)
-			loadGpus, launchOpts = selectLlamaServerPlacement(systemInfo, gpus, predicted, req.opts)
-			availableForBatch, _, _ := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
-			flashAttention := llm.LlamaServerFlashAttention(loadGpus)
-			req.applyAutomaticGenerationBatch(completion, predictedCtx, predicted, availableForBatch, flashAttention, loadGpus)
-			launchOpts.NumBatch = req.opts.NumBatch
+			var probed bool
+			loadGpus, launchOpts, calibrationKey, predicted, probed = settlePlacement(predicted,
+				func(estimate uint64) ([]ml.DeviceInfo, api.Options) {
+					return selectLlamaServerPlacement(systemInfo, gpus, estimate, req.opts)
+				},
+				func(placed []ml.DeviceInfo, opts api.Options, estimate uint64) (api.Options, llm.CalibrationKey, uint64, bool) {
+					availableForBatch, _, _ := availableMemoryForPlacement(systemInfo, placed, opts)
+					req.applyAutomaticGenerationBatch(completion, predictedCtx, estimate, availableForBatch, llm.LlamaServerFlashAttention(placed), placed)
+					opts.NumBatch = req.opts.NumBatch
 
-			// Now the invocation is fully determined, so this key describes the load that
-			// will actually run, and the measurement it produces is filed where the next
-			// prediction for the same invocation will look.
-			calibrationKey = vramCalibrationKey(req, loadGpus, numParallel)
-			probed := s.probeCalibration(req.ctx, calibrationKey, req, f, launchOpts, loadGpus, numParallel, predictedCtx)
+					// Now the invocation is fully determined, so this key describes the load
+					// that will actually run, and the measurement it produces is filed where
+					// the next prediction for the same invocation will look.
+					key := vramCalibrationKey(req, placed, numParallel)
+					probed := s.probeCalibration(req.ctx, key, req, f, opts, placed, numParallel, predictedCtx)
+					return opts, key, predictLlamaServerVRAM(s.vramCalibration, key, req, f, predictedCtx), probed
+				})
 
 			// Unconditionally, not only when the probe ran. The first prediction was made
 			// from a key built before the batch was settled, which addresses a different
@@ -1632,7 +1612,6 @@ iGPUScan:
 		}
 		complete.WeightsOnDisk = llama.WeightsOnDisk()
 		complete.Placement = llama.LayerPlacement()
-		s.auditSlidingWindow(req.model.ModelPath, f, complete.Placement)
 		if !runner.weightsLoaded.IsZero() && !runner.loadStarted.IsZero() {
 			complete.WeightsMs = runner.weightsLoaded.Sub(runner.loadStarted).Milliseconds()
 			complete.ContextMs = complete.DurationMs - complete.WeightsMs

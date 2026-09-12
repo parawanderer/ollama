@@ -47,7 +47,9 @@ func TestDumpPlacementInputs(t *testing.T) {
 		out["architecture"] = f.KV().Architecture()
 		out["train_ctx"] = trainCtx
 		out["metadata_complete"] = f.KV().KVCacheModelIsComplete()
-		out["measured_by_probe"] = modelNeedsMeasurement(f, m.ProjectorPaths)
+		// Every model is probed now; only a trained context too small to give two distinct
+		// probe points leaves one on the metadata.
+		out["measured_by_probe"] = probeable
 		out["weights"] = weights
 		out["bytes_per_token"] = bytesPerToken
 		out["probe_points"] = points

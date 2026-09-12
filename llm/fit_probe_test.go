@@ -214,7 +214,8 @@ llama_context: n_ctx_seq (12544) < n_ctx_train (131072) -- the full capacity of 
 common_params_fit_impl: projected to use 3129 MiB of device memory vs. 96690 MiB of free device memory
 common_params_fit_impl: will leave 93560 >= 1024 MiB of free device memory, no changes needed
 `
-	total, clean, measured := scanFitProbe(strings.NewReader(log), false)
+	total, verdict, measured := scanFitProbe(strings.NewReader(log), false)
+	clean := verdict == fitClean
 	if !clean || total == 0 {
 		t.Fatalf("clean=%v total=%d; the fixture should read as a clean probe", clean, total)
 	}
@@ -233,5 +234,37 @@ common_params_fit_impl: will leave 69708 >= 1024 MiB of free device memory, no c
 `
 	if _, _, measured := scanFitProbe(strings.NewReader(log), false); measured != 32768 {
 		t.Errorf("measured context = %d, want the main model's 32768", measured)
+	}
+}
+
+// The same transcribed log the scanner must not take as clean: the pass printed the full
+// load's cost (79170 MiB) before deciding it did not fit, then went on to fallbacks ending at
+// about a gigabyte. The first figure is the measurement; the fallbacks never are.
+func TestScanFitProbeKeepsTheProjectionOfALoadThatDoesNotFit(t *testing.T) {
+	total, verdict, _ := scanFitProbe(strings.NewReader(fitProbeTooSmallLog), false)
+	if verdict != fitTooSmall || total != 79170*1024*1024 {
+		t.Fatalf("verdict %v, total %d MiB; want too-small with the 79170 MiB projection", verdict, total/1024/1024)
+	}
+}
+
+func TestAcceptFitProbe(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		total        uint64
+		verdict      fitVerdict
+		hasProjector bool
+		want         bool
+	}{
+		{"fits", 1, fitClean, false, true},
+		{"fits, vision", 1, fitClean, true, true},
+		{"does not fit now: the projection is the load's cost", 1, fitTooSmall, false, true},
+		// The encoder graph is reserved only after the weights load, which this probe never reached.
+		{"does not fit now, vision: incomplete", 1, fitTooSmall, true, false},
+		{"no verdict: may be a degraded tail", 1, fitNoVerdict, false, false},
+		{"nothing read", 0, fitClean, false, false},
+	} {
+		if got := acceptFitProbe(tc.total, tc.verdict, tc.hasProjector) == nil; got != tc.want {
+			t.Errorf("%s: accepted = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

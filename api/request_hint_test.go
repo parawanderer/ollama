@@ -19,8 +19,12 @@ func TestRequestHintSanitized(t *testing.T) {
 		{"kept as sent, trimmed", &RequestHint{Use: " agent ", Session: " s1 "}, &RequestHint{Use: "agent", Session: "s1"}},
 		// Unknown values are recorded, not rejected: a newer client must not break an older server.
 		{"unknown use kept", &RequestHint{Use: "rerank"}, &RequestHint{Use: "rerank"}},
-		{"bounded", &RequestHint{Use: strings.Repeat("u", 100), Session: strings.Repeat("s", 500)},
-			&RequestHint{Use: strings.Repeat("u", hintUseMax), Session: strings.Repeat("s", hintSessionMax)}},
+		{"bounded", &RequestHint{Use: strings.Repeat("u", 100), Session: strings.Repeat("s", 500),
+			Request: strings.Repeat("r", 100), After: strings.Repeat("a", 100)},
+			&RequestHint{Use: strings.Repeat("u", hintUseMax), Session: strings.Repeat("s", hintSessionMax),
+				Request: strings.Repeat("r", hintRequestMax), After: strings.Repeat("a", hintAfterMax)}},
+		// Synthetic alone is still a hint: it keeps benchmark traffic out of learned usage.
+		{"synthetic alone", &RequestHint{Synthetic: true}, &RequestHint{Synthetic: true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := tc.in.Sanitized()

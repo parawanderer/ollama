@@ -207,27 +207,51 @@ type RequestHint struct {
 	// conversation or one agent run. ollama has no notion of a session otherwise, and the
 	// gaps between one session's requests are what a learned keep-alive is fitted to.
 	Session string `json:"session,omitempty"`
+
+	// Request is a client-chosen id for this one request, echoed on its gen.end so a client
+	// can match the event to its own call exactly rather than by model and end time.
+	Request string `json:"request,omitempty"`
+
+	// After says what the client was waiting on between its previous request in this session
+	// and this one, when it knows: "human" (an approval gate, a person deciding) or "tool" (a
+	// tool running). A long gap inside an agent run otherwise reads as the model no longer
+	// being wanted.
+	After string `json:"after,omitempty"`
+
+	// Synthetic marks generated traffic, such as benchmark sweeps, so it is served exactly as
+	// real traffic but kept out of what usage is learned from.
+	Synthetic bool `json:"synthetic,omitempty"`
 }
 
 // hintLimits bound what a caller can put in a hint, since it is copied into every event.
 const (
 	hintUseMax     = 32
 	hintSessionMax = 128
+	hintRequestMax = 64
+	hintAfterMax   = 32
 )
+
+func truncateTo(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
+}
 
 // Sanitized returns the hint trimmed to its limits, or nil if nothing is left.
 func (h *RequestHint) Sanitized() *RequestHint {
 	if h == nil {
 		return nil
 	}
-	out := RequestHint{Use: strings.TrimSpace(h.Use), Session: strings.TrimSpace(h.Session)}
-	if len(out.Use) > hintUseMax {
-		out.Use = out.Use[:hintUseMax]
+	out := RequestHint{
+		Use:       truncateTo(h.Use, hintUseMax),
+		Session:   truncateTo(h.Session, hintSessionMax),
+		Request:   truncateTo(h.Request, hintRequestMax),
+		After:     truncateTo(h.After, hintAfterMax),
+		Synthetic: h.Synthetic,
 	}
-	if len(out.Session) > hintSessionMax {
-		out.Session = out.Session[:hintSessionMax]
-	}
-	if out.Use == "" && out.Session == "" {
+	if out == (RequestHint{}) {
 		return nil
 	}
 	return &out

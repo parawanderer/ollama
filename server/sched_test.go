@@ -2538,6 +2538,35 @@ func TestSchedLoadFilesCalibrationAtTheGrantedContext(t *testing.T) {
 			"context x slots, so the per-slot figure would halve every multi-slot sample")
 }
 
+// A load with no GPU has no placement to decide, so it must not probe. It used to, on the CPU,
+// hit the 30 s probe timeout twice and record nothing, so every load of a CPU-pinned model
+// (num_gpu 0, as UIs do for small utility models) paid a minute.
+func TestSchedLoadWithoutGPUsDoesNotProbe(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer done()
+
+	s := InitScheduler(ctx)
+	probes := 0
+	s.fitProbe = func(context.Context, []ml.DeviceInfo, string, *ggml.GGML, []string, []string, api.Options, int, string, llm.LlamaServerConfig, int) (uint64, int, error) {
+		probes++
+		return 1 << 30, 8192, nil
+	}
+	scenario := newScenarioRequestWithContext(t, ctx, "cpu-only", 10, nil, map[ml.DeviceID]uint64{}, 131072)
+	scenario.req.opts.NumGPU = 0
+	scenario.req.opts.NumCtx = 8192
+	s.newServerFn = scenario.newServer
+
+	s.load(scenario.req, ml.SystemInfo{}, nil, false)
+	select {
+	case err := <-scenario.req.errCh:
+		t.Fatal(err)
+	case <-scenario.req.successCh:
+	}
+	if probes != 0 {
+		t.Fatalf("%d fit probes for a load with no GPU, want 0", probes)
+	}
+}
+
 // unmeasuredLlm is a runner whose engine reported no buffer sizes, so its MemorySize is the
 // file-size fallback rather than a measurement.
 type unmeasuredLlm struct{ *mockLlm }

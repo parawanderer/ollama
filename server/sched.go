@@ -977,9 +977,10 @@ func (s *Scheduler) processPending(ctx context.Context) {
 					if maxRunners <= 0 {
 						// No user specified MaxRunners, so figure out what automatic setting to use for the next load attempt
 						if pending.opts.NumGPU == 0 {
-							// Need to get actual GPU list to set the correct default max models
-							logutil.Trace("refreshing GPU list", "model", pending.model.ModelPath)
-							g := s.getGpuFn(ctx, runnersSnapshot)
+							// Only the number of GPUs is needed, which the device cache knows.
+							// Fresh discovery starts a llama-server on every GPU, and a CPU-pinned
+							// load has no reason to touch them.
+							g := s.cachedDevices(ctx)
 							maxRunners = uint(defaultModelsPerGPU * max(len(g), 1))
 						} else {
 							maxRunners = uint(defaultModelsPerGPU * max(len(gpus), 1))
@@ -1322,6 +1323,15 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 					// that will actually run, and the measurement it produces is filed where
 					// the next prediction for the same invocation will look.
 					key := vramCalibrationKey(req, placed, numParallel)
+
+					// A load with no GPU has no placement to decide and nothing a device
+					// probe can tell it. Probing anyway ran on the CPU, hit the 30 s probe
+					// timeout twice, and recorded nothing, so every load of a CPU-pinned
+					// model paid a minute (measured: 62.8 s to load gemma4:e4b with
+					// num_gpu 0, 60 of it probing).
+					if len(placed) == 0 {
+						return opts, key, predictLlamaServerVRAM(s.vramCalibration, key, req, f, predictedCtx), false
+					}
 
 					if decideOnly {
 						// Where the load goes depends only on what it costs at its own context,

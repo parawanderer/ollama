@@ -103,6 +103,10 @@ type Scheduler struct {
 	// rather than a read of activeLoading, which is written outside loadedMu.
 	loadingPID atomic.Int64
 
+	// deviceNames remembers what each device was called while healthy, for naming it after
+	// it faults. Nil in tests that do not set it; every method accepts that.
+	deviceNames *deviceNames
+
 	// events publishes model lifecycle transitions to /api/events subscribers, and ring
 	// retains them so a client that reconnects can be told what it missed rather than
 	// having a gap drawn over.
@@ -270,6 +274,7 @@ func (s *Scheduler) cachedDevices(ctx context.Context) []ml.DeviceInfo {
 	s.deviceCacheMu.Unlock()
 
 	devices := s.getGpuFn(ctx, s.runnerDiscoverySnapshot())
+	s.deviceNames.observe(devices)
 
 	s.deviceCacheMu.Lock()
 	s.deviceCache = devices

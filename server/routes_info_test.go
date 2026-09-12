@@ -245,6 +245,7 @@ func TestInfoHandlerReportsPhysicalMemoryWhenItDiffers(t *testing.T) {
 				return []ml.DeviceInfo{{
 					DeviceID:       ml.DeviceID{ID: "0", Library: "CUDA"},
 					Name:           "CUDA0",
+					Description:    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
 					TotalMemory:    usable,
 					PhysicalMemory: physical,
 					FreeMemory:     usable,
@@ -260,6 +261,10 @@ func TestInfoHandlerReportsPhysicalMemoryWhenItDiffers(t *testing.T) {
 	}
 	if gpu.PhysicalMemory != physical {
 		t.Errorf("physical_memory: got %d, want %d", gpu.PhysicalMemory, physical)
+	}
+	// The product name beside the backend's label, which stays as it was.
+	if gpu.Description != "NVIDIA RTX PRO 6000 Blackwell Workstation Edition" || gpu.Name != "CUDA0" {
+		t.Errorf("description %q, name %q", gpu.Description, gpu.Name)
 	}
 }
 

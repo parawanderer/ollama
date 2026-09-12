@@ -2021,6 +2021,7 @@ func Serve(ln net.Listener) error {
 	// discarded with them.
 	sched.vramCalibrationPath = filepath.Join(envconfig.Models(), "vram-calibration.json")
 	sched.vramCalibration.Load(sched.vramCalibrationPath)
+	sched.deviceNames = newDeviceNames(filepath.Join(envconfig.Models(), "device-names.json"))
 
 	sched.psFn = s.processResponse
 	sched.infoFn = s.infoResponse
@@ -2812,6 +2813,7 @@ func (s *Server) infoResponse() *api.InfoResponse {
 			MemoryBusWidthBits: dev.MemoryBusWidthBits,
 			MemoryClockMaxMHz:  dev.MemoryClockMaxMHz,
 			Name:               dev.Name,
+			Description:        dev.Description,
 			TotalMemory:        dev.TotalMemory,
 			PhysicalMemory:     dev.PhysicalMemory,
 			Processes:          gpuProcesses(processes[dev.PCIID], runnerPIDs),
@@ -2878,7 +2880,7 @@ func (s *Server) infoResponse() *api.InfoResponse {
 				FreeSwap:    sysInfo.FreeSwap,
 			},
 			SupportedGPUs:   gpus,
-			UnavailableGPUs: unavailableGPUs(devices),
+			UnavailableGPUs: unavailableGPUs(devices, s.sched.deviceNames),
 			Topology:        gpuTopology(devices),
 		},
 	}
@@ -2909,7 +2911,7 @@ func (s *Server) unavailableGPUsNow() []api.UnavailableGPU {
 	if s.sched == nil {
 		return nil
 	}
-	return unavailableGPUs(s.sched.cachedDevices(context.Background()))
+	return unavailableGPUs(s.sched.cachedDevices(context.Background()), s.sched.deviceNames)
 }
 
 // unavailableGPUs asks which devices the machine has that discovery did not return.
@@ -2918,7 +2920,7 @@ func (s *Server) unavailableGPUsNow() []api.UnavailableGPU {
 // subprocess. Devices without a PCI address are skipped rather than passed as an empty
 // string: an empty key would match nothing and every real device would then be reported as
 // unavailable, which is the loudest possible way to be wrong.
-func unavailableGPUs(found []ml.DeviceInfo) []api.UnavailableGPU {
+func unavailableGPUs(found []ml.DeviceInfo, names *deviceNames) []api.UnavailableGPU {
 	known := make([]string, 0, len(found))
 	for _, dev := range found {
 		if dev.PCIID != "" {
@@ -2933,12 +2935,12 @@ func unavailableGPUs(found []ml.DeviceInfo) []api.UnavailableGPU {
 
 	out := make([]api.UnavailableGPU, 0, len(unusable))
 	for _, d := range unusable {
-		out = append(out, unavailableGPU(d))
+		out = append(out, unavailableGPU(d, names))
 	}
 	return out
 }
 
-func unavailableGPU(d ml.UnavailableDevice) api.UnavailableGPU {
+func unavailableGPU(d ml.UnavailableDevice, names *deviceNames) api.UnavailableGPU {
 	gpu := api.UnavailableGPU{
 		PCIID:    d.PCIID,
 		Name:     d.Name,
@@ -2946,6 +2948,11 @@ func unavailableGPU(d ml.UnavailableDevice) api.UnavailableGPU {
 		Reason:   d.Reason,
 		Detail:   d.Detail,
 		Recovery: d.Recovery,
+	}
+	if seen, ok := names.lookup(d.PCIID); ok {
+		gpu.LastName = seen.Name
+		lastSeen := seen.LastSeen
+		gpu.LastSeen = &lastSeen
 	}
 	if d.Bus != nil {
 		gpu.Bus = &api.GPUBusState{

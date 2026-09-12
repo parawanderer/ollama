@@ -2068,6 +2068,12 @@ type GPUInfo struct {
 	// Name is the model or other identifying information about the GPU
 	Name string `json:"name"`
 
+	// Description is the device's product name as its driver reports it -- "NVIDIA RTX PRO
+	// 6000 Blackwell Workstation Edition" -- where Name is the backend's label for it
+	// ("CUDA0"). From the backend's own device description: cudaDeviceProp.name on CUDA and
+	// HIP, the Vulkan device name on Vulkan. Omitted when the backend gives none.
+	Description string `json:"description,omitempty"`
+
 	// TotalMemory is the amount of video memory on the GPU usable for loading models
 	TotalMemory uint64 `json:"total_memory"`
 
@@ -2215,6 +2221,17 @@ type UnavailableGPU struct {
 	// two identical GPUs the UUID is what distinguishes the broken one.
 	Name string `json:"name,omitempty"`
 	UUID string `json:"uuid,omitempty"`
+
+	// LastName is what supported_gpus[] called this bus address ("CUDA1") the last time the
+	// server enumerated it healthy, and LastSeen when that was. Remembered across restarts, so
+	// a card that faulted before the running server started can still be named. Absent when
+	// this server has never seen the address healthy.
+	//
+	// These names are enumeration order and shift when a card drops out -- with the first of
+	// two cards gone, the survivor is the new CUDA0 -- so LastName can equal a healthy card's
+	// current name. It says what this card was called, not what that name means now.
+	LastName string     `json:"last_name,omitempty"`
+	LastSeen *time.Time `json:"last_seen,omitempty"`
 
 	// Reason is a stable token to branch on. Detail is the driver's own wording, passed
 	// through unparaphrased so it can be searched for verbatim in vendor documentation --

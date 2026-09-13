@@ -24,7 +24,7 @@ import (
 )
 
 // The box profile measures this machine's decode speed, once, from a model ollama writes
-// itself. See api.BoxProfile for what it reports, and slop-zone notebooks/box-profile.ipynb for
+// itself. See api.BoxProfile for what it reports, and slop-zone notebooks/placement/box-profile.ipynb for
 // the measurements it rests on: on the machine it was built on, the numbers from a zero-weight
 // llama predicted real models' one-GPU decode within 2-4% and their tensor-split decode within
 // 2% (dense models and gpt-oss:120b).

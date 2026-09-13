@@ -7,7 +7,7 @@ import (
 )
 
 // The readings in these tests are transcribed from a real fault, captured live before the
-// GPU was reset: reports/captures/gpu1-gsp-fault-2026-09-11.json in the slop-zone repo. The
+// GPU was reset: reports/ui-api/captures/gpu1-gsp-fault-2026-09-11.json in the slop-zone repo. The
 // state cannot be reproduced on demand -- it took twelve days of uptime to happen once --
 // so a fixture recalled from memory would be the only alternative, and that is exactly how
 // a matcher that matches nothing gets written.

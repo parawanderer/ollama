@@ -574,7 +574,7 @@ const probeMinContext = 256
 // measurement, for one more ~0.5 s probe, once per model.
 //
 // Measured afterwards on all 31 models here trained past 131072 (slop-zone
-// notebooks/context-vs-vram.ipynb): the extrapolation was never off by more than 590 MiB
+// notebooks/placement/context-vs-vram.ipynb): the extrapolation was never off by more than 590 MiB
 // (0.4%, dsv4-flash), and by exactly 0 for 19 of them, because allocation is close to
 // linear in context. So the third point turned an assumption into a measurement rather than
 // correcting a real error. It pays past 262144, where the line's error grows with distance:
@@ -639,7 +639,7 @@ func probePoints(trainCtx, numParallel int) ([2]int, bool) {
 // Every model is measured, not only those whose metadata admits it cannot describe them.
 // That gate used to decide from metadata keys whether the metadata could be trusted, and it
 // was the last place the estimate was still believed: measured on 2026-09-11 across the 31
-// models here trained past 131072 (slop-zone notebooks/context-vs-vram.ipynb), the one model
+// models here trained past 131072 (slop-zone notebooks/placement/context-vs-vram.ipynb), the one model
 // it let through, qwen3:235b, was placed 9.3 GiB under what it uses at 262144, while every
 // probed line landed within 590 MiB. The metadata line is now only the first guess that
 // placement starts from, and settlePlacement corrects the placement when the measurement

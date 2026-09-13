@@ -15,7 +15,7 @@ import (
 // context), whether the model is measured by probe instead, and the probe's context pair.
 //
 // It is not a test of anything. It exists so a notebook can draw ollama's own prediction
-// rather than a re-implementation of it -- slop-zone/notebooks/context-vs-vram.ipynb runs
+// rather than a re-implementation of it -- slop-zone/notebooks/placement/context-vs-vram.ipynb runs
 // it with the model store mounted and OLLAMA_MODELS pointing at it. Skipped unless
 // SLOP_DUMP_MODELS names the models, comma-separated.
 func TestDumpPlacementInputs(t *testing.T) {

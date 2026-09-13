@@ -13,7 +13,7 @@ import (
 // exists to time the hardware: decode reads every weight once per token whatever its value, so
 // a model of zeros exercises the memory system exactly as a real model of the same shape does.
 // Measured on 2026-09-12: Q8_0 zeros and Q8_0 random values of one shape decoded within 1.1%
-// of each other (notebooks/box-profile.ipynb in slop-zone).
+// of each other (notebooks/placement/box-profile.ipynb in slop-zone).
 //
 // Zero weights make every activation zero, so the output is meaningless. Time it with a fixed
 // number of forced tokens; never read what it says.

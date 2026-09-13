@@ -1066,6 +1066,36 @@ type ExpectedDecode struct {
 	ActiveWeightsFraction float64 `json:"active_weights_fraction,omitempty"`
 }
 
+// DecodePrediction is what the box profile predicted for one generation's decode. It is made
+// from the state before the generation, so the generation did not teach the prediction it is
+// compared with, and it is the figure stored beside the measurement in the server's database.
+// Compare MsPerToken with timings.eval_ms / timings.decoded.
+type DecodePrediction struct {
+	// MsPerToken is the predicted milliseconds per decoded token at OccupancyTokens of
+	// context: ProfileMsPerToken times CorrectionFactor when Basis is "profile_corrected".
+	MsPerToken float64 `json:"ms_per_token"`
+
+	// OccupancyTokens is the context the prediction is made at: prompt_tokens + decoded / 2,
+	// the mean over the decode.
+	OccupancyTokens float64 `json:"occupancy_tokens"`
+
+	// Basis is "profile" (the machine's measured speed only) or "profile_corrected" (times the
+	// correction the model had earned on this kind of placement before this generation).
+	Basis string `json:"basis"`
+
+	// ProfileMsPerToken, CorrectionFactor and CorrectionSamples are present when corrected:
+	// the prediction before the correction, the factor, and how many earlier generations it
+	// rests on.
+	ProfileMsPerToken float64 `json:"profile_ms_per_token,omitempty"`
+	CorrectionFactor  float64 `json:"correction_factor,omitempty"`
+	CorrectionSamples int     `json:"correction_samples,omitempty"`
+
+	// ExcludesCacheRead is true when reading the KV cache is not in the prediction (a
+	// sliding-window model, whose cache read does not grow at one rate). The prediction is then
+	// a lower bound on the time.
+	ExcludesCacheRead bool `json:"excludes_cache_read,omitempty"`
+}
+
 // RooflineDevice is one device's share of a model's per-token reads.
 type RooflineDevice struct {
 	ID                     string `json:"gpu_id"`
@@ -2020,6 +2050,10 @@ type EventFrame struct {
 	// Hint is what the caller said the request was for, on a gen.end frame, when it said.
 	Hint *RequestHint `json:"hint,omitempty"`
 
+	// PredictedDecode is the box profile's prediction for this generation's decode, on a
+	// gen.end frame. See DecodePrediction.
+	PredictedDecode *DecodePrediction `json:"predicted_decode,omitempty"`
+
 	// Shape is the request's form, on a gen.end frame. See RequestShape.
 	Shape *RequestShape `json:"shape,omitempty"`
 
@@ -2159,6 +2193,10 @@ type ModelEvent struct {
 
 	// Hint is what the caller said the request was for, on a gen.end event, when it said.
 	Hint *RequestHint `json:"hint,omitempty"`
+
+	// PredictedDecode is the box profile's prediction for this generation's decode, on a
+	// gen.end event, when the machine has been measured. See DecodePrediction.
+	PredictedDecode *DecodePrediction `json:"predicted_decode,omitempty"`
 
 	// Shape is the request's form, on a gen.end event. See RequestShape.
 	Shape *RequestShape `json:"shape,omitempty"`

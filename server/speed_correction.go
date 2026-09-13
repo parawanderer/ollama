@@ -3,6 +3,7 @@ package server
 import (
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,11 +39,12 @@ func newSpeedCorrections() *speedCorrections {
 	return &speedCorrections{ratios: map[string][]float64{}}
 }
 
-// speedKey identifies what a correction applies to: a model on a set of devices, split one way.
-// It is built from the same strings the generations table stores, so a correction can be rebuilt
-// from the table.
-func speedKey(model, devices, split string) string {
-	return model + "|" + devices + "|" + split
+// speedKey identifies what a correction applies to: a model on a kind of device set, split one
+// way. deviceKinds is usageDeviceKinds, not the device names, so the same model on the other of
+// two identical cards shares its correction rather than starting over. It is built from strings
+// the generations table stores, so a correction can be rebuilt from the table.
+func speedKey(model, deviceKinds, split string) string {
+	return model + "|" + deviceKinds + "|" + split
 }
 
 // factor returns the median ratio for key and how many samples it rests on.
@@ -80,16 +82,23 @@ func (c *speedCorrections) add(key string, ratio float64) {
 // predictAndLearn fills a generation's row with the profile's prediction and, once the model has
 // earned one, the corrected prediction, then lets the generation teach the correction if its
 // timing is clean. The corrected prediction is made from what was learned before this
-// generation, so its error is an honest test of the correction rather than a fit to itself.
-func (s *Scheduler) predictAndLearn(key string, in decodeInputs, t api.GenerationTimings, row *usageGeneration) {
+// generation, so its error is an honest test of the correction rather than a fit to itself. It
+// returns the same prediction for gen.end, or nil when there is none.
+func (s *Scheduler) predictAndLearn(key string, in decodeInputs, t api.GenerationTimings, row *usageGeneration) *api.DecodePrediction {
 	ms, basis, ok := predictedEvalMs(in, t.PromptTokens, t.Decoded)
 	if !ok {
-		return
+		return nil
 	}
 	row.PredictedEvalMs, row.PredictedBasis = &ms, basis
+	out := &api.DecodePrediction{
+		MsPerToken: round3(ms), Basis: "profile", ExcludesCacheRead: basis == "profile_no_kv",
+		OccupancyTokens: float64(t.PromptTokens) + float64(t.Decoded)/2,
+	}
 	if factor, n := s.speed.factor(key); n >= correctionMinSamples {
 		corrected := ms * factor
 		row.CorrectedEvalMs, row.CorrectionSamples = &corrected, n
+		out.MsPerToken, out.Basis = round3(corrected), "profile_corrected"
+		out.ProfileMsPerToken, out.CorrectionFactor, out.CorrectionSamples = round3(ms), round3(factor), n
 	}
 	measured := t.EvalMs / float64(max(t.Decoded, 1))
 	if usableForCorrection(t.Decoded, row.Contended, ms) {
@@ -98,6 +107,7 @@ func (s *Scheduler) predictAndLearn(key string, in decodeInputs, t api.Generatio
 	slog.Debug("decode speed against the profile's prediction", "key", key,
 		"predicted_ms_per_token", ms, "corrected_ms_per_token", row.CorrectedEvalMs,
 		"measured_ms_per_token", measured, "basis", basis, "contended", row.Contended)
+	return out
 }
 
 // usable reports whether a generation's timing may teach the correction.
@@ -105,12 +115,15 @@ func usableForCorrection(decoded int, contended bool, predictedMs float64) bool 
 	return decoded >= correctionMinDecoded && !contended && predictedMs > 0
 }
 
-// loadSpeedCorrections rebuilds the corrections from the generations already recorded.
-func (d *serverDB) loadSpeedCorrections(c *speedCorrections) error {
+// loadSpeedCorrections rebuilds the corrections from the generations already recorded. Rows from
+// before device_kinds was recorded carry only device names; legacyKinds turns those into kinds
+// where it can, and rows it cannot are left out rather than guessed.
+func (d *serverDB) loadSpeedCorrections(c *speedCorrections, legacyKinds func(devices string) string) error {
 	if d == nil {
 		return nil
 	}
-	rows, err := d.db.Query(`SELECT model, coalesce(devices, ''), coalesce(split, ''), eval_ms, decoded, predicted_eval_ms_per_token
+	rows, err := d.db.Query(`SELECT model, coalesce(devices, ''), coalesce(device_kinds, ''), coalesce(split, ''),
+			eval_ms, decoded, predicted_eval_ms_per_token
 		FROM generations WHERE predicted_eval_ms_per_token > 0 AND decoded >= ? AND coalesce(contended, 0) = 0 ORDER BY id`,
 		correctionMinDecoded)
 	if err != nil {
@@ -118,15 +131,71 @@ func (d *serverDB) loadSpeedCorrections(c *speedCorrections) error {
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var model, devices, split string
+		var model, devices, kinds, split string
 		var evalMs, predicted float64
 		var decoded int
-		if err := rows.Scan(&model, &devices, &split, &evalMs, &decoded, &predicted); err != nil {
+		if err := rows.Scan(&model, &devices, &kinds, &split, &evalMs, &decoded, &predicted); err != nil {
 			return err
 		}
-		c.add(speedKey(model, devices, split), evalMs/float64(decoded)/predicted)
+		if kinds == "" && legacyKinds != nil {
+			kinds = legacyKinds(devices)
+		}
+		if kinds == "" {
+			continue
+		}
+		c.add(speedKey(model, kinds, split), evalMs/float64(decoded)/predicted)
 	}
 	return rows.Err()
+}
+
+// legacyDeviceKinds maps a row's device names ("CUDA0,CUDA1") to kinds using the devices present
+// now, but only for a library whose devices are all one kind. A name is an enumeration index, and
+// indexes shift when a card faults or is swapped, so "CUDA1 then" need not be "CUDA1 now"; when
+// every card of the library is the same kind, which one it was does not matter. On a mixed box
+// the row maps to nothing.
+func legacyDeviceKinds(gpus []ml.DeviceInfo) func(devices string) string {
+	kindOf := map[string]string{} // library -> its one kind, or "" when it has several
+	for _, g := range gpus {
+		k, seen := kindOf[g.Library]
+		switch {
+		case !seen:
+			kindOf[g.Library] = deviceKind(g)
+		case k != deviceKind(g):
+			kindOf[g.Library] = ""
+		}
+	}
+	return func(devices string) string {
+		if devices == "" {
+			return ""
+		}
+		var kinds []string
+		for _, name := range strings.Split(devices, ",") {
+			kind := ""
+			for lib, k := range kindOf {
+				if strings.HasPrefix(name, lib) && isDigits(name[len(lib):]) {
+					kind = k
+				}
+			}
+			if kind == "" {
+				return ""
+			}
+			kinds = append(kinds, kind)
+		}
+		slices.Sort(kinds)
+		return strings.Join(kinds, ",")
+	}
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // runnerUsage is what a runner's generation callback and the rest of the scheduler share about

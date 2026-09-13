@@ -1546,13 +1546,13 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 				// rather than read at fire time because the runner outlives this request.
 				modelName := req.model.Name
 				// Placement is fixed for the life of the runner, so it is captured once here.
-				devices, split, numBatch := usageDevices(loadGpus), usageSplit(loadGpus, launchOpts), launchOpts.NumBatch
+				devices, kinds, split, numBatch := usageDevices(loadGpus), usageDeviceKinds(loadGpus), usageSplit(loadGpus, launchOpts), launchOpts.NumBatch
 				runnerLlama := llama
 				gpuIDs := make([]ml.DeviceID, 0, len(loadGpus))
 				for _, g := range loadGpus {
 					gpuIDs = append(gpuIDs, g.DeviceID)
 				}
-				usage := &runnerUsage{key: speedKey(modelName, devices, split), gpus: gpuIDs}
+				usage := &runnerUsage{key: speedKey(modelName, kinds, split), gpus: gpuIDs}
 				loadingUsage = usage
 				layers, activeWeights, sliding := 0, 1.0, false
 				if f != nil {
@@ -1561,15 +1561,10 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 				}
 				llama.SetOnGenerationDone(func(t api.GenerationTimings, meta *api.GenerationMeta) {
 					timings := t
-					ev := api.ModelEvent{Type: EventGenEnd, Model: modelName, Timings: &timings}
-					if meta != nil {
-						ev.Hint, ev.Shape = meta.Hint, meta.Shape
-					}
-					s.publishEvent(ev)
 					numCtx, numCtxTotal := runnerLlama.GrantedContext()
 					row := usageGeneration{
 						At: time.Now(), Model: modelName, Timings: timings, Meta: meta,
-						Devices: devices, NumCtx: numCtx, NumBatch: numBatch, Split: split,
+						Devices: devices, DeviceKinds: kinds, NumCtx: numCtx, NumBatch: numBatch, Split: split,
 					}
 					// The profile's prediction for this generation, recorded beside what it
 					// measured, so the prediction's error is visible per model and placement.
@@ -1587,7 +1582,14 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 					// a measurement of the contention, not of the model.
 					sinceMs := time.Now().UnixMilli() - int64(timings.PromptMs+timings.EvalMs)
 					row.Contended = s.contended(usage, sinceMs)
-					s.predictAndLearn(usage.key, in, timings, &row)
+					// gen.end carries the prediction, so it is published once the prediction is
+					// made: from the state before this generation, the same figure the row stores.
+					ev := api.ModelEvent{Type: EventGenEnd, Model: modelName, Timings: &timings}
+					if meta != nil {
+						ev.Hint, ev.Shape = meta.Hint, meta.Shape
+					}
+					ev.PredictedDecode = s.predictAndLearn(usage.key, in, timings, &row)
+					s.publishEvent(ev)
 					s.db.recordGeneration(row)
 				})
 			}

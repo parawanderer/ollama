@@ -62,6 +62,51 @@ func TestSchedulerLearnsAModelsCorrection(t *testing.T) {
 	near(t, "raw ms still recorded", *row.PredictedEvalMs, raw, 1e-9)
 }
 
+// gen.end carries the prediction the row stores, made before the generation taught anything:
+// the UI compares it with the generation's measured speed, and a prediction that included the
+// generation's own sample would be fitted partly to what it predicts.
+func TestGenEndCarriesThePredictionMadeBeforeIt(t *testing.T) {
+	s := &Scheduler{speed: newSpeedCorrections()}
+	in := decodeInputs{
+		gpus:     []ml.DeviceID{decodeGPU0},
+		memByGPU: map[ml.DeviceID]api.MemoryBreakdown{decodeGPU0: {Weights: 5e9, KVCache: 1 << 30}},
+		fits:     map[ml.DeviceID]api.ProfileDevice{decodeGPU0: measuredFit},
+		layers:   36, activeWeights: 1, grantedCtxTotal: 8192,
+	}
+	raw, _, _ := predictedEvalMs(in, 100, 200)
+	timings := api.GenerationTimings{PromptTokens: 100, Decoded: 200, EvalMs: 2 * raw * 200}
+	var p *api.DecodePrediction
+	for range correctionMinSamples - 1 {
+		p = s.predictAndLearn("k", in, timings, &usageGeneration{})
+	}
+	if p == nil || p.Basis != "profile" || p.OccupancyTokens != 200 || p.ExcludesCacheRead {
+		t.Fatalf("before a correction: %+v, want basis profile at 100 + 200/2 tokens, cache read included", p)
+	}
+	near(t, "uncorrected ms", p.MsPerToken, round3(raw), 1e-9)
+
+	// The model now has two samples. This generation makes the third, and its prediction must
+	// not use it: it is still uncorrected.
+	if p = s.predictAndLearn("k", in, timings, &usageGeneration{}); p.Basis != "profile" {
+		t.Fatalf("the generation that earned the correction was predicted with it: %+v", p)
+	}
+	var row usageGeneration
+	p = s.predictAndLearn("k", in, timings, &row)
+	if p.Basis != "profile_corrected" || p.CorrectionSamples != correctionMinSamples {
+		t.Fatalf("after %d samples: %+v", correctionMinSamples, p)
+	}
+	near(t, "gen.end matches the row", p.MsPerToken, round3(*row.CorrectedEvalMs), 1e-9)
+	near(t, "profile ms", p.ProfileMsPerToken, round3(raw), 1e-9)
+
+	in.slidingWindow = true
+	if p = s.predictAndLearn("other", in, timings, &usageGeneration{}); !p.ExcludesCacheRead {
+		t.Errorf("a sliding-window prediction does not say it leaves out the cache read: %+v", p)
+	}
+	in.fits = nil
+	if p = s.predictAndLearn("other", in, timings, &usageGeneration{}); p != nil {
+		t.Errorf("an unmeasured machine predicted %+v", p)
+	}
+}
+
 // A generation shares its card's bandwidth with any other runner there working at the same
 // time; a runner on another card, or one that finished before the generation began, does not
 // count.
@@ -121,10 +166,10 @@ func TestSpeedCorrectionsAreRebuiltFromTheDatabase(t *testing.T) {
 	d.close()
 
 	c := newSpeedCorrections()
-	if err := testServerDB(t, dir).loadSpeedCorrections(c); err != nil {
+	if err := testServerDB(t, dir).loadSpeedCorrections(c, legacyDeviceKinds(pairOf("RTX", "RTX"))); err != nil {
 		t.Fatal(err)
 	}
-	f, n := c.factor(speedKey("m", "CUDA0", "none"))
+	f, n := c.factor(speedKey("m", "CUDA RTX", "none"))
 	if n != 3 || f != 1.5 {
 		t.Errorf("rebuilt %v from %d samples, want 1.5 from 3 (the contended and the short one left out)", f, n)
 	}
@@ -197,5 +242,56 @@ func TestRunnerUsageFollowsItsRequests(t *testing.T) {
 	}
 	if runner.usage.idleSinceMs.Load() < before {
 		t.Error("the runner went idle without recording when")
+	}
+}
+
+func pairOf(a, b string) []ml.DeviceInfo {
+	return []ml.DeviceInfo{
+		{DeviceID: ml.DeviceID{ID: "0", Library: "CUDA"}, Description: a},
+		{DeviceID: ml.DeviceID{ID: "1", Library: "CUDA"}, Description: b},
+	}
+}
+
+// A model moved to the other of two identical cards keeps its correction: the key is what the
+// cards are, not their index. On 2026-09-13 qwen3.5:0.8b had five samples on CUDA1 and, placed on
+// CUDA0, predicted 854 tok/s against 521 measured, because the key was the index.
+func TestSpeedCorrectionIsSharedByIdenticalCards(t *testing.T) {
+	gpus := pairOf("RTX", "RTX")
+	on0, on1 := usageDeviceKinds(gpus[:1]), usageDeviceKinds(gpus[1:])
+	if on0 != on1 {
+		t.Fatalf("identical cards have kinds %q and %q", on0, on1)
+	}
+	c := newSpeedCorrections()
+	for range 3 {
+		c.add(speedKey("m", on1, "none"), 1.6)
+	}
+	if f, n := c.factor(speedKey("m", on0, "none")); n != 3 || f != 1.6 {
+		t.Errorf("on the other card: factor %v from %d samples, want 1.6 from 3", f, n)
+	}
+	if mixed := pairOf("RTX", "GTX"); usageDeviceKinds(mixed[:1]) == usageDeviceKinds(mixed[1:]) {
+		t.Error("different cards share a kind")
+	}
+}
+
+// Rows from before device kinds were recorded carry names only. A name is an index, which shifts
+// when a card faults, so it is mapped to a kind only when every card of that library is the same
+// kind; on a mixed box the row is left out rather than guessed.
+func TestLegacyRowsMapToKindsOnlyOnAUniformBox(t *testing.T) {
+	uniform := legacyDeviceKinds(pairOf("RTX", "RTX"))
+	for devices, want := range map[string]string{
+		"CUDA0":       "CUDA RTX",
+		"CUDA1":       "CUDA RTX",
+		"CUDA1,CUDA0": "CUDA RTX,CUDA RTX",
+		"CUDA7":       "CUDA RTX", // a card missing now is still that kind
+		"ROCm0":       "",
+		"":            "",
+	} {
+		if got := uniform(devices); got != want {
+			t.Errorf("uniform box: %q -> %q, want %q", devices, got, want)
+		}
+	}
+	mixed := legacyDeviceKinds(pairOf("RTX", "GTX"))
+	if got := mixed("CUDA0"); got != "" {
+		t.Errorf("mixed box: CUDA0 -> %q, want nothing", got)
 	}
 }

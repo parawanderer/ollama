@@ -2032,9 +2032,6 @@ func Serve(ln net.Listener) error {
 	if err := sched.db.loadCalibration(sched.vramCalibration); err != nil {
 		slog.Warn("could not read memory calibration; loads will be measured again", "error", err)
 	}
-	if err := sched.db.loadSpeedCorrections(sched.speed); err != nil {
-		slog.Warn("could not read the decode speed corrections; they will be learned again", "error", err)
-	}
 	sched.deviceNames = newDeviceNames(sched.db)
 	// Measured once per GPUs, driver and engine, when the server is quiet.
 	sched.profiler = newBoxProfiler(sched.db)
@@ -2085,6 +2082,12 @@ func Serve(ln net.Listener) error {
 	// being thrown away. That is what lets the box profile, which never starts discovery
 	// itself, run on a server no client has asked anything yet.
 	s.sched.seedDeviceCache(gpus)
+	// After discovery, because rows recorded before device kinds were are mapped to kinds from
+	// the devices present. Nothing has been served yet: a generation needs a load, and serving
+	// starts below.
+	if err := s.sched.db.loadSpeedCorrections(s.sched.speed, legacyDeviceKinds(gpus)); err != nil {
+		slog.Warn("could not read the decode speed corrections; they will be learned again", "error", err)
+	}
 
 	var totalVRAM uint64
 	for _, gpu := range gpus {
@@ -2330,25 +2333,26 @@ func (s *Server) PsHandler(c *gin.Context) {
 // guards it.
 func frameFromEvent(ev api.ModelEvent, started time.Time) api.EventFrame {
 	f := api.EventFrame{
-		Kind:          ev.Type,
-		Model:         ev.Model,
-		Reason:        ev.Reason,
-		DurationMs:    ev.DurationMs,
-		WeightsMs:     ev.WeightsMs,
-		ContextMs:     ev.ContextMs,
-		SizeVRAM:      ev.SizeVRAM,
-		SizeTotal:     ev.SizeTotal,
-		Memory:        ev.Memory,
-		MemoryHost:    ev.MemoryHost,
-		WeightsOnDisk: ev.WeightsOnDisk,
-		Placement:     ev.Placement,
-		Timings:       ev.Timings,
-		Hint:          ev.Hint,
-		Shape:         ev.Shape,
-		Lease:         ev.Lease,
-		Estimate:      ev.Estimate,
-		Dropped:       ev.Dropped,
-		T:             ev.At.Sub(started).Milliseconds(),
+		Kind:            ev.Type,
+		Model:           ev.Model,
+		Reason:          ev.Reason,
+		DurationMs:      ev.DurationMs,
+		WeightsMs:       ev.WeightsMs,
+		ContextMs:       ev.ContextMs,
+		SizeVRAM:        ev.SizeVRAM,
+		SizeTotal:       ev.SizeTotal,
+		Memory:          ev.Memory,
+		MemoryHost:      ev.MemoryHost,
+		WeightsOnDisk:   ev.WeightsOnDisk,
+		Placement:       ev.Placement,
+		Timings:         ev.Timings,
+		Hint:            ev.Hint,
+		PredictedDecode: ev.PredictedDecode,
+		Shape:           ev.Shape,
+		Lease:           ev.Lease,
+		Estimate:        ev.Estimate,
+		Dropped:         ev.Dropped,
+		T:               ev.At.Sub(started).Milliseconds(),
 	}
 	// Bodies come from the event where it carried them -- a sample measured them at its
 	// own instant, and re-reading here would report a later moment under an earlier

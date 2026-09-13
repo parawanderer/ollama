@@ -166,9 +166,10 @@ func TestEventFrameCopiesEveryCommonField(t *testing.T) {
 			PromptTokens: 4098, PromptTokensCached: cachedTokens(4097),
 			PromptMs: 3.4, EvalMs: 111.5, Decoded: 40,
 		},
-		Hint:  &api.RequestHint{Use: "agent", Session: "chat-123"},
-		Shape: &api.RequestShape{Endpoint: "chat", Surface: "native", Messages: 2},
-		Lease: &api.LeaseInfo{Holder: "train.py", Devices: []string{"0000:03:00.0"}},
+		Hint:            &api.RequestHint{Use: "agent", Session: "chat-123"},
+		PredictedDecode: &api.DecodePrediction{MsPerToken: 14.3, OccupancyTokens: 200, Basis: "profile"},
+		Shape:           &api.RequestShape{Endpoint: "chat", Surface: "native", Messages: 2},
+		Lease:           &api.LeaseInfo{Holder: "train.py", Devices: []string{"0000:03:00.0"}},
 		Placement: &api.ModelPlacement{
 			NumLayers: 4,
 			Devices: []api.PlacementRange{

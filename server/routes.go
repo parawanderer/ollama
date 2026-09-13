@@ -2032,6 +2032,9 @@ func Serve(ln net.Listener) error {
 	if err := sched.db.loadCalibration(sched.vramCalibration); err != nil {
 		slog.Warn("could not read memory calibration; loads will be measured again", "error", err)
 	}
+	if err := sched.db.loadSpeedCorrections(sched.speed); err != nil {
+		slog.Warn("could not read the decode speed corrections; they will be learned again", "error", err)
+	}
 	sched.deviceNames = newDeviceNames(sched.db)
 	// Measured once per GPUs, driver and engine, when the server is quiet.
 	sched.profiler = newBoxProfiler(sched.db)
@@ -2484,7 +2487,8 @@ func (s *Server) processResponse() *api.ProcessResponse {
 			Activity:      v.activity,
 		}
 		row.Roofline = modelRoofline(v)
-		row.ExpectedDecode = expectedDecodeReport(decodeInputsFor(v, fits))
+		factor, samples := s.sched.speed.factor(v.speedKey)
+		row.ExpectedDecode = expectedDecodeReport(decodeInputsFor(v, fits), factor, samples)
 		if v.memVRAM.Total() > 0 {
 			breakdown := v.memVRAM
 			row.Memory = &breakdown

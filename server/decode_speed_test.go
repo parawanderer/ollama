@@ -95,7 +95,7 @@ func TestExpectedDecodeSaysWhyNot(t *testing.T) {
 			t.Errorf("%s: %q, want %q", name, why, tc.want)
 		}
 	}
-	if r := expectedDecodeReport(decodeInputs{fits: fits}); r != nil {
+	if r := expectedDecodeReport(decodeInputs{fits: fits}, 1, 0); r != nil {
 		t.Errorf("a model on no GPU got %+v; the field should be absent", r)
 	}
 }

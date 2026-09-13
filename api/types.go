@@ -1039,8 +1039,22 @@ type ExpectedDecode struct {
 	// "memory_unknown" -- the runner reported no weights on its devices
 	Unavailable string `json:"unavailable,omitempty"`
 
-	// TokensPerSec is the predicted decode speed with an empty cache.
+	// TokensPerSec is the predicted decode speed with an empty cache: the profile's prediction,
+	// times this model's learned correction once it has one (Basis says which).
 	TokensPerSec float64 `json:"tokens_per_sec,omitempty"`
+
+	// Basis is "profile" (the machine's measured speed only) or "profile_corrected" (times the
+	// correction this model has earned on this placement).
+	Basis string `json:"basis,omitempty"`
+
+	// ProfileTokensPerSec is the profile's prediction before the correction.
+	ProfileTokensPerSec float64 `json:"profile_tokens_per_sec,omitempty"`
+
+	// CorrectionFactor is the median of measured ÷ predicted time over this model's recent
+	// generations on this placement, excluding very short ones and any that shared a card with
+	// another model's work; CorrectionSamples is how many. Absent until there are three.
+	CorrectionFactor  float64 `json:"correction_factor,omitempty"`
+	CorrectionSamples int     `json:"correction_samples,omitempty"`
 
 	// MsPerTokenPer1kContext is how much longer each token takes for every thousand tokens
 	// already in the cache. Absent for a sliding-window model, whose cache read does not grow at

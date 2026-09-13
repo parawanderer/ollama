@@ -111,7 +111,7 @@ func activeWeightsFraction(f *ggml.GGML) float64 {
 
 // expectedDecodeReport is the /api/ps form: tokens per second at an empty cache, and how much
 // longer each token takes per thousand tokens already in the cache.
-func expectedDecodeReport(in decodeInputs) *api.ExpectedDecode {
+func expectedDecodeReport(in decodeInputs, factor float64, samples int) *api.ExpectedDecode {
 	baseMs, perCtxMs, perCtxOK, unavailable := expectedDecode(in)
 	switch unavailable {
 	case "not_on_gpu":
@@ -120,7 +120,13 @@ func expectedDecodeReport(in decodeInputs) *api.ExpectedDecode {
 	default:
 		return &api.ExpectedDecode{Unavailable: unavailable}
 	}
-	out := &api.ExpectedDecode{TokensPerSec: round3(1000 / baseMs)}
+	out := &api.ExpectedDecode{TokensPerSec: round3(1000 / baseMs), Basis: "profile"}
+	if samples >= correctionMinSamples && factor > 0 {
+		out.ProfileTokensPerSec = out.TokensPerSec
+		out.CorrectionFactor, out.CorrectionSamples = round3(factor), samples
+		out.TokensPerSec, out.Basis = round3(1000/(baseMs*factor)), "profile_corrected"
+		perCtxMs *= factor
+	}
 	if perCtxOK {
 		out.MsPerTokenPer1kContext = round3(perCtxMs * 1000)
 	}

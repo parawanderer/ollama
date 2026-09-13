@@ -38,6 +38,12 @@ type usageGeneration struct {
 	// predictedEvalMs). Nil until the machine has been measured.
 	PredictedEvalMs *float64
 	PredictedBasis  string
+	// CorrectedEvalMs is PredictedEvalMs times the model's learned correction, from the
+	// CorrectionSamples generations before this one; nil until there are enough. Contended marks
+	// a generation that shared a card with another runner's work, which teaches no correction.
+	CorrectedEvalMs   *float64
+	CorrectionSamples int
+	Contended         bool
 }
 
 // usageLoad is one completed load.
@@ -67,7 +73,8 @@ CREATE TABLE IF NOT EXISTS generations (
 	req_num_ctx INTEGER, req_num_gpu INTEGER, req_num_predict INTEGER, req_keep_alive_s INTEGER,
 	client TEXT,
 	devices TEXT, num_ctx INTEGER, num_batch INTEGER, split TEXT,
-	predicted_eval_ms_per_token REAL, predicted_basis TEXT
+	predicted_eval_ms_per_token REAL, predicted_basis TEXT,
+	corrected_eval_ms_per_token REAL, correction_samples INTEGER, contended INTEGER
 );
 CREATE INDEX IF NOT EXISTS generations_model_at ON generations(model, at_ms);
 CREATE INDEX IF NOT EXISTS generations_session_at ON generations(hint_session, at_ms);
@@ -90,6 +97,9 @@ CREATE INDEX IF NOT EXISTS loads_model_at ON loads(model, at_ms);
 var usageAddedColumns = []struct{ name, decl string }{
 	{"predicted_eval_ms_per_token", "REAL"},
 	{"predicted_basis", "TEXT"},
+	{"corrected_eval_ms_per_token", "REAL"},
+	{"correction_samples", "INTEGER"},
+	{"contended", "INTEGER"},
 }
 
 func (d *serverDB) recordGeneration(g usageGeneration) { d.enqueue(g) }
@@ -113,15 +123,17 @@ func insertGeneration(tx *sql.Tx, g usageGeneration) error {
 		hint_use, hint_session, hint_request, hint_after, hint_synthetic,
 		endpoint, surface, stream, messages, images, tools, format, think,
 		req_num_ctx, req_num_gpu, req_num_predict, req_keep_alive_s, client,
-		devices, num_ctx, num_batch, split, predicted_eval_ms_per_token, predicted_basis
-	) VALUES (?,?,?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,?)`,
+		devices, num_ctx, num_batch, split, predicted_eval_ms_per_token, predicted_basis,
+		corrected_eval_ms_per_token, correction_samples, contended
+	) VALUES (?,?,?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,?, ?,?,?)`,
 		g.At.UnixMilli(), g.Model, g.Timings.PromptTokens, g.Timings.PromptTokensCached, g.Timings.PromptMs,
 		g.Timings.EvalMs, g.Timings.Decoded, swapMs,
 		nullIfEmpty(hint.Use), nullIfEmpty(hint.Session), nullIfEmpty(hint.Request), nullIfEmpty(hint.After), boolInt(hint.Synthetic),
 		nullIfEmpty(shape.Endpoint), nullIfEmpty(shape.Surface), boolInt(shape.Stream), shape.Messages, shape.Images, shape.Tools,
 		boolInt(shape.Format), nullIfEmpty(shape.Think),
 		shape.NumCtx, shape.NumGPU, shape.NumPredict, shape.KeepAliveS, nullIfEmpty(shape.Client),
-		nullIfEmpty(g.Devices), g.NumCtx, g.NumBatch, nullIfEmpty(g.Split), g.PredictedEvalMs, nullIfEmpty(g.PredictedBasis))
+		nullIfEmpty(g.Devices), g.NumCtx, g.NumBatch, nullIfEmpty(g.Split), g.PredictedEvalMs, nullIfEmpty(g.PredictedBasis),
+		g.CorrectedEvalMs, g.CorrectionSamples, boolInt(g.Contended))
 	return err
 }
 

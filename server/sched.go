@@ -73,7 +73,10 @@ type Scheduler struct {
 	// one model at a time but new requests to models that already loaded can
 	// happen in parallel
 	activeLoading llm.LlamaServer
-	loaded        map[string]*runnerRef
+	// activeLoadingUsage is what activeLoading's generation callback shares with the runner
+	// that will hold it (speed_correction.go). Guarded like activeLoading.
+	activeLoadingUsage *runnerUsage
+	loaded             map[string]*runnerRef
 
 	// vramCalibration remembers what earlier loads actually used, so a repeat load of a
 	// model is predicted from measurement instead of from metadata alone.
@@ -155,6 +158,11 @@ type Scheduler struct {
 	// (server/box_profile.go); nil measures nothing.
 	profiler *boxProfiler
 
+	// speed learns each model's error against the profile's prediction, and usages says which
+	// runners were working when (server/speed_correction.go).
+	speed  *speedCorrections
+	usages usageRegistry
+
 	// fitProbe measures a load without performing it; nil means llm.ProbeFitVRAM. Swapped
 	// only by tests, which cannot run llama-server.
 	fitProbe        func(ctx context.Context, gpus []ml.DeviceInfo, modelPath string, f *ggml.GGML, adapters, projectors []string, opts api.Options, numParallel int, kvCacheType string, config llm.LlamaServerConfig, numCtx int) (uint64, int, error)
@@ -184,6 +192,7 @@ func InitScheduler(ctx context.Context) *Scheduler {
 		getSystemInfoFn: discover.GetSystemInfo,
 		waitForRecovery: 5 * time.Second,
 		vramCalibration: llm.NewVRAMCalibration(),
+		speed:           newSpeedCorrections(),
 		events:          newEventBus(),
 		ring:            newFrameRing(retainedWindow),
 		samplerWake:     make(chan struct{}, 1),
@@ -1110,6 +1119,7 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 			}
 			runner.refMu.Lock()
 			runner.refCount--
+			runner.usage.noteRequests(runner.refCount)
 			if runner.refCount <= 0 {
 				s.publishEvent(api.ModelEvent{Type: EventBusyEnd, Model: runner.name})
 				if runner.sessionDuration <= 0 {
@@ -1195,6 +1205,9 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 					name = runner.model.Name
 				}
 				runner.unload()
+				if runner.usage != nil {
+					runner.usage.unloaded.Store(true)
+				}
 				delete(s.loaded, runner.modelKey)
 				s.loadedMu.Unlock()
 				slog.Debug("runner terminated and removed from list, blocking for VRAM recovery", "runner", runner)
@@ -1217,6 +1230,7 @@ func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *Llm
 	runner.refMu.Lock()
 	defer runner.refMu.Unlock()
 	runner.refCount++
+	runner.usage.noteRequests(runner.refCount)
 	becameBusy = runner.refCount == 1
 	if runner.expireTimer != nil {
 		runner.expireTimer.Stop()
@@ -1259,6 +1273,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 
 	s.loadedMu.Lock()
 	llama := s.activeLoading
+	loadingUsage := s.activeLoadingUsage
 	var f *ggml.GGML
 	loadGpus := gpus
 	var launchOpts api.Options
@@ -1537,6 +1552,8 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 				for _, g := range loadGpus {
 					gpuIDs = append(gpuIDs, g.DeviceID)
 				}
+				usage := &runnerUsage{key: speedKey(modelName, devices, split), gpus: gpuIDs}
+				loadingUsage = usage
 				layers, activeWeights, sliding := 0, 1.0, false
 				if f != nil {
 					layers, activeWeights = int(f.KV().BlockCount()), activeWeightsFraction(f)
@@ -1566,12 +1583,11 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 					}
 					total, vram := runnerLlama.MemorySize()
 					in.partlyOnCPU = total > vram
-					if ms, basis, ok := predictedEvalMs(in, timings.PromptTokens, timings.Decoded); ok {
-						row.PredictedEvalMs, row.PredictedBasis = &ms, basis
-						slog.Debug("decode speed against the profile's prediction", "model", modelName,
-							"predicted_ms_per_token", ms, "measured_ms_per_token", timings.EvalMs/float64(max(timings.Decoded, 1)),
-							"basis", basis)
-					}
+					// Another runner on one of these cards working at the same time makes this
+					// a measurement of the contention, not of the model.
+					sinceMs := time.Now().UnixMilli() - int64(timings.PromptMs+timings.EvalMs)
+					row.Contended = s.contended(usage, sinceMs)
+					s.predictAndLearn(usage.key, in, timings, &row)
 					s.db.recordGeneration(row)
 				})
 			}
@@ -1596,6 +1612,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 		}
 
 		s.activeLoading = llama
+		s.activeLoadingUsage = loadingUsage
 		s.loadingPID.Store(int64(llama.Pid()))
 	} else {
 		wantPath := req.model.ModelPath
@@ -1703,6 +1720,7 @@ iGPUScan:
 		req.contextShift = resolveContextShift(req.shift, req.model)
 	}
 	runner := &runnerRef{
+		usage:           loadingUsage,
 		model:           req.model,
 		modelPath:       req.model.ModelPath,
 		modelKey:        schedulerModelKey(req.model),
@@ -1754,7 +1772,9 @@ iGPUScan:
 		oldRunner.refMu.Unlock()
 	}
 	s.activeLoading = nil
+	s.activeLoadingUsage = nil
 	s.loaded[runner.modelKey] = runner
+	s.usages.add(runner.usage)
 	slog.Info("loaded runners", "count", len(s.loaded))
 	s.loadedMu.Unlock()
 
@@ -1783,6 +1803,7 @@ iGPUScan:
 			runner.pid = llama.Pid()
 		}
 		runner.refCount++
+		runner.usage.noteRequests(runner.refCount)
 		if runner.refCount == 1 {
 			s.publishEvent(api.ModelEvent{Type: EventBusyStart, Model: req.model.Name})
 			s.publishEvent(api.ModelEvent{Type: EventGenStart, Model: req.model.Name})
@@ -2479,6 +2500,9 @@ type runnerRef struct {
 	// its weights one token reads.
 	layers        int
 	activeWeights float64
+	// usage is shared with this runner's generation callback (speed_correction.go). nil for a
+	// runner that is not a llama-server.
+	usage *runnerUsage
 
 	refMu    sync.Mutex
 	refCount uint // prevent unloading if > 0
@@ -2958,6 +2982,7 @@ type loadedModel struct {
 	grantedCtxTotal int
 	layers          int
 	activeWeights   float64
+	speedKey        string
 }
 
 // loadedModels returns a snapshot of the currently loaded models for status
@@ -3144,6 +3169,9 @@ func (r *runnerRef) reportLocked() loadedModel {
 		lm.expertCount = r.expertCount
 		lm.slidingWindow = r.slidingWindow
 		lm.layers, lm.activeWeights = r.layers, r.activeWeights
+		if r.usage != nil {
+			lm.speedKey = r.usage.key
+		}
 		_, lm.grantedCtxTotal = r.llama.GrantedContext()
 		// Briefly cached inside the runner, so a polled /api/ps does not make one HTTP
 		// round trip per resident model per request.

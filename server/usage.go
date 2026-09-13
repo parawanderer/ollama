@@ -53,6 +53,10 @@ type usageGeneration struct {
 	NumCtx   int
 	NumBatch int
 	Split    string
+	// The box profile's predicted milliseconds per decoded token, and what it includes (see
+	// predictedEvalMs). Nil until the machine has been measured.
+	PredictedEvalMs *float64
+	PredictedBasis  string
 }
 
 // usageLoad is one completed load.
@@ -82,7 +86,8 @@ CREATE TABLE IF NOT EXISTS generations (
 	format INTEGER, think TEXT,
 	req_num_ctx INTEGER, req_num_gpu INTEGER, req_num_predict INTEGER, req_keep_alive_s INTEGER,
 	client TEXT,
-	devices TEXT, num_ctx INTEGER, num_batch INTEGER, split TEXT
+	devices TEXT, num_ctx INTEGER, num_batch INTEGER, split TEXT,
+	predicted_eval_ms_per_token REAL, predicted_basis TEXT
 );
 CREATE INDEX IF NOT EXISTS generations_model_at ON generations(model, at_ms);
 CREATE INDEX IF NOT EXISTS generations_session_at ON generations(hint_session, at_ms);
@@ -99,6 +104,40 @@ CREATE TABLE IF NOT EXISTS loads (
 CREATE INDEX IF NOT EXISTS loads_model_at ON loads(model, at_ms);
 `
 
+// usageAddedColumns are columns added after the table was first created. CREATE TABLE IF NOT
+// EXISTS leaves an existing table as it was, so a database from an earlier build gains them here.
+// Append only: a column is never renamed or dropped, so old rows stay readable.
+var usageAddedColumns = []struct{ name, decl string }{
+	{"predicted_eval_ms_per_token", "REAL"},
+	{"predicted_basis", "TEXT"},
+}
+
+// addMissingColumns adds each column the table lacks.
+func addMissingColumns(db *sql.DB, table string, cols []struct{ name, decl string }) error {
+	rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return err
+	}
+	have := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return err
+		}
+		have[name] = true
+	}
+	rows.Close()
+	for _, c := range cols {
+		if !have[c.name] {
+			if _, err := db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, c.name, c.decl)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 const usageBuffer = 4096
 
 // openUsageStore opens (creating if needed) the database at path. A store that cannot be
@@ -110,6 +149,10 @@ func openUsageStore(path string) (*usageStore, error) {
 	}
 	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(usageSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("usage schema: %w", err)
+	}
+	if err := addMissingColumns(db, "generations", usageAddedColumns); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("usage schema: %w", err)
 	}
@@ -222,15 +265,15 @@ func insertGeneration(tx *sql.Tx, g usageGeneration) error {
 		hint_use, hint_session, hint_request, hint_after, hint_synthetic,
 		endpoint, surface, stream, messages, images, tools, format, think,
 		req_num_ctx, req_num_gpu, req_num_predict, req_keep_alive_s, client,
-		devices, num_ctx, num_batch, split
-	) VALUES (?,?,?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?)`,
+		devices, num_ctx, num_batch, split, predicted_eval_ms_per_token, predicted_basis
+	) VALUES (?,?,?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,?)`,
 		g.At.UnixMilli(), g.Model, g.Timings.PromptTokens, g.Timings.PromptTokensCached, g.Timings.PromptMs,
 		g.Timings.EvalMs, g.Timings.Decoded, swapMs,
 		nullIfEmpty(hint.Use), nullIfEmpty(hint.Session), nullIfEmpty(hint.Request), nullIfEmpty(hint.After), boolInt(hint.Synthetic),
 		nullIfEmpty(shape.Endpoint), nullIfEmpty(shape.Surface), boolInt(shape.Stream), shape.Messages, shape.Images, shape.Tools,
 		boolInt(shape.Format), nullIfEmpty(shape.Think),
 		shape.NumCtx, shape.NumGPU, shape.NumPredict, shape.KeepAliveS, nullIfEmpty(shape.Client),
-		nullIfEmpty(g.Devices), g.NumCtx, g.NumBatch, nullIfEmpty(g.Split))
+		nullIfEmpty(g.Devices), g.NumCtx, g.NumBatch, nullIfEmpty(g.Split), g.PredictedEvalMs, nullIfEmpty(g.PredictedBasis))
 	return err
 }
 

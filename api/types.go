@@ -1027,6 +1027,31 @@ type ModelRoofline struct {
 	Devices []RooflineDevice `json:"devices,omitempty"`
 }
 
+// ExpectedDecode is the decode speed this machine's measured profile (compute.profile on
+// /api/info) predicts for a model where it is placed now. Unlike the roofline, which is a
+// ceiling from rated bandwidth, it is a prediction: it uses the bandwidth decode actually
+// achieves and the per-token and per-layer overheads the profile measured. Every generation
+// records the same prediction beside its measured speed, so how far off it is can be checked.
+type ExpectedDecode struct {
+	// Unavailable, when set, says why no prediction is given, and the other fields are absent:
+	// "profile_pending" -- the machine has not been measured yet
+	// "partly_on_cpu" -- spilled layers run at host-memory speed, which is not measured
+	// "memory_unknown" -- the runner reported no weights on its devices
+	Unavailable string `json:"unavailable,omitempty"`
+
+	// TokensPerSec is the predicted decode speed with an empty cache.
+	TokensPerSec float64 `json:"tokens_per_sec,omitempty"`
+
+	// MsPerTokenPer1kContext is how much longer each token takes for every thousand tokens
+	// already in the cache. Absent for a sliding-window model, whose cache read does not grow at
+	// one rate.
+	MsPerTokenPer1kContext float64 `json:"ms_per_token_per_1k_context,omitempty"`
+
+	// ActiveWeightsFraction is the share of the weights one token reads, present only for a
+	// mixture of experts: the expert tensors count at experts used ÷ experts.
+	ActiveWeightsFraction float64 `json:"active_weights_fraction,omitempty"`
+}
+
 // RooflineDevice is one device's share of a model's per-token reads.
 type RooflineDevice struct {
 	ID                     string `json:"gpu_id"`
@@ -1062,6 +1087,10 @@ type ProcessModelResponse struct {
 	// Roofline is the decode ceiling this placement allows. Absent for a model that is not on
 	// a GPU; present with Unavailable set when a ceiling cannot honestly be computed.
 	Roofline *ModelRoofline `json:"roofline,omitempty"`
+
+	// ExpectedDecode is the decode speed the machine's measured profile predicts for this
+	// placement. Absent for a model that is not on a GPU.
+	ExpectedDecode *ExpectedDecode `json:"expected_decode,omitempty"`
 
 	// ContextLength is the context the engine allocated per slot, which is what a client
 	// can actually fill. It is not necessarily the num_ctx that was requested: llama.cpp

@@ -2421,6 +2421,7 @@ func modelRoofline(v loadedModel) *api.ModelRoofline {
 
 func (s *Server) processResponse() *api.ProcessResponse {
 	models := []api.ProcessModelResponse{}
+	fits := s.sched.profileFits()
 
 	for _, v := range s.sched.loadedModels() {
 		if v.loading {
@@ -2481,6 +2482,7 @@ func (s *Server) processResponse() *api.ProcessResponse {
 			Activity:      v.activity,
 		}
 		row.Roofline = modelRoofline(v)
+		row.ExpectedDecode = expectedDecodeReport(decodeInputsFor(v, fits))
 		if v.memVRAM.Total() > 0 {
 			breakdown := v.memVRAM
 			row.Memory = &breakdown

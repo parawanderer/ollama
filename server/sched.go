@@ -1539,6 +1539,15 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 				// Placement is fixed for the life of the runner, so it is captured once here.
 				devices, split, numBatch := usageDevices(loadGpus), usageSplit(loadGpus, launchOpts), launchOpts.NumBatch
 				runnerLlama := llama
+				gpuIDs := make([]ml.DeviceID, 0, len(loadGpus))
+				for _, g := range loadGpus {
+					gpuIDs = append(gpuIDs, g.DeviceID)
+				}
+				layers, activeWeights, sliding := 0, 1.0, false
+				if f != nil {
+					layers, activeWeights = int(f.KV().BlockCount()), activeWeightsFraction(f)
+					sliding = f.KV().Uint("attention.sliding_window") > 0
+				}
 				llama.SetOnGenerationDone(func(t api.GenerationTimings, meta *api.GenerationMeta) {
 					timings := t
 					ev := api.ModelEvent{Type: EventGenEnd, Model: modelName, Timings: &timings}
@@ -1546,11 +1555,30 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 						ev.Hint, ev.Shape = meta.Hint, meta.Shape
 					}
 					s.publishEvent(ev)
-					numCtx, _ := runnerLlama.GrantedContext()
-					s.usage.recordGeneration(usageGeneration{
+					numCtx, numCtxTotal := runnerLlama.GrantedContext()
+					row := usageGeneration{
 						At: time.Now(), Model: modelName, Timings: timings, Meta: meta,
 						Devices: devices, NumCtx: numCtx, NumBatch: numBatch, Split: split,
-					})
+					}
+					// The profile's prediction for this generation, recorded beside what it
+					// measured, so the prediction's error is visible per model and placement.
+					in := decodeInputs{
+						gpus: gpuIDs, fits: s.profileFits(), layers: layers, activeWeights: activeWeights,
+						slidingWindow: sliding, grantedCtxTotal: numCtxTotal,
+						memByGPU: make(map[ml.DeviceID]api.MemoryBreakdown, len(gpuIDs)),
+					}
+					for _, d := range gpuIDs {
+						in.memByGPU[d] = runnerLlama.MemoryBreakdownByGPU(d)
+					}
+					total, vram := runnerLlama.MemorySize()
+					in.partlyOnCPU = total > vram
+					if ms, basis, ok := predictedEvalMs(in, timings.PromptTokens, timings.Decoded); ok {
+						row.PredictedEvalMs, row.PredictedBasis = &ms, basis
+						slog.Debug("decode speed against the profile's prediction", "model", modelName,
+							"predicted_ms_per_token", ms, "measured_ms_per_token", timings.EvalMs/float64(max(timings.Decoded, 1)),
+							"basis", basis)
+					}
+					s.usage.recordGeneration(row)
 				})
 			}
 			if err != nil {
@@ -1709,6 +1737,8 @@ iGPUScan:
 	if f != nil {
 		runner.expertCount = int(f.KV().Uint("expert_count"))
 		runner.slidingWindow = f.KV().Uint("attention.sliding_window") > 0
+		runner.layers = int(f.KV().BlockCount())
+		runner.activeWeights = activeWeightsFraction(f)
 	}
 	runner.stillLoading.Store(true)
 	runner.numParallel = numParallel
@@ -2454,6 +2484,10 @@ type runnerRef struct {
 	pciByGPU       map[ml.DeviceID]string
 	expertCount    int
 	slidingWindow  bool
+	// For the expected decode speed (decode_speed.go): the model's layer count and the share of
+	// its weights one token reads.
+	layers        int
+	activeWeights float64
 
 	refMu    sync.Mutex
 	refCount uint // prevent unloading if > 0
@@ -2931,6 +2965,8 @@ type loadedModel struct {
 	expertCount     int
 	slidingWindow   bool
 	grantedCtxTotal int
+	layers          int
+	activeWeights   float64
 }
 
 // loadedModels returns a snapshot of the currently loaded models for status
@@ -3116,6 +3152,7 @@ func (r *runnerRef) reportLocked() loadedModel {
 		lm.pciByGPU = r.pciByGPU
 		lm.expertCount = r.expertCount
 		lm.slidingWindow = r.slidingWindow
+		lm.layers, lm.activeWeights = r.layers, r.activeWeights
 		_, lm.grantedCtxTotal = r.llama.GrantedContext()
 		// Briefly cached inside the runner, so a polled /api/ps does not make one HTTP
 		// round trip per resident model per request.

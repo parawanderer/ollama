@@ -6,10 +6,8 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
-	"log/slog"
 	"math"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -20,27 +18,10 @@ import (
 	"github.com/ollama/ollama/ml"
 )
 
-// usageStore keeps one row per finished generation and one per load, in SQLite beside the
-// models. This is the high-volume record: the calibration store holds at most eight samples
-// per key and stays JSON, while this grows with every request, so it gets a database.
-//
-// What it is for: the learned keep-alive and the per-model speed store need the history of
-// what was requested, how it was served and how long it took, from every client. The event
-// stream carries the same facts but keeps ten minutes of them.
-//
-// What it never holds: anything a person wrote. A row has counts, timings, the caller's hint
-// and a salted client hash, never a prompt or a reply.
-//
-// Writes go through a buffered channel to one goroutine that commits in batches, so a request
-// never waits on the disk. If the buffer is full the row is dropped and counted rather than
-// blocking the scheduler.
-type usageStore struct {
-	db      *sql.DB
-	rows    chan any
-	dropped atomic.Int64
-	done    chan struct{}
-	closeMu sync.Once
-}
+// Usage: one row per finished generation and one per load, in the server database
+// (server_db.go). What it is for: the learned keep-alive and the per-model speed store need the
+// history of what was requested, how it was served and how long it took, from every client. The
+// event stream carries the same facts but keeps ten minutes of them.
 
 // usageGeneration is one finished generation.
 type usageGeneration struct {
@@ -74,7 +55,6 @@ type usageLoad struct {
 }
 
 const usageSchema = `
-CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS generations (
 	id INTEGER PRIMARY KEY,
 	at_ms INTEGER NOT NULL,
@@ -112,140 +92,8 @@ var usageAddedColumns = []struct{ name, decl string }{
 	{"predicted_basis", "TEXT"},
 }
 
-// addMissingColumns adds each column the table lacks.
-func addMissingColumns(db *sql.DB, table string, cols []struct{ name, decl string }) error {
-	rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, table)
-	if err != nil {
-		return err
-	}
-	have := map[string]bool{}
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			rows.Close()
-			return err
-		}
-		have[name] = true
-	}
-	rows.Close()
-	for _, c := range cols {
-		if !have[c.name] {
-			if _, err := db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, c.name, c.decl)); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-const usageBuffer = 4096
-
-// openUsageStore opens (creating if needed) the database at path. A store that cannot be
-// opened is not an error for the server: usage is recorded when possible, never required.
-func openUsageStore(path string) (*usageStore, error) {
-	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_busy_timeout=5000&_synchronous=NORMAL")
-	if err != nil {
-		return nil, err
-	}
-	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(usageSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("usage schema: %w", err)
-	}
-	if err := addMissingColumns(db, "generations", usageAddedColumns); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("usage schema: %w", err)
-	}
-	u := &usageStore{db: db, rows: make(chan any, usageBuffer), done: make(chan struct{})}
-	if salt, err := u.salt(); err == nil {
-		clientSalt.Store(salt)
-	}
-	go u.writer()
-	return u, nil
-}
-
-// salt returns this server's client-hash salt, creating it once. Persisted so a client's id is
-// stable across restarts; random so it means nothing on any other server.
-func (u *usageStore) salt() (string, error) {
-	var s string
-	err := u.db.QueryRow(`SELECT value FROM meta WHERE key = 'client_salt'`).Scan(&s)
-	if err == nil {
-		return s, nil
-	}
-	s = randomHex(16)
-	_, err = u.db.Exec(`INSERT OR IGNORE INTO meta (key, value) VALUES ('client_salt', ?)`, s)
-	if err != nil {
-		return "", err
-	}
-	return s, u.db.QueryRow(`SELECT value FROM meta WHERE key = 'client_salt'`).Scan(&s)
-}
-
-func (u *usageStore) recordGeneration(g usageGeneration) { u.enqueue(g) }
-func (u *usageStore) recordLoad(l usageLoad)             { u.enqueue(l) }
-
-func (u *usageStore) enqueue(row any) {
-	if u == nil {
-		return
-	}
-	select {
-	case u.rows <- row:
-	default:
-		if u.dropped.Add(1)%1000 == 1 {
-			slog.Warn("usage store is behind; dropping rows", "dropped", u.dropped.Load())
-		}
-	}
-}
-
-func (u *usageStore) writer() {
-	defer close(u.done)
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	var batch []any
-	flush := func() {
-		if len(batch) == 0 {
-			return
-		}
-		if err := u.write(batch); err != nil {
-			slog.Warn("could not record usage", "rows", len(batch), "error", err)
-		}
-		batch = batch[:0]
-	}
-	for {
-		select {
-		case row, ok := <-u.rows:
-			if !ok {
-				flush()
-				return
-			}
-			batch = append(batch, row)
-			if len(batch) >= 256 {
-				flush()
-			}
-		case <-ticker.C:
-			flush()
-		}
-	}
-}
-
-func (u *usageStore) write(batch []any) error {
-	tx, err := u.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback() //nolint:errcheck
-	for _, row := range batch {
-		switch r := row.(type) {
-		case usageGeneration:
-			err = insertGeneration(tx, r)
-		case usageLoad:
-			err = insertLoad(tx, r)
-		}
-		if err != nil {
-			return err
-		}
-	}
-	return tx.Commit()
-}
+func (d *serverDB) recordGeneration(g usageGeneration) { d.enqueue(g) }
+func (d *serverDB) recordLoad(l usageLoad)             { d.enqueue(l) }
 
 func insertGeneration(tx *sql.Tx, g usageGeneration) error {
 	var hint api.RequestHint
@@ -289,19 +137,6 @@ func insertLoad(tx *sql.Tx, l usageLoad) error {
 		l.At.UnixMilli(), l.Model, e.Predicted, e.PredictedForLoad, nullIfEmpty(e.Source), e.NumCtx, e.NumGPU, e.NumBatch,
 		nullIfEmpty(l.Devices), nullIfEmpty(l.Split), l.SizeVRAM, l.SizeTotal, l.WeightsMs, l.ContextMs, l.TotalMs)
 	return err
-}
-
-// close flushes what is buffered and closes the database.
-func (u *usageStore) close() {
-	if u == nil {
-		return
-	}
-	u.closeMu.Do(func() {
-		close(u.rows)
-		<-u.done
-		_, _ = u.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
-		u.db.Close()
-	})
 }
 
 func nullIfEmpty(s string) any {

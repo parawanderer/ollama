@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -56,7 +57,7 @@ func (m fakeMachine) time(_ context.Context, gpus []ml.DeviceInfo, path string, 
 }
 
 func newTestProfiler(t *testing.T, m fakeMachine) (*boxProfiler, *time.Time) {
-	p := newBoxProfiler(filepath.Join(t.TempDir(), "box-profile.json"))
+	p := newBoxProfiler(testServerDB(t, t.TempDir()))
 	p.timeFn = m.time
 	p.engineFn = func() string { return "engine-1" }
 	now := time.Unix(1_800_000_000, 0)
@@ -243,29 +244,39 @@ func TestProfileIdentity(t *testing.T) {
 	}
 }
 
-// Measured once, kept across restarts, and reported with the ids the devices have now.
+// Measured once, kept across restarts in the database, and reported with the ids the devices
+// have now.
 func TestProfileSurvivesARestart(t *testing.T) {
-	m := fakeMachine{a: 0.1, c: 0.02, bw: 1e9}
+	m := fakeMachine{a: 0.1, c: 0.02, bw: 1e9, ell: 0.01}
+	dir := t.TempDir()
+	db := testServerDB(t, dir)
 	p, _ := newTestProfiler(t, m)
-	gpus := []ml.DeviceInfo{profileGPU("0", "0000:01:00.0")}
+	p.db = db
+	gpus := []ml.DeviceInfo{profileGPU("0", "0000:01:00.0"), profileGPU("1", "0000:03:00.0")}
 	if !p.tick(t.Context(), func() ([]ml.DeviceInfo, string) { return gpus, "" }) {
 		t.Fatal("not measured")
 	}
+	want := p.report(gpus)
+	db.close()
 
-	q := newBoxProfiler(p.path)
+	q := newBoxProfiler(testServerDB(t, dir))
 	q.engineFn = p.engineFn
-	renumbered := gpus[0]
-	renumbered.ID = "7"
-	r := q.report([]ml.DeviceInfo{renumbered})
-	if r.State != "measured" || len(r.Devices) != 1 || r.Devices[0].ID != "7" {
+	renumbered := []ml.DeviceInfo{gpus[0], gpus[1]}
+	renumbered[0].ID, renumbered[1].ID = "7", "8"
+	r := q.report(renumbered)
+	if r.State != "measured" || len(r.Devices) != 2 || r.Devices[0].ID != "7" {
 		t.Fatalf("after restart = %+v", r)
+	}
+	r.Devices[0].ID, r.Devices[1].ID = "0", "1"
+	if !reflect.DeepEqual(r.Devices, want.Devices) || !reflect.DeepEqual(r.Links, want.Links) || !r.MeasuredAt.Equal(*want.MeasuredAt) {
+		t.Errorf("after restart\n  %+v\nwant\n  %+v", r, want)
 	}
 	q.timeFn = func(context.Context, []ml.DeviceInfo, string, bool) (float64, error) {
 		t.Fatal("a stored profile was measured again")
 		return 0, nil
 	}
 	q.lastBusy = time.Time{}
-	q.tick(t.Context(), func() ([]ml.DeviceInfo, string) { return []ml.DeviceInfo{renumbered}, "" })
+	q.tick(t.Context(), func() ([]ml.DeviceInfo, string) { return renumbered, "" })
 }
 
 func TestProfileCandidates(t *testing.T) {

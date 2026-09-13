@@ -2,7 +2,6 @@ package server
 
 import (
 	"encoding/json"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -17,7 +16,7 @@ func cudaDev(pci, name string) ml.DeviceInfo {
 // With the first of two cards gone the survivor is the new CUDA0. The faulted card must
 // keep the name it had, not inherit the shift.
 func TestDeviceNamesKeepWhatAFaultedCardWasCalled(t *testing.T) {
-	d := newDeviceNames("")
+	d := newDeviceNames(nil)
 	d.observe([]ml.DeviceInfo{cudaDev("0000:01:00.0", "CUDA0"), cudaDev("0000:03:00.0", "CUDA1")})
 	d.observe([]ml.DeviceInfo{cudaDev("0000:03:00.0", "CUDA0")}) // 01:00.0 faulted and left
 
@@ -34,10 +33,12 @@ func TestDeviceNamesKeepWhatAFaultedCardWasCalled(t *testing.T) {
 
 // The case that happened: the server restarted after the card had already faulted.
 func TestDeviceNamesSurviveARestart(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "device-names.json")
-	newDeviceNames(path).observe([]ml.DeviceInfo{cudaDev("0000:01:00.0", "CUDA0"), cudaDev("0000:03:00.0", "CUDA1")})
+	dir := t.TempDir()
+	db := testServerDB(t, dir)
+	newDeviceNames(db).observe([]ml.DeviceInfo{cudaDev("0000:01:00.0", "CUDA0"), cudaDev("0000:03:00.0", "CUDA1")})
+	db.close()
 
-	restarted := newDeviceNames(path)
+	restarted := newDeviceNames(testServerDB(t, dir))
 	if s, ok := restarted.lookup("0000:03:00.0"); !ok || s.Name != "CUDA1" || s.LastSeen.IsZero() {
 		t.Fatalf("after a restart: %+v %v, want CUDA1 with a time", s, ok)
 	}
@@ -47,7 +48,7 @@ func TestDeviceNamesSurviveARestart(t *testing.T) {
 // name changes or the last write is older than the persist interval.
 func TestDeviceNamesDoNotRewriteOnEveryRefresh(t *testing.T) {
 	now := time.Date(2026, 9, 12, 8, 0, 0, 0, time.UTC)
-	d := newDeviceNames(filepath.Join(t.TempDir(), "device-names.json"))
+	d := newDeviceNames(testServerDB(t, t.TempDir()))
 	d.now = func() time.Time { return now }
 	devs := []ml.DeviceInfo{cudaDev("0000:01:00.0", "CUDA0")}
 
@@ -71,14 +72,14 @@ func TestDeviceNamesDoNotRewriteOnEveryRefresh(t *testing.T) {
 }
 
 func TestUnavailableGPUCarriesItsLastName(t *testing.T) {
-	d := newDeviceNames("")
+	d := newDeviceNames(nil)
 	d.observe([]ml.DeviceInfo{cudaDev("0000:03:00.0", "CUDA1")})
 
 	got := unavailableGPU(ml.UnavailableDevice{PCIID: "0000:03:00.0", Reason: "reset_required"}, d)
 	if got.LastName != "CUDA1" || got.LastSeen == nil {
 		t.Fatalf("got %+v, want last_name CUDA1 with last_seen", got)
 	}
-	for _, names := range []*deviceNames{nil, newDeviceNames("")} {
+	for _, names := range []*deviceNames{nil, newDeviceNames(nil)} {
 		b, _ := json.Marshal(unavailableGPU(ml.UnavailableDevice{PCIID: "0000:03:00.0", Reason: "reset_required"}, names))
 		if strings.Contains(string(b), "last_name") || strings.Contains(string(b), "last_seen") {
 			t.Errorf("a card never seen healthy was given a name: %s", b)

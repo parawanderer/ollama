@@ -79,10 +79,6 @@ type Scheduler struct {
 	// model is predicted from measurement instead of from metadata alone.
 	vramCalibration *llm.VRAMCalibration
 
-	// vramCalibrationPath is where those measurements survive a restart. Without it every
-	// restart re-earns them by making one uninformed placement per model.
-	vramCalibrationPath string
-
 	// loadsInFlight counts loads that have started and not finished. A runner object does
 	// not exist for most of a load, so the runner list cannot answer "is anything loading"
 	// -- which is exactly the period the sampler most needs to run fast.
@@ -148,8 +144,9 @@ type Scheduler struct {
 	freeMemoryFn func(pciIDs []string) map[string]uint64
 
 	loadFn func(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool
-	// usage records every generation and load (server/usage.go); nil records nothing.
-	usage *usageStore
+	// db is the server database (server_db.go): usage, calibration, device names and the box
+	// profile. nil keeps everything in memory.
+	db *serverDB
 
 	// leases are GPUs given to jobs outside ollama (server/lease.go).
 	leases leaseTable
@@ -664,7 +661,7 @@ func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey
 	var probes []string
 	for c, vram := range premeasured {
 		if vram > 0 {
-			s.vramCalibration.Record(key, c, vram)
+			s.recordCalibration(key, c, vram, "probe")
 			recorded++
 		}
 	}
@@ -680,7 +677,7 @@ func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey
 		if !ok {
 			continue
 		}
-		s.vramCalibration.Record(key, measuredCtx, vram)
+		s.recordCalibration(key, measuredCtx, vram, "probe")
 		recorded++
 	}
 
@@ -688,13 +685,10 @@ func (s *Scheduler) probeCalibration(ctx context.Context, key llm.CalibrationKey
 	// coming from the metadata prior, which for this architecture is the thing known to
 	// be wrong -- so the result would look calibrated while carrying the same error.
 	if recorded < 2 {
-		s.vramCalibration.Forget(key)
+		s.forgetCalibration(key)
 		return false
 	}
 
-	if s.vramCalibrationPath != "" {
-		go s.vramCalibration.Persist(s.vramCalibrationPath)
-	}
 	slog.Info("measured a model's memory use without loading it",
 		"model", req.model.ModelPath,
 		"architecture", f.KV().Architecture(),
@@ -1578,7 +1572,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 							"predicted_ms_per_token", ms, "measured_ms_per_token", timings.EvalMs/float64(max(timings.Decoded, 1)),
 							"basis", basis)
 					}
-					s.usage.recordGeneration(row)
+					s.db.recordGeneration(row)
 				})
 			}
 			if err != nil {
@@ -1836,10 +1830,7 @@ iGPUScan:
 				"model", req.model.ModelPath)
 		}
 		if loadedTotal > 0 && measured {
-			s.vramCalibration.Record(runner.calibrationKey, recordedCtx, loadedTotal)
-			if s.vramCalibrationPath != "" {
-				go s.vramCalibration.Persist(s.vramCalibrationPath)
-			}
+			s.recordCalibration(runner.calibrationKey, recordedCtx, loadedTotal, "load")
 		}
 		s.loadsInFlight.Add(-1)
 		s.clearLoadingModel()
@@ -1878,7 +1869,7 @@ iGPUScan:
 			complete.ContextMs = complete.DurationMs - complete.WeightsMs
 		}
 		s.publishEvent(complete)
-		s.usage.recordLoad(usageLoad{
+		s.db.recordLoad(usageLoad{
 			At: time.Now(), Model: req.model.Name, Estimate: loadEstimate,
 			Devices: usageDevices(loadGpus), Split: usageSplit(loadGpus, launchOpts),
 			SizeVRAM: complete.SizeVRAM, SizeTotal: complete.SizeTotal,

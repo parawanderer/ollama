@@ -20,7 +20,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
@@ -2022,19 +2021,20 @@ func Serve(ln net.Listener) error {
 	// without an HTTP layer.
 	// Calibration lives beside the models it describes, so it travels with them and is
 	// discarded with them.
-	sched.vramCalibrationPath = filepath.Join(envconfig.Models(), "vram-calibration.json")
-	sched.vramCalibration.Load(sched.vramCalibrationPath)
-	sched.deviceNames = newDeviceNames(filepath.Join(envconfig.Models(), "device-names.json"))
-	// The high-volume record: one row per generation and per load. Optional -- a server that
-	// cannot open it serves exactly the same, it just learns nothing.
-	if u, err := openUsageStore(filepath.Join(envconfig.Models(), "usage.db")); err != nil {
-		slog.Warn("usage store unavailable; generations will not be recorded", "error", err)
+	// Everything the server measures or records lives in one database beside the models, so it
+	// travels with them and a new machine starts fresh. Optional: a server that cannot open it
+	// serves exactly the same from memory, and measures again after a restart.
+	if db, err := openServerDB(envconfig.Models()); err != nil {
+		slog.Warn("database unavailable; measurements and usage will not survive a restart", "error", err)
 	} else {
-		sched.usage = u
+		sched.db = db
 	}
-	// Measured once per GPUs, driver and engine, when the server is quiet; kept beside the
-	// other stores so a new machine starts fresh.
-	sched.profiler = newBoxProfiler(filepath.Join(envconfig.Models(), "box-profile.json"))
+	if err := sched.db.loadCalibration(sched.vramCalibration); err != nil {
+		slog.Warn("could not read memory calibration; loads will be measured again", "error", err)
+	}
+	sched.deviceNames = newDeviceNames(sched.db)
+	// Measured once per GPUs, driver and engine, when the server is quiet.
+	sched.profiler = newBoxProfiler(sched.db)
 	go sched.profiler.run(schedCtx, sched.profileCandidates)
 
 	sched.psFn = s.processResponse
@@ -2063,6 +2063,8 @@ func Serve(ln net.Listener) error {
 		srvr.Close()
 		schedDone()
 		sched.unloadAllRunners()
+		// Flush what is buffered; without this a stop lost up to a second of rows.
+		sched.db.close()
 		done()
 	}()
 

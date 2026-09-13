@@ -163,6 +163,15 @@ func TestActiveWeightsFraction(t *testing.T) {
 	near(t, "dense", activeWeightsFraction(dense), 1, 0)
 }
 
+// firstUsageSchema is the generations table as the first usage build (2026-09-12) created it.
+const firstUsageSchema = `CREATE TABLE generations (id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL, model TEXT NOT NULL,
+	prompt_tokens INTEGER, prompt_tokens_cached INTEGER, prompt_ms REAL, eval_ms REAL, decoded INTEGER, cache_swap_ms REAL,
+	hint_use TEXT, hint_session TEXT, hint_request TEXT, hint_after TEXT, hint_synthetic INTEGER,
+	endpoint TEXT, surface TEXT, stream INTEGER, messages INTEGER, images INTEGER, tools INTEGER, format INTEGER, think TEXT,
+	req_num_ctx INTEGER, req_num_gpu INTEGER, req_num_predict INTEGER, req_keep_alive_s INTEGER, client TEXT,
+	devices TEXT, num_ctx INTEGER, num_batch INTEGER, split TEXT);
+`
+
 type zeroTensor struct{}
 
 func (zeroTensor) WriteTo(io.Writer) (int64, error) { return 0, nil }
@@ -170,23 +179,17 @@ func (zeroTensor) WriteTo(io.Writer) (int64, error) { return 0, nil }
 // A database from before the prediction existed gains its columns, keeps its rows, and records
 // the prediction from then on.
 func TestUsageStoreAddsColumnsToAnOlderDatabase(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "usage.db")
-	old, err := sql.Open("sqlite3", path)
+	dir := t.TempDir()
+	old, err := sql.Open("sqlite3", filepath.Join(dir, serverDBPrevious))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := old.Exec(`CREATE TABLE generations (id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL, model TEXT NOT NULL,
-		prompt_tokens INTEGER, prompt_tokens_cached INTEGER, prompt_ms REAL, eval_ms REAL, decoded INTEGER, cache_swap_ms REAL,
-		hint_use TEXT, hint_session TEXT, hint_request TEXT, hint_after TEXT, hint_synthetic INTEGER,
-		endpoint TEXT, surface TEXT, stream INTEGER, messages INTEGER, images INTEGER, tools INTEGER, format INTEGER, think TEXT,
-		req_num_ctx INTEGER, req_num_gpu INTEGER, req_num_predict INTEGER, req_keep_alive_s INTEGER, client TEXT,
-		devices TEXT, num_ctx INTEGER, num_batch INTEGER, split TEXT);
-		INSERT INTO generations (at_ms, model) VALUES (1, 'before');`); err != nil {
+	if _, err := old.Exec(firstUsageSchema + `INSERT INTO generations (at_ms, model) VALUES (1, 'before');`); err != nil {
 		t.Fatal(err)
 	}
 	old.Close()
 
-	u, err := openUsageStore(path)
+	u, err := openServerDB(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +197,7 @@ func TestUsageStoreAddsColumnsToAnOlderDatabase(t *testing.T) {
 	u.recordGeneration(usageGeneration{At: time.Now(), Model: "after", PredictedEvalMs: &ms, PredictedBasis: "profile"})
 	u.close()
 
-	db, _ := sql.Open("sqlite3", path)
+	db, _ := sql.Open("sqlite3", filepath.Join(dir, serverDBName))
 	defer db.Close()
 	var n int
 	db.QueryRow(`SELECT count(*) FROM generations`).Scan(&n)

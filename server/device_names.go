@@ -1,10 +1,9 @@
 package server
 
 import (
+	"database/sql"
 	"encoding/json"
-	"log/slog"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -13,7 +12,7 @@ import (
 
 // deviceNamesPersistEvery bounds how often the remembered names are written when nothing about
 // them changed. Devices are re-enumerated every few seconds while anything polls, so writing
-// on every refresh would rewrite the file constantly; LastSeen survives a restart to within
+// on every refresh would rewrite them constantly; LastSeen survives a restart to within
 // this interval instead.
 const deviceNamesPersistEvery = 10 * time.Minute
 
@@ -25,10 +24,11 @@ const deviceNamesPersistEvery = 10 * time.Minute
 // with the first of two cards gone the survivor becomes CUDA0. Only a record taken while the
 // card was healthy can say what it was called, and that record has to outlive the process,
 // because a server started after the fault -- which happened on 2026-09-12, when a deploy
-// restarted it with GPU1 already faulted -- never saw the card at all.
+// restarted it with GPU1 already faulted -- never saw the card at all. It is kept in the
+// server database (server_db.go); without one it lives in the process only.
 type deviceNames struct {
 	mu        sync.Mutex
-	path      string
+	db        *serverDB
 	byPCI     map[string]seenDevice
 	persisted time.Time
 	now       func() time.Time
@@ -40,22 +40,72 @@ type seenDevice struct {
 	LastSeen time.Time `json:"last_seen"`
 }
 
-// newDeviceNames loads what an earlier process remembered from path, if anything. An empty
-// path keeps the memory in the process only.
-func newDeviceNames(path string) *deviceNames {
-	d := &deviceNames{path: path, byPCI: map[string]seenDevice{}, now: time.Now}
-	if path == "" {
+const deviceNamesSchema = `
+CREATE TABLE IF NOT EXISTS device_names (
+	pci_id TEXT PRIMARY KEY,
+	name TEXT NOT NULL,
+	library TEXT,
+	last_seen_ms INTEGER NOT NULL
+);
+`
+
+// seenDeviceRow is one device's record as the database writer receives it.
+type seenDeviceRow struct {
+	PCIID string
+	seenDevice
+}
+
+func upsertDeviceName(tx *sql.Tx, r seenDeviceRow) error {
+	_, err := tx.Exec(`INSERT INTO device_names (pci_id, name, library, last_seen_ms) VALUES (?,?,?,?)
+		ON CONFLICT(pci_id) DO UPDATE SET name = excluded.name, library = excluded.library, last_seen_ms = excluded.last_seen_ms`,
+		r.PCIID, r.Name, nullIfEmpty(r.Library), r.LastSeen.UnixMilli())
+	return err
+}
+
+// newDeviceNames loads what an earlier process remembered from db, if anything. A nil db keeps
+// the memory in the process only.
+func newDeviceNames(db *serverDB) *deviceNames {
+	d := &deviceNames{db: db, byPCI: map[string]seenDevice{}, now: time.Now}
+	if db == nil {
 		return d
 	}
-	b, err := os.ReadFile(path)
+	rows, err := db.db.Query(`SELECT pci_id, name, library, last_seen_ms FROM device_names`)
 	if err != nil {
 		return d
 	}
-	if err := json.Unmarshal(b, &d.byPCI); err != nil {
-		slog.Warn("ignoring unreadable device name memory", "path", path, "error", err)
-		d.byPCI = map[string]seenDevice{}
+	defer rows.Close()
+	for rows.Next() {
+		var pci, name string
+		var library sql.NullString
+		var seen int64
+		if rows.Scan(&pci, &name, &library, &seen) == nil {
+			d.byPCI[pci] = seenDevice{Name: name, Library: library.String, LastSeen: time.UnixMilli(seen)}
+		}
 	}
 	return d
+}
+
+// importDeviceNames files the records of a device-names.json.
+func (d *serverDB) importDeviceNames(path string) (int, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	var byPCI map[string]seenDevice
+	if err := json.Unmarshal(b, &byPCI); err != nil {
+		return 0, err
+	}
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	for pci, s := range byPCI {
+		if err := upsertDeviceName(tx, seenDeviceRow{PCIID: pci, seenDevice: s}); err != nil {
+			return 0, err
+		}
+	}
+	return len(byPCI), tx.Commit()
 }
 
 // observe records the devices an enumeration returned. Every one of them is healthy by
@@ -79,35 +129,13 @@ func (d *deviceNames) observe(devices []ml.DeviceInfo) {
 		}
 		d.byPCI[dev.PCIID] = seenDevice{Name: dev.Name, Library: dev.Library, LastSeen: now}
 	}
-	if d.path == "" || (!changed && now.Sub(d.persisted) < deviceNamesPersistEvery) {
+	if d.db == nil || (!changed && now.Sub(d.persisted) < deviceNamesPersistEvery) {
 		return
 	}
-	if err := d.writeLocked(); err != nil {
-		slog.Debug("could not persist device names", "path", d.path, "error", err)
-		return
+	for pci, s := range d.byPCI {
+		d.db.enqueue(seenDeviceRow{PCIID: pci, seenDevice: s})
 	}
 	d.persisted = now
-}
-
-func (d *deviceNames) writeLocked() error {
-	b, err := json.MarshalIndent(d.byPCI, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(d.path), ".device-names-*")
-	if err != nil {
-		return err
-	}
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmp.Name())
-		return err
-	}
-	return os.Rename(tmp.Name(), d.path)
 }
 
 // lookup returns what the device at pci was last called while healthy.

@@ -2579,12 +2579,13 @@ func TestSchedRecordsUsage(t *testing.T) {
 	defer done()
 
 	s := InitScheduler(ctx)
-	path := filepath.Join(t.TempDir(), "usage.db")
-	u, err := openUsageStore(path)
+	dir := t.TempDir()
+	path := filepath.Join(dir, serverDBName)
+	u, err := openServerDB(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.usage = u
+	s.db = u
 	scenario := newScenarioRequestWithContext(t, ctx, "usage", 10, nil, map[ml.DeviceID]uint64{}, 131072)
 	scenario.req.opts.NumCtx = 8192
 	scenario.srv.contextLength = 8192

@@ -2,6 +2,7 @@ package llm
 
 import (
 	"math"
+	"slices"
 	"sync"
 )
 
@@ -216,6 +217,24 @@ func (c *VRAMCalibration) SampleCount(key CalibrationKey) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.samples[key])
+}
+
+// Each calls fn for every sample held. It works on a copy, so fn may call back into c.
+func (c *VRAMCalibration) Each(fn func(key CalibrationKey, numCtx int, vram uint64)) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	copied := make(map[CalibrationKey][]calibrationSample, len(c.samples))
+	for k, v := range c.samples {
+		copied[k] = slices.Clone(v)
+	}
+	c.mu.Unlock()
+	for k, samples := range copied {
+		for _, s := range samples {
+			fn(k, s.numCtx, s.vram)
+		}
+	}
 }
 
 // Forget discards every sample for a key. It exists for the case where samples were

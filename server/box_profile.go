@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -85,7 +84,7 @@ type storedProfile struct {
 }
 
 type boxProfiler struct {
-	path string
+	db *serverDB
 
 	// Seams for tests.
 	timeFn   func(ctx context.Context, gpus []ml.DeviceInfo, modelPath string, tensorSplit bool) (float64, error)
@@ -101,22 +100,22 @@ type boxProfiler struct {
 	engineSet bool
 }
 
-func newBoxProfiler(path string) *boxProfiler {
+// newBoxProfiler loads the latest measurement of each machine from db. A nil db keeps
+// measurements in the process only.
+func newBoxProfiler(db *serverDB) *boxProfiler {
 	p := &boxProfiler{
-		path:     path,
+		db:       db,
 		timeFn:   llm.TimeDecode,
 		engineFn: engineFingerprint,
 		now:      time.Now,
 		profiles: map[string]*storedProfile{},
 	}
 	p.lastBusy = p.now() // a server that just started is not yet known to be quiet
-	if path == "" {
-		return p
-	}
-	if b, err := os.ReadFile(path); err == nil {
-		if err := json.Unmarshal(b, &p.profiles); err != nil {
-			slog.Warn("ignoring an unreadable box profile; it will be measured again", "path", path, "error", err)
-			p.profiles = map[string]*storedProfile{}
+	if db != nil {
+		if profiles, err := db.loadProfiles(); err != nil {
+			slog.Warn("could not read the box profile; it will be measured again", "error", err)
+		} else {
+			p.profiles = profiles
 		}
 	}
 	return p
@@ -197,8 +196,8 @@ func (p *boxProfiler) tick(ctx context.Context, candidates func() ([]ml.DeviceIn
 	p.mu.Lock()
 	p.profiles[id] = prof
 	p.evictLocked()
-	p.saveLocked()
 	p.mu.Unlock()
+	p.db.enqueue(profileRow{Identity: id, Profile: *prof})
 	slog.Info("measured this machine's decode speed", "took", p.now().Sub(started).Round(time.Second),
 		"devices", len(prof.Devices), "links", len(prof.Links), "failures", len(prof.Failures))
 	return true
@@ -463,7 +462,8 @@ func engineFingerprint() string {
 	return strings.Join(parts, ",")
 }
 
-// evictLocked keeps the store to profileMaxStored machines, dropping the oldest measurement.
+// evictLocked keeps at most profileMaxStored machines in memory, dropping the oldest measurement.
+// The database keeps every one.
 func (p *boxProfiler) evictLocked() {
 	for len(p.profiles) > profileMaxStored {
 		var oldest string
@@ -473,22 +473,6 @@ func (p *boxProfiler) evictLocked() {
 			}
 		}
 		delete(p.profiles, oldest)
-	}
-}
-
-func (p *boxProfiler) saveLocked() {
-	if p.path == "" {
-		return
-	}
-	b, err := json.MarshalIndent(p.profiles, "", " ")
-	if err == nil {
-		tmp := p.path + ".tmp"
-		if err = os.WriteFile(tmp, b, 0o644); err == nil {
-			err = os.Rename(tmp, p.path)
-		}
-	}
-	if err != nil {
-		slog.Warn("could not save the box profile; it will be measured again after a restart", "path", p.path, "error", err)
 	}
 }
 

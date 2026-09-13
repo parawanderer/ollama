@@ -14,8 +14,9 @@ import (
 )
 
 func TestUsageStoreRecordsGenerationsAndLoads(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "usage.db")
-	u, err := openUsageStore(path)
+	dir := t.TempDir()
+	path := filepath.Join(dir, serverDBName)
+	u, err := openServerDB(dir)
 	if err != nil {
 		t.Fatal(err)
 	}

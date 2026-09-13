@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/ollama/ollama/fs/ggml"
 )
@@ -121,6 +122,10 @@ func (m SyntheticModel) Write(path string) error {
 		return err
 	}
 	defer f.Close()
+	if err := markSparse(f); err != nil {
+		os.Remove(path)
+		return fmt.Errorf("synthetic model: the filesystem at %s cannot hold sparse files, so the model would take its full size on disk: %w", filepath.Dir(path), err)
+	}
 	ts := m.tensors()
 	if err := ggml.WriteGGUF(f, kv, ts); err != nil {
 		return err
@@ -139,5 +144,21 @@ func (m SyntheticModel) Write(path string) error {
 	for _, t := range ts {
 		end = max(end, t.Offset+t.Size())
 	}
-	return f.Truncate(header + int64(end))
+	if err := f.Truncate(header + int64(end)); err != nil {
+		return err
+	}
+	// A filesystem that does not keep holes allocates the whole length. Refuse rather than fill
+	// the disk: the profile records the reason as a failure.
+	if used, ok := allocatedBytes(path); ok && used > sparseLimit {
+		f.Close()
+		os.Remove(path)
+		return fmt.Errorf("synthetic model: the filesystem at %s does not keep holes (%d bytes allocated for a %d-byte file), so it cannot be used", filepath.Dir(path), used, header+int64(end))
+	}
+	return nil
 }
+
+// sparseLimit is more than a synthetic model's header ever needs: the real ones take 20-50 KiB.
+const sparseLimit = 64 << 20
+
+// allocatedBytes is AllocatedBytes, replaceable in tests: no filesystem here lacks holes.
+var allocatedBytes = AllocatedBytes

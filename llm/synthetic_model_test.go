@@ -3,7 +3,6 @@ package llm
 import (
 	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
 
 	"github.com/ollama/ollama/fs/ggml"
@@ -50,7 +49,22 @@ func TestSyntheticModelIsASparseGGUF(t *testing.T) {
 	if want := int64(g.Tensors().Offset) + int64(total); st.Size() < want {
 		t.Errorf("file is %d bytes, the tensors need %d: llama.cpp would reject it as truncated", st.Size(), want)
 	}
-	if blocks := st.Sys().(*syscall.Stat_t).Blocks * 512; blocks > 1<<20 {
-		t.Errorf("file occupies %d bytes of disk for %d of data: the data was written, not left a hole", blocks, total)
+	if used, ok := AllocatedBytes(path); ok && used > 1<<20 {
+		t.Errorf("file occupies %d bytes of disk for %d of data: the data was written, not left a hole", used, total)
+	}
+}
+
+// On a filesystem that allocates the whole length (no holes), writing must fail and leave
+// nothing behind rather than fill the disk with a model of many GiB.
+func TestSyntheticModelRefusesAFilesystemWithoutHoles(t *testing.T) {
+	defer func(f func(string) (int64, bool)) { allocatedBytes = f }(allocatedBytes)
+	allocatedBytes = func(string) (int64, bool) { return 11 << 30, true }
+
+	path := filepath.Join(t.TempDir(), "synthetic.gguf")
+	if err := (SyntheticModel{Embedding: 2048, Layers: 8}).Write(path); err == nil {
+		t.Fatal("wrote a model the filesystem allocated in full")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Error("the refused model was left on disk")
 	}
 }

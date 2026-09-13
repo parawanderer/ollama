@@ -242,7 +242,7 @@ func (p *boxProfiler) measure(ctx context.Context, gpus []ml.DeviceInfo) (*store
 		if info, err := os.Stat(path); err == nil {
 			attrs = append(attrs, "size", formatGiB(uint64(info.Size())))
 		}
-		if onDisk, ok := allocatedBytes(path); ok {
+		if onDisk, ok := llm.AllocatedBytes(path); ok {
 			attrs = append(attrs, "on_disk_bytes", onDisk)
 		}
 		slog.Info("box profile: wrote a synthetic model (zero weights, sparse)", attrs...)

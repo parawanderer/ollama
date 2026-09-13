@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/ollama/ollama/api"
@@ -91,6 +92,9 @@ type boxProfiler struct {
 	engineFn func() string
 	now      func() time.Time
 
+	// tempDir is where synthetic models are written; empty means os.TempDir().
+	tempDir string
+
 	mu        sync.Mutex
 	profiles  map[string]*storedProfile
 	lastBusy  time.Time
@@ -142,6 +146,7 @@ func (p *boxProfiler) preempt() {
 // to measure. candidates returns the GPUs, or a reason they may not be touched now; it must
 // not start device discovery, which would itself initialise the GPUs.
 func (p *boxProfiler) run(ctx context.Context, candidates func() ([]ml.DeviceInfo, string)) {
+	removeStaleProfileDirs(p.tempRoot())
 	t := time.NewTicker(profileCheckEvery)
 	defer t.Stop()
 	for {
@@ -206,12 +211,23 @@ func (p *boxProfiler) tick(ctx context.Context, candidates func() ([]ml.DeviceIn
 // measure times the synthetic shapes on each GPU alone, fits each GPU's three numbers, then
 // times tensor split across each set and backs out the link cost. It returns an error only if
 // it was interrupted; a measurement that fails is recorded as a failure in the profile.
+//
+// Every step is logged at info level, because this runs unprompted and touches the GPUs and the
+// disk: someone reading the log should be able to see what it did and that it cleaned up.
 func (p *boxProfiler) measure(ctx context.Context, gpus []ml.DeviceInfo) (*storedProfile, error) {
-	dir, err := os.MkdirTemp("", "ollama-profile-")
+	dir, err := os.MkdirTemp(p.tempRoot(), profileDirPrefix())
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(dir)
+	slog.Info("box profile: writing synthetic models", "dir", dir)
+	defer func() {
+		files, _ := os.ReadDir(dir)
+		if err := os.RemoveAll(dir); err != nil {
+			slog.Warn("box profile: could not remove the synthetic models; they are removed at the next start", "dir", dir, "error", err)
+			return
+		}
+		slog.Info("box profile: removed the synthetic models", "dir", dir, "files", len(files))
+	}()
 
 	models := map[profileShape]string{}
 	model := func(s profileShape) (string, error) {
@@ -222,6 +238,14 @@ func (p *boxProfiler) measure(ctx context.Context, gpus []ml.DeviceInfo) (*store
 		if err := (llm.SyntheticModel{Embedding: s.width, Layers: s.layers}).Write(path); err != nil {
 			return "", err
 		}
+		attrs := []any{"file", filepath.Base(path), "width", s.width, "layers", s.layers}
+		if info, err := os.Stat(path); err == nil {
+			attrs = append(attrs, "size", formatGiB(uint64(info.Size())))
+		}
+		if onDisk, ok := allocatedBytes(path); ok {
+			attrs = append(attrs, "on_disk_bytes", onDisk)
+		}
+		slog.Info("box profile: wrote a synthetic model (zero weights, sparse)", attrs...)
 		models[s] = path
 		return path, nil
 	}
@@ -230,7 +254,25 @@ func (p *boxProfiler) measure(ctx context.Context, gpus []ml.DeviceInfo) (*store
 		if err != nil {
 			return 0, err
 		}
-		return p.timeFn(ctx, set, path, tensor)
+		started := p.now()
+		ms, err := p.timeFn(ctx, set, path, tensor)
+		// The load read the file through the page cache: gigabytes of zero pages that would
+		// otherwise stay cached until the file is deleted.
+		releasePageCache(path)
+		split := "none"
+		if tensor {
+			split = "tensor"
+		}
+		attrs := []any{"devices", pciList(set), "split", split, "width", s.width, "layers", s.layers,
+			"took", p.now().Sub(started).Round(time.Millisecond)}
+		if err != nil {
+			if ctx.Err() == nil {
+				slog.Warn("box profile: timing failed", append(attrs, "error", err)...)
+			}
+			return 0, err
+		}
+		slog.Info("box profile: timed decode", append(attrs, "ms_per_token", round3(ms))...)
+		return ms, nil
 	}
 
 	gpus = slices.Clone(gpus)
@@ -249,13 +291,18 @@ func (p *boxProfiler) measure(ctx context.Context, gpus []ml.DeviceInfo) (*store
 			}, deviceShapes(wide)); err == nil {
 				fits[g.PCIID], widths[g.PCIID] = f, wide
 				ok = append(ok, g)
-				prof.Devices = append(prof.Devices, f.wire(g.PCIID))
+				d := f.wire(g.PCIID)
+				prof.Devices = append(prof.Devices, d)
+				slog.Info("box profile: measured a device", "pci_id", g.PCIID,
+					"bandwidth", fmt.Sprintf("%.3f TB/s", float64(d.BandwidthBytesPerSec)/1e12),
+					"token_overhead_ms", d.TokenOverheadMs, "layer_overhead_us", d.LayerOverheadUs, "fit_error_pct", d.FitErrorPct)
 				continue
 			}
 		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+		slog.Warn("box profile: could not measure a device; recorded as a failure", "pci_id", g.PCIID, "error", err)
 		prof.Failures = append(prof.Failures, api.ProfileFailure{What: "device", PCIIDs: []string{g.PCIID}, Error: err.Error()})
 	}
 
@@ -281,12 +328,86 @@ func (p *boxProfiler) measure(ctx context.Context, gpus []ml.DeviceInfo) (*store
 			return nil, ctx.Err()
 		}
 		if failed != nil {
+			slog.Warn("box profile: tensor split could not be measured; recorded as a failure", "devices", pciList(set), "error", failed)
 			prof.Failures = append(prof.Failures, api.ProfileFailure{What: "tensor_split", PCIIDs: pcis, Error: failed.Error()})
 			continue
 		}
+		slog.Info("box profile: measured a link", "devices", pciList(set), "reductions_us", link.Reductions)
 		prof.Links = append(prof.Links, link)
 	}
 	return prof, nil
+}
+
+func pciList(set []ml.DeviceInfo) string {
+	out := make([]string, len(set))
+	for i, g := range set {
+		out[i] = g.PCIID
+	}
+	return strings.Join(out, ",")
+}
+
+// profileDirPrefix names a measurement's directory after the process that owns it, which is
+// how removeStaleProfileDirs tells a live server's directory from a dead one's.
+func profileDirPrefix() string { return fmt.Sprintf("ollama-profile-%d-", os.Getpid()) }
+
+func (p *boxProfiler) tempRoot() string {
+	if p.tempDir != "" {
+		return p.tempDir
+	}
+	return os.TempDir()
+}
+
+// profileStaleAfter is how old a measurement directory must be to be removed when its owner
+// cannot be determined. A whole measurement takes about half a minute.
+const profileStaleAfter = time.Hour
+
+// removeStaleProfileDirs removes the measurement directories a server that died mid-measurement
+// left behind: files of many GiB on paper, a few KiB on disk (more where the filesystem does
+// not keep holes). Called once at startup, before this process has made any of its own, so a
+// directory named after this process's id is stale too -- in a container, the server is
+// always the same pid.
+func removeStaleProfileDirs(root string) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !e.IsDir() || !strings.HasPrefix(name, "ollama-profile-") {
+			continue
+		}
+		path := filepath.Join(root, name)
+		var pid int
+		owned := false
+		if _, err := fmt.Sscanf(strings.TrimPrefix(name, "ollama-profile-"), "%d-", &pid); err == nil && pid > 0 {
+			owned = true
+		}
+		switch {
+		case owned && pid != os.Getpid() && processAlive(pid):
+			continue // another server, measuring now
+		case !owned:
+			info, err := e.Info()
+			if err != nil || time.Since(info.ModTime()) < profileStaleAfter {
+				continue
+			}
+		}
+		if err := os.RemoveAll(path); err != nil {
+			slog.Warn("box profile: could not remove a measurement directory an earlier server left", "dir", path, "error", err)
+			continue
+		}
+		slog.Info("box profile: removed a measurement directory an earlier server left", "dir", path)
+	}
+}
+
+// processAlive reports whether pid is a running process. An answer it cannot get counts as
+// alive, which keeps the directory: leaving files behind is the cheaper mistake.
+func processAlive(pid int) bool {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	err = proc.Signal(syscall.Signal(0))
+	return err == nil || !errors.Is(err, os.ErrProcessDone)
 }
 
 // tensorSets are the device sets tensor split is measured across: every pair, and every

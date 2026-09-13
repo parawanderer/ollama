@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sync/atomic"
@@ -309,4 +311,69 @@ func TestProfileCandidates(t *testing.T) {
 		t.Error("measured a leased GPU")
 	}
 	s.leases.remove(l)
+}
+
+// A server that died mid-measurement leaves its synthetic models behind. The next start removes
+// them, and never a directory a live server is measuring in.
+func TestStaleProfileDirsAreRemoved(t *testing.T) {
+	root := t.TempDir()
+	dead := exec.Command("true")
+	if err := dead.Run(); err != nil {
+		t.Skip("no true(1):", err)
+	}
+	dirs := map[string]bool{ // name -> should survive
+		fmt.Sprintf("ollama-profile-%d-a", os.Getpid()):      false, // this process's, from before it started
+		fmt.Sprintf("ollama-profile-%d-b", os.Getppid()):     true,  // a live server's
+		fmt.Sprintf("ollama-profile-%d-c", dead.Process.Pid): false, // a dead server's
+		"ollama-profile-abc123":                              false, // no owner, and old
+		"ollama-profile-def456":                              true,  // no owner, and recent
+		"something-else":                                     true,
+	}
+	for name := range dirs {
+		if err := os.MkdirAll(filepath.Join(root, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-2 * profileStaleAfter)
+	os.Chtimes(filepath.Join(root, "ollama-profile-abc123"), old, old)
+
+	removeStaleProfileDirs(root)
+	for name, survive := range dirs {
+		_, err := os.Stat(filepath.Join(root, name))
+		if got := err == nil; got != survive {
+			t.Errorf("%s: survived=%v, want %v", name, got, survive)
+		}
+	}
+}
+
+// The synthetic models are removed when a measurement ends, whether it finished or was stopped.
+func TestMeasurementRemovesItsModels(t *testing.T) {
+	gpus := []ml.DeviceInfo{profileGPU("0", "0000:01:00.0"), profileGPU("1", "0000:03:00.0")}
+
+	done, _ := newTestProfiler(t, fakeMachine{a: 0.1, c: 0.02, bw: 1e9, ell: 0.01})
+	done.tempDir = t.TempDir()
+	if !done.tick(t.Context(), func() ([]ml.DeviceInfo, string) { return gpus, "" }) {
+		t.Fatal("not measured")
+	}
+
+	stopped, _ := newTestProfiler(t, fakeMachine{})
+	stopped.tempDir = t.TempDir()
+	entered := make(chan struct{})
+	stopped.timeFn = func(ctx context.Context, _ []ml.DeviceInfo, path string, _ bool) (float64, error) {
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("the model being timed does not exist: %v", err)
+		}
+		close(entered)
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
+	go stopped.tick(t.Context(), func() ([]ml.DeviceInfo, string) { return gpus, "" })
+	<-entered
+	stopped.preempt()
+
+	for name, p := range map[string]*boxProfiler{"finished": done, "preempted": stopped} {
+		if left, _ := os.ReadDir(p.tempDir); len(left) != 0 {
+			t.Errorf("%s: %d entries left in the temp dir", name, len(left))
+		}
+	}
 }

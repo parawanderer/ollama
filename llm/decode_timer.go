@@ -85,7 +85,8 @@ func TimeDecode(ctx context.Context, gpus []ml.DeviceInfo, modelPath string, ten
 	}
 
 	cmd := exec.Command(exe, params...)
-	cmd.SysProcAttr = LlamaServerSysProcAttr
+	unlock := dieWithParent(cmd)
+	defer unlock() // registered first, so it runs after the child is killed and reaped
 	SetupLlamaServerCommandEnv(cmd, exe, ml.LibraryPaths(gpus), ml.GetDevicesEnv(gpus))
 	tail := &lastLines{max: 20}
 	cmd.Stdout, cmd.Stderr = tail, tail

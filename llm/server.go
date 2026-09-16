@@ -279,6 +279,8 @@ type ChatRequest struct {
 
 	Logprobs    bool
 	TopLogprobs int
+	// IncludeIntermediateMetrics adds cumulative metrics to non-final responses; final responses always include metrics.
+	IncludeIntermediateMetrics bool
 	// Meta is the caller's hint and the request's shape, passed back on the
 	// generation-done callback.
 	Meta *api.GenerationMeta

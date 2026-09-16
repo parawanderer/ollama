@@ -2211,6 +2211,13 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 			}
 
 			if resp.Message.Content != "" || resp.Message.Thinking != "" || len(resp.Logprobs) > 0 {
+				if req.IncludeIntermediateMetrics {
+					resp.PromptEvalCount = lsResp.Timings.promptEvalCount()
+					resp.PromptEvalCachedCount = lsResp.Timings.CacheN
+					resp.PromptEvalDuration = time.Duration(lsResp.Timings.PromptMS * float64(time.Millisecond))
+					resp.EvalCount = lsResp.Timings.PredictN
+					resp.EvalDuration = time.Duration(lsResp.Timings.PredictMS * float64(time.Millisecond))
+				}
 				fn(resp)
 			}
 		}
@@ -2343,6 +2350,12 @@ func (s *llamaServerRunner) llamaServerChatRequest(req ChatRequest, stream bool)
 		"presence_penalty":  req.Options.PresencePenalty,
 		"typical_p":         req.Options.TypicalP,
 		"seed":              req.Options.Seed,
+	}
+	if req.IncludeIntermediateMetrics {
+		// Without this llama-server attaches its timings only to the final chunk, so a
+		// client streaming a model served through the engine's own chat template has no
+		// running token count to show.
+		body["timings_per_token"] = true
 	}
 	if len(req.Tools) > 0 {
 		body["tools"] = req.Tools

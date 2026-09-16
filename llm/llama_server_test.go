@@ -377,6 +377,109 @@ func TestLlamaServerChatPromptEvalCountIncludesCache(t *testing.T) {
 	}
 }
 
+// A model served through the engine's own chat template goes through Chat rather than
+// Completion, and the running token count has to reach its chunks the same way: ask
+// llama-server for timings_per_token, and put the counts on every chunk, not just the last.
+func TestLlamaServerChatIntermediateMetrics(t *testing.T) {
+	for _, asked := range []bool{true, false} {
+		t.Run(fmt.Sprintf("asked=%v", asked), func(t *testing.T) {
+			var gotTimingsPerToken any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/health":
+					fmt.Fprint(w, `{"status":"ok"}`)
+				case "/v1/chat/completions":
+					var body map[string]any
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Errorf("invalid request body: %v", err)
+						return
+					}
+					gotTimingsPerToken = body["timings_per_token"]
+					w.Header().Set("Content-Type", "text/event-stream")
+					// What llama-server sends with timings_per_token on: the timings ride
+					// on the last delta of each partial result.
+					fmt.Fprintln(w, `data: {"choices":[{"delta":{"reasoning_content":"We"}}],"timings":{"cache_n":2,"prompt_n":3,"prompt_ms":10.5,"predicted_n":1,"predicted_ms":9.1}}`)
+					fmt.Fprintln(w, `:`)
+					fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"51"}}],"timings":{"cache_n":2,"prompt_n":3,"prompt_ms":10.5,"predicted_n":2,"predicted_ms":20.3}}`)
+					fmt.Fprintln(w, `data: {"choices":[{"delta":{},"finish_reason":"stop"}],"timings":{"cache_n":2,"prompt_n":3,"prompt_ms":10.5,"predicted_n":2,"predicted_ms":20.3}}`)
+					fmt.Fprintln(w, `data: [DONE]`)
+				default:
+					t.Errorf("unexpected path: %s", r.URL.Path)
+				}
+			}))
+			defer srv.Close()
+
+			parts := strings.Split(srv.URL, ":")
+			var portInt int
+			fmt.Sscanf(parts[len(parts)-1], "%d", &portInt)
+
+			runner := &llamaServerRunner{
+				port:    portInt,
+				cmd:     fakeRunningCmd(),
+				sem:     semaphore.NewWeighted(1),
+				options: api.Options{Runner: api.Runner{NumCtx: 2048}},
+			}
+
+			var responses []ChatResponse
+			opts := api.DefaultOptions()
+			err := runner.Chat(t.Context(), ChatRequest{
+				Messages:                   []api.Message{{Role: "user", Content: "what is 17*3?"}},
+				Options:                    &opts,
+				IncludeIntermediateMetrics: asked,
+			}, func(cr ChatResponse) {
+				responses = append(responses, cr)
+			})
+			if err != nil {
+				t.Fatalf("Chat error: %v", err)
+			}
+
+			if asked {
+				if gotTimingsPerToken != true {
+					t.Errorf("timings_per_token = %v, want true", gotTimingsPerToken)
+				}
+			} else if gotTimingsPerToken != nil {
+				t.Errorf("timings_per_token = %v, want it absent", gotTimingsPerToken)
+			}
+
+			if len(responses) != 3 {
+				t.Fatalf("got %d responses, want 3", len(responses))
+			}
+
+			// The thinking chunk and the content chunk both carry the running count when
+			// it was asked for, and nothing when it was not.
+			want := []struct{ prompt, eval int }{{5, 1}, {5, 2}}
+			for i, w := range want {
+				if !asked {
+					w.prompt, w.eval = 0, 0
+				}
+				if responses[i].PromptEvalCount != w.prompt || responses[i].EvalCount != w.eval {
+					t.Errorf("response[%d] counts = (%d, %d), want (%d, %d)", i,
+						responses[i].PromptEvalCount, responses[i].EvalCount, w.prompt, w.eval)
+				}
+			}
+			if asked {
+				if got := responses[0].PromptEvalCachedCount; got == nil || *got != 2 {
+					t.Errorf("response[0] cached prompt count = %v, want 2", got)
+				}
+				if responses[0].EvalDuration != 9100*time.Microsecond || responses[0].PromptEvalDuration != 10500*time.Microsecond {
+					t.Errorf("response[0] durations = (%s, %s), want (10.5ms, 9.1ms)",
+						responses[0].PromptEvalDuration, responses[0].EvalDuration)
+				}
+			} else if responses[0].PromptEvalCachedCount != nil {
+				t.Errorf("response[0] cached prompt count = %v, want nil", responses[0].PromptEvalCachedCount)
+			}
+
+			// The final chunk carries them either way.
+			if !responses[2].Done {
+				t.Fatal("response[2] should be done")
+			}
+			if responses[2].PromptEvalCount != 5 || responses[2].EvalCount != 2 {
+				t.Errorf("final counts = (%d, %d), want (5, 2)", responses[2].PromptEvalCount, responses[2].EvalCount)
+			}
+		})
+	}
+}
+
 func TestLlamaServerStreamsHandleLargeSSELines(t *testing.T) {
 	tests := []struct {
 		name       string

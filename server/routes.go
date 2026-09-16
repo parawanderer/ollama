@@ -3552,6 +3552,8 @@ func (s *Server) handleNativeChat(c *gin.Context, req api.ChatRequest, m *Model,
 		Shift:       req.Shift == nil || *req.Shift,
 		Logprobs:    req.Logprobs,
 		TopLogprobs: req.TopLogprobs,
+
+		IncludeIntermediateMetrics: req.StreamMetrics,
 	}, truncate)
 	if err != nil {
 		slog.Error("chat template prompt error", "error", err)

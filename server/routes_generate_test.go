@@ -326,6 +326,84 @@ func TestChatHandlerChatTemplateRoute(t *testing.T) {
 	}
 }
 
+// stream_metrics has to reach the chat_template route too: a model whose template the engine
+// renders goes through Chat, not Completion, and its chunks carried no running count at all.
+func TestChatHandlerChatTemplateRouteStreamMetrics(t *testing.T) {
+	t.Setenv("OLLAMA_CONTEXT_LENGTH", "4096")
+	t.Setenv("OLLAMA_GO_TEMPLATE", "")
+	gin.SetMode(gin.TestMode)
+
+	for _, tc := range []struct {
+		name  string
+		asked bool
+	}{{"asked", true}, {"not asked", false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			asked := tc.asked
+			var requests []llm.ChatRequest
+			mock := mockRunner{
+				ChatFn: func(_ context.Context, req llm.ChatRequest, fn func(llm.ChatResponse)) error {
+					requests = append(requests, req)
+					counts := []int{3, 7, 9}
+					if !req.IncludeIntermediateMetrics {
+						counts = []int{0, 0, 9}
+					}
+					fn(llm.ChatResponse{Message: api.Message{Role: "assistant", Thinking: "weighing it up"}, PromptEvalCount: 40, EvalCount: counts[0]})
+					fn(llm.ChatResponse{Message: api.Message{Role: "assistant", Content: "The answer"}, PromptEvalCount: 40, EvalCount: counts[1]})
+					fn(llm.ChatResponse{Message: api.Message{Role: "assistant", Content: " is 42."}, Done: true, DoneReason: llm.DoneReasonStop, PromptEvalCount: 40, EvalCount: counts[2]})
+					return nil
+				},
+			}
+			s := newServerWithMockRunner(t, &mock)
+			createMinimalGGUFModel(t, s, "chat-template-metrics", ggml.KV{
+				"tokenizer.chat_template": "{{ messages[0]['content'] }}",
+			}, "", nil)
+
+			stream := true
+			w := createRequest(t, s.ChatHandler, api.ChatRequest{
+				Model:         "chat-template-metrics",
+				Messages:      []api.Message{{Role: "user", Content: "What is it?"}},
+				Stream:        &stream,
+				StreamMetrics: asked,
+			})
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+			}
+
+			if len(requests) != 1 || requests[0].IncludeIntermediateMetrics != asked {
+				t.Fatalf("stream_metrics=%v: engine asked for running counts = %v", asked, requests[0].IncludeIntermediateMetrics)
+			}
+			if !asked {
+				return
+			}
+
+			var events []api.ChatResponse
+			decoder := json.NewDecoder(w.Body)
+			for {
+				var event api.ChatResponse
+				if err := decoder.Decode(&event); err == io.EOF {
+					break
+				} else if err != nil {
+					t.Fatal(err)
+				}
+				events = append(events, event)
+			}
+			last := 0
+			for _, e := range events {
+				if e.EvalCount == 0 {
+					t.Errorf("a chunk carried no running count: %+v", e)
+				}
+				if e.EvalCount < last {
+					t.Errorf("running count went backwards: %d after %d", e.EvalCount, last)
+				}
+				last = e.EvalCount
+			}
+			if last != 9 {
+				t.Errorf("final count = %d, want 9", last)
+			}
+		})
+	}
+}
+
 func TestChatHandlerChatTemplateRouteTruncatesMessages(t *testing.T) {
 	t.Setenv("OLLAMA_CONTEXT_LENGTH", "4096")
 	t.Setenv("OLLAMA_GO_TEMPLATE", "")

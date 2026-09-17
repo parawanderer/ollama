@@ -1744,6 +1744,8 @@ iGPUScan:
 		useMMapAuto:     req.useMMapAuto,
 		contextShift:    req.contextShift,
 		trainContext:    trainContext,
+		db:              s.db,
+		routingStop:     make(chan struct{}),
 	}
 	runner.name = req.model.Name
 	runner.bandwidthByGPU = make(map[ml.DeviceID]uint64, len(loadGpus))
@@ -1897,6 +1899,7 @@ iGPUScan:
 			complete.ContextMs = complete.DurationMs - complete.WeightsMs
 		}
 		s.publishEvent(complete)
+		runner.watchRouting()
 		s.db.recordLoad(usageLoad{
 			At: time.Now(), Model: req.model.Name, Estimate: loadEstimate,
 			Devices: usageDevices(loadGpus), Split: usageSplit(loadGpus, launchOpts),
@@ -2528,6 +2531,13 @@ type runnerRef struct {
 	llama llm.LlamaServer
 	pid   int
 
+	// db and routingStop drive the routing-statistics poller (routing_db.go). The counts
+	// live in the runner and die with it, so they are copied out on a slow schedule rather
+	// than only at unload: runners here end by being killed, and the box power-cycles.
+	db          *serverDB
+	routingStop chan struct{}
+	routingOnce sync.Once
+
 	// calibrationKey and calibrationCtx are the inputs this load's prediction was made
 	// from, kept so its measurement is recorded under the key a later prediction from the
 	// same inputs will look up.
@@ -2588,6 +2598,12 @@ func (runner *runnerRef) unload() {
 		runner.expireTimer.Stop()
 		runner.expireTimer = nil
 	}
+	runner.stopRoutingPoll()
+	// One last reading before the process is killed, so a runner that lived less than a poll
+	// interval still contributes what it recorded. The deadline is short on purpose: this runs
+	// on the scheduler's path, and a runner too wedged to answer in 200ms is one whose numbers
+	// are not worth waiting on.
+	runner.snapshotRouting(200 * time.Millisecond)
 	if runner.llama != nil {
 		runner.llama.Close()
 	}
@@ -2595,6 +2611,67 @@ func (runner *runnerRef) unload() {
 	runner.Options = nil
 	runner.gpus = nil
 	runner.contextShift = false
+}
+
+// routingPollInterval is how often a runner's routing counts are copied into the database. One
+// local HTTP GET per minute per mixture-of-experts runner costs nothing measurable, and the
+// interval bounds what a kill loses.
+const routingPollInterval = time.Minute
+
+// watchRouting copies this runner's routing counts into the database until it unloads. It runs
+// only for a mixture of experts: every other model reports nothing, and asking would be a request
+// per minute for an endpoint that always answers "not a mixture".
+//
+// The counts only grow over a runner's life, so each snapshot supersedes the last and the row is
+// replaced rather than appended to.
+func (runner *runnerRef) watchRouting() {
+	if runner.expertCount <= 0 || runner.db == nil || runner.llama == nil {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(routingPollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-runner.routingStop:
+				return
+			case <-ticker.C:
+				runner.snapshotRouting(routingPollInterval / 2)
+			}
+		}
+	}()
+}
+
+func (runner *runnerRef) stopRoutingPoll() {
+	if runner.routingStop == nil {
+		return
+	}
+	runner.routingOnce.Do(func() { close(runner.routingStop) })
+}
+
+// snapshotRouting reads the runner's counts and writes them, if it has any. Everything here is
+// best-effort: a runner that does not record routing, an engine without the endpoint and a
+// database that cannot be written all end the same way, with the server running exactly as it
+// would have.
+func (runner *runnerRef) snapshotRouting(timeout time.Duration) {
+	if runner.expertCount <= 0 || runner.db == nil || runner.llama == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	stats := runner.llama.RoutingStats(ctx)
+	if stats == nil {
+		return
+	}
+	runner.db.recordRoutingSnapshot(routingSnapshot{
+		At: time.Now(), Runner: runner.routingKey(), Model: runner.name, Stats: stats,
+	})
+}
+
+// routingKey names one runner life. The pid alone would do until the operating system reuses one,
+// which over a long-lived server it will, so the load time is carried too.
+func (runner *runnerRef) routingKey() string {
+	return fmt.Sprintf("%d@%d", runner.pid, runner.loadStarted.UnixMilli())
 }
 
 func (runner *runnerRef) needsReload(ctx context.Context, req *LlmRequest) bool {

@@ -3697,6 +3697,46 @@ func (s *llamaServerRunner) notifyGeneration(t llamaServerTimings, swap *api.Pro
 	}, meta)
 }
 
+// RoutingStats reads llama-server's /routing, which the fork serves when LLAMA_ROUTING_STATS is
+// set. nil means the runner has nothing to report: not a mixture of experts, recording off, or an
+// engine without the endpoint. It is not cached -- the caller polls it on its own slow schedule,
+// off the scheduler's path -- and a failure is logged at debug, because a stock engine 404s here
+// and that is not a fault.
+func (s *llamaServerRunner) RoutingStats(ctx context.Context) *api.RoutingStats {
+	if s.cmd == nil || s.cmd.ProcessState != nil || s.port == 0 {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, activityRequestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		fmt.Sprintf("http://127.0.0.1:%d/routing", s.port), nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := s.httpClient().Do(req)
+	if err != nil {
+		slog.Debug("could not read runner routing statistics", "port", s.port, "error", err)
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		slog.Debug("runner declined to report routing statistics", "port", s.port, "status", resp.StatusCode)
+		return nil
+	}
+
+	var stats api.RoutingStats
+	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+		slog.Debug("could not decode runner routing statistics", "port", s.port, "error", err)
+		return nil
+	}
+	if !stats.Enabled {
+		return nil
+	}
+	return &stats
+}
+
 // Activity reports what this runner is doing, from llama-server's /slots endpoint, or nil if
 // it cannot be determined.
 //

@@ -1284,6 +1284,60 @@ type PromptCacheState struct {
 // counts on the slot, which is not staleness -- those tokens really are still in the cache --
 // but it does mean the counts describe the *last* task once Phase is "idle", and must not be
 // drawn as work in flight.
+// RoutingStats is what a runner recorded of its mixture-of-experts routing while it served,
+// as llama-server's GET /routing reports it (LLAMA_ROUTING_STATS in the llama.cpp fork).
+//
+// Trained routing is skewed, how skewed depends on the weights, and nothing in a GGUF header
+// says by how much -- so a cost model for a mixture of experts has to measure it, and this is
+// the measurement taken from real traffic rather than from a benchmark. Nothing about the
+// tokens is in it: only counts per expert, per layer.
+type RoutingStats struct {
+	Enabled       bool `json:"enabled"`
+	NumExpert     int  `json:"n_expert"`
+	NumExpertUsed int  `json:"n_expert_used"`
+	// UBatchesSeen counts micro-batches offered to the recorder, recorded or not, so the
+	// share actually sampled can be read off rather than assumed from the period.
+	UBatchesSeen int64 `json:"n_ubatch_seen"`
+	// ReadMicros is the time spent reading routing back off the devices, which is what the
+	// recording costs the runner directly.
+	ReadMicros int64 `json:"t_read_us"`
+
+	// Prefill and Decode are kept apart because they are different token distributions and
+	// what routing does with one says little about the other.
+	Prefill RoutingPopulation `json:"prefill"`
+	Decode  RoutingPopulation `json:"decode"`
+}
+
+// RoutingPopulation is one kind of micro-batch: prefill (more than one token) or decode
+// (exactly one).
+type RoutingPopulation struct {
+	UBatchesRecorded int64          `json:"n_ubatch_recorded"`
+	Tokens           int64          `json:"n_tokens"`
+	Layers           []RoutingLayer `json:"layers"`
+}
+
+// RoutingLayer is one mixture-of-experts layer's record.
+//
+// Divide by this layer's own Tokens, never by the population's: the last layer of a model
+// routes only the tokens whose output is needed, so during prefill its router sees one token
+// where every other layer sees the whole micro-batch.
+type RoutingLayer struct {
+	Layer   int   `json:"il"`
+	Tokens  int64 `json:"n_tokens"`
+	Batches int64 `json:"n_batches"`
+	// Touched, EffExperts and Busiest are means over micro-batches, each computed on one
+	// micro-batch before it was pooled into Counts and weighted by that micro-batch's
+	// tokens. They are not recoverable from Counts: a layer's expert popularity is redrawn
+	// per micro-batch, so pooling many averages that away and routing reads more even than
+	// it is. For decode they are degenerate -- one token takes k distinct experts -- and
+	// only Counts says anything.
+	Touched    float64 `json:"touched"`
+	EffExperts float64 `json:"eff_experts"`
+	Busiest    float64 `json:"busiest"`
+	// Counts is the tokens this layer routed to each expert, pooled over its micro-batches.
+	Counts []int64 `json:"counts"`
+}
+
 type RunnerActivity struct {
 	// Phase is "prefill", "decode" or "idle".
 	//

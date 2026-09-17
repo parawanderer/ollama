@@ -20,6 +20,7 @@ import (
 //   - calibration: every memory sample and every retraction, in order (calibration_db.go)
 //   - device names: what each card was called while healthy (device_names.go)
 //   - the box profile: every measurement of the machine's speed (box_profile.go)
+//   - routing: what each runner's mixture of experts actually did (routing_db.go)
 //
 // All of it is re-measurable. If the file cannot be opened the server runs exactly the same
 // from memory and measures again after a restart, so an unusable database costs time, never
@@ -47,7 +48,7 @@ const (
 
 const serverDBSchema = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-` + usageSchema + calibrationSchema + deviceNamesSchema + profileSchema
+` + usageSchema + calibrationSchema + deviceNamesSchema + profileSchema + routingSchema
 
 const serverDBBuffer = 4096
 
@@ -221,6 +222,8 @@ func (d *serverDB) write(batch []any) error {
 			err = upsertDeviceName(tx, r)
 		case profileRow:
 			err = insertProfile(tx, r)
+		case routingSnapshot:
+			err = insertRoutingSnapshot(tx, r)
 		default:
 			err = fmt.Errorf("no table for %T", row)
 		}

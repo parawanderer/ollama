@@ -2238,7 +2238,8 @@ func (s *mockLlm) MemoryBreakdownByGPU(id ml.DeviceID) api.MemoryBreakdown {
 	return s.memByGPU[id]
 }
 
-func (s *mockLlm) WeightsOnDisk() int64 { return s.weightsOnDisk }
+func (s *mockLlm) WeightsOnDisk() int64                               { return s.weightsOnDisk }
+func (s *mockLlm) RoutingStats(ctx context.Context) *api.RoutingStats { return nil }
 
 func (s *mockLlm) LayerPlacement() *api.ModelPlacement { return s.placement }
 

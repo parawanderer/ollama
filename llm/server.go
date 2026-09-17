@@ -90,6 +90,12 @@ type LlamaServer interface {
 	// cached briefly, so this is safe to call on a polled endpoint.
 	Activity(ctx context.Context, busy bool) *api.RunnerActivity
 
+	// RoutingStats reports what this runner has recorded of its mixture-of-experts routing
+	// while serving, or nil when it records none -- the model is not a mixture, the engine
+	// does not offer it, or LLAMA_ROUTING_STATS is unset. The counts only grow over a
+	// runner's life, so two reads give a window.
+	RoutingStats(ctx context.Context) *api.RoutingStats
+
 	// SetOnGenerationDone registers a callback fired when a completion finishes, with the
 	// engine's own measurement of how it divided between prefill and decode.
 	SetOnGenerationDone(func(api.GenerationTimings, *api.GenerationMeta))

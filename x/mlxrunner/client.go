@@ -549,6 +549,9 @@ func (c *Client) MemoryBreakdownByGPU(id ml.DeviceID) api.MemoryBreakdown {
 }
 
 // WeightsOnDisk implements llm.LlamaServer.
+// RoutingStats: the MLX runner records no routing.
+func (c *Client) RoutingStats(ctx context.Context) *api.RoutingStats { return nil }
+
 func (c *Client) WeightsOnDisk() int64 {
 	info, err := os.Stat(c.ModelPath())
 	if err != nil {

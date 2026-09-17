@@ -134,7 +134,8 @@ func (f *fakeRunner) MemoryBreakdownByGPU(id ml.DeviceID) api.MemoryBreakdown {
 	return f.memByGPU[id]
 }
 
-func (f *fakeRunner) WeightsOnDisk() int64 { return f.weightsOnDisk }
+func (f *fakeRunner) WeightsOnDisk() int64                               { return f.weightsOnDisk }
+func (f *fakeRunner) RoutingStats(ctx context.Context) *api.RoutingStats { return nil }
 
 func (f *fakeRunner) LayerPlacement() *api.ModelPlacement { return f.placement }
 

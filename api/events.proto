@@ -1,0 +1,517 @@
+syntax = "proto3";
+
+// The /api/events stream, as it is sent.
+//
+// This describes the NDJSON that /api/events already serves: one EventFrame per line, in
+// protobuf's canonical JSON mapping. **It is not a second encoding.** The server serves
+// JSON (optionally gzipped) and nothing here changes a byte of it; measuring a binary
+// encoding for this stream was done twice and declined both times, most recently on
+// 2026-09-13 (reports/ui-api/events-protobuf-closed.md in the slop-zone repository: gzip
+// captures 97.6% of the achievable saving without a schema).
+//
+// It exists because the stream has more than one consumer now, in more than one language,
+// and until this file the only statement of what the stream carries was api/types.go. A
+// consumer generates types from this and reads the JSON with them.
+//
+// KINDS. `kind` is one of, and this list is the contract:
+//
+//   hello          first frame on every connection; carries box, serverTime, retainedMs,
+//                  backfilled and unavailable_gpus. Frames with a negative `t` follow it:
+//                  that is the backfill.
+//   heartbeat      every 5 s, so a client can tell a quiet box from a dead connection
+//   sample         periodic state: ps, and info when it has changed since the last sample
+//   estimate       the placement decision, emitted BEFORE the load it decided
+//   load.start     a load began
+//   load.weights   the weights are in; the context is being built. Splits a load in two
+//   load.complete  the load finished; size_vram, memory, weights_ms and context_ms
+//   load.failed    the load did not finish; reason says why
+//   evict          a model was removed to make room for another
+//   unload         a model was removed because its keep-alive expired, or on request
+//   expires        a keep-alive deadline moved
+//   busy.start     a model started working (transitions in and out of idle, not per request)
+//   busy.end       it went idle; this is also when its keep-alive deadline moves
+//   gen.start      one generation began
+//   gen.end        one generation finished; timings, shape, hint, predicted_decode
+//   lease.start    a job outside ollama asked for the GPUs
+//   lease.granted  ollama has vacated them
+//   lease.end      the job finished
+//
+// A client must ignore a kind it does not know: kinds are added without a `v` bump, and
+// four of the ones above did not exist when the first consumer was written.
+//
+// PRESENCE, which is the part to read carefully, because absence is a signal on this
+// stream and it means two different things. A field is `optional` exactly when the JSON key
+// can appear carrying a zero:
+//
+//   optional     the key is written whenever the server has something to say, including
+//                when what it has to say is 0, so your generated code can tell "reported as
+//                zero" from "not reported". `backfilled` is the worked example: it is sent
+//                on every hello, including as 0, because "the history was replayed and held
+//                nothing" and "no history was replayed" are different facts.
+//   not optional the encoder omits the zero value, so a real 0 and an unset field are
+//                indistinguishable on the wire, and a schema cannot record a distinction
+//                the encoder does not make. Read a missing `weights_ms` as "zero or not
+//                measured", never as a measured zero.
+//
+// That mapping is mechanical -- a Go pointer, or a Go field the encoder always writes, is
+// `optional`; a Go field the encoder omits when it is zero is not -- and a test enforces it
+// in both directions (api/events_proto_test.go), along with every field name and type here.
+// Adding a field to api/types.go turns that test red.
+//
+// It matters more than it looks. With `ps.models[].activity.slots_busy` declared as an
+// ordinary field, a frame that said `slots_busy: 0` survives parsing but comes back out of
+// protobuf's JSON mapping with no slots_busy at all -- and on this stream that reads as "the
+// runner could not be asked", which is a different and more alarming fact than "no slot is
+// busy". A first version of this file had the rule as "pointer" alone, and the conformance
+// check found 1221 such paths across 117 real frames.
+//
+// ONE CASE THE SCHEMA CANNOT CARRY: an empty array. protobuf has no presence for repeated
+// fields, so a `[]` the box sent comes back absent through a round trip. Nothing on this
+// stream distinguishes "empty" from "not reported" for a list today, so this loses no
+// meaning -- but do not build one on it.
+//
+// STABILITY. The envelope (v, kind, t, box, serverTime, retainedMs, backfilled, dropped)
+// and the lifecycle edges are settled; treat them as stable. Two areas still move, and are
+// marked UNSTABLE where they are declared: LoadEstimate.breakdown and RunnerActivity, both
+// of which are the live edge of the placement work. `ps` and `info` mirror ollama's own
+// /api/ps and /api/info bodies, so they also move when ollama does; they are declared in
+// full rather than left opaque because they are most of what a panel draws.
+//
+// VERSIONING. `v` is the frame version and is 1. It is bumped only for a change that would
+// break a client that ignores unknown fields and unknown kinds -- a field removed, renamed,
+// or given a new meaning. Additions do not bump it.
+
+package slop.events.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// The measured machine: what each device does, and what each link costs.
+message BoxProfile {
+  optional string state = 1;
+  optional google.protobuf.Timestamp measured_at = 2;
+  repeated ProfileDevice devices = 3;
+  repeated ProfileLink links = 4;
+  repeated ProfileFailure failures = 5;
+}
+
+// The machine's compute: what can be used, what cannot, and how it is wired.
+message ComputeInfo {
+  optional SystemComputeInfo system_compute = 1;
+  repeated GPUInfo supported_gpus = 2;
+  repeated UnavailableGPU unavailable_gpus = 3;
+  optional GPUTopology topology = 4;
+  optional BoxProfile profile = 5;
+}
+
+// The box profile's prediction for this generation's decode, made before it ran.
+message DecodePrediction {
+  optional double ms_per_token = 1;
+  optional double occupancy_tokens = 2;
+  optional string basis = 3;
+  double profile_ms_per_token = 4;
+  double correction_factor = 5;
+  int32 correction_samples = 6;
+  bool excludes_cache_read = 7;
+}
+
+// One line of /api/events.
+//
+// Flat, because that is what is sent: the server builds this from api.EventFrame, which
+// repeats ModelEvent's fields rather than embedding it. Most fields are absent on most
+// kinds; which ones a kind carries is in the kind list at the top of this file.
+message EventFrame {
+  // Frame version; 1. See VERSIONING at the top of this file.
+  optional int32 v = 1;
+  optional string kind = 2;
+  // Milliseconds since this connection's hello. Negative on backfilled frames.
+  optional int64 t = 3;
+  repeated UnavailableGPU unavailable_gpus = 4;
+  optional google.protobuf.Timestamp serverTime = 5;
+  // Identifies the machine, so a client can drop history from a different one. hello only.
+  string box = 6;
+  // How much backfill this server can serve. hello only.
+  int64 retainedMs = 7;
+  // How many retained frames follow this hello. Present on every hello, including as 0.
+  optional int32 backfilled = 8;
+  string model = 9;
+  string reason = 10;
+  optional google.protobuf.Timestamp expires_at = 11;
+  int64 duration_ms = 12;
+  // The two halves of a load, repeated on load.complete so a client that
+  int64 weights_ms = 13;
+  // subscribed mid-load still gets the split.
+  int64 context_ms = 14;
+  // On load.weights what the weights occupy; on load.complete what the finished model holds.
+  int64 size_vram = 15;
+  optional GenerationTimings timings = 16;
+  optional RequestHint hint = 17;
+  optional DecodePrediction predicted_decode = 18;
+  optional RequestShape shape = 19;
+  optional LeaseInfo lease = 20;
+  optional MemoryBreakdown memory = 21;
+  optional MemoryBreakdown memory_host = 22;
+  int64 weights_on_disk = 23;
+  // Which layers went where, when the server records that.
+  optional ModelPlacement placement = 24;
+  optional LoadEstimate estimate = 25;
+  // What the load holds everywhere, device and host. Above size_vram means it spilled.
+  int64 size_total = 26;
+  // The /api/ps body, on a sample.
+  optional ProcessResponse ps = 27;
+  // The /api/info body, on the first sample and whenever it changed.
+  optional InfoResponse info = 28;
+  // Frames this subscriber lost to a full buffer, cumulative. Non-zero means its record has a
+  // gap, which must not be drawn as a flat line. Absent means none.
+  uint64 dropped = 29;
+}
+
+// The decode speed this model is expected to reach on this placement.
+message ExpectedDecode {
+  string unavailable = 1;
+  double tokens_per_sec = 2;
+  string basis = 3;
+  double profile_tokens_per_sec = 4;
+  double correction_factor = 5;
+  int32 correction_samples = 6;
+  double ms_per_token_per_1k_context = 7;
+  double active_weights_fraction = 8;
+}
+
+// What the PCI bus says about a card that the driver no longer answers for.
+message GPUBusState {
+  optional bool present = 1;
+  string link_speed = 2;
+  int32 link_width = 3;
+  string power_state = 4;
+  string max_link_speed = 5;
+  int32 max_link_width = 6;
+  optional int32 pcie_fatal_errors = 7;
+  optional int32 pcie_nonfatal_errors = 8;
+}
+
+// One usable GPU.
+message GPUInfo {
+  optional string gpu_id = 1;
+  string pci_id = 2;
+  optional string name = 3;
+  string description = 4;
+  optional uint64 total_memory = 5;
+  repeated GPUProcess processes = 6;
+  string processes_scope = 7;
+  string leased = 8;
+  uint64 physical_memory = 9;
+  uint64 memory_bandwidth_bytes_per_sec = 10;
+  int32 memory_bus_width_bits = 11;
+  int32 memory_clock_max_mhz = 12;
+  int32 pcie_max_generation = 13;
+  int32 pcie_max_width = 14;
+  optional GPUUtilization utilization = 15;
+  optional uint64 free_memory = 16;
+  string compute = 17;
+  string driver = 18;
+  optional string runner = 19;
+}
+
+// One link between two GPUs.
+message GPULink {
+  optional string a = 1;
+  optional string b = 2;
+  optional string type = 3;
+  string path = 4;
+  int32 nvlink_count = 5;
+  int32 nvlink_version = 6;
+  string pcie_path = 7;
+  uint64 bandwidth_bytes_per_sec = 8;
+  string bandwidth_source = 9;
+  string reason = 10;
+}
+
+// A process holding memory on a device.
+message GPUProcess {
+  optional int32 pid = 1;
+  optional uint64 used_memory = 2;
+  string name = 3;
+  optional GPUProcessRunner runner = 4;
+  bool ollama_helper = 5;
+}
+
+// The model an ollama runner process is serving, when the process is one.
+message GPUProcessRunner {
+  optional string model = 1;
+  bool loading = 2;
+}
+
+// How the GPUs are connected to each other.
+message GPUTopology {
+  optional string status = 1;
+  string detail = 2;
+  repeated string gpus = 3;
+  repeated GPULink links = 4;
+}
+
+// A device's utilization, as the driver reports it.
+message GPUUtilization {
+  optional int32 gpu_percent = 1;
+  optional int32 memory_percent = 2;
+}
+
+// How one generation divided, from the engine's own measurement, on gen.end.
+message GenerationTimings {
+  optional int32 prompt_tokens = 1;
+  // Of prompt_tokens, how many the cache already held.
+  optional int32 prompt_tokens_cached = 2;
+  optional double prompt_ms = 3;
+  optional double eval_ms = 4;
+  optional int32 decoded = 5;
+  optional PromptCacheSwap prompt_cache_swap = 6;
+}
+
+// The /api/info body. Sent on the first sample and whenever it has changed.
+message InfoResponse {
+  optional string version = 1;
+  optional SystemModelInfo models = 2;
+  optional ComputeInfo compute = 3;
+  optional int64 load_stall_timeout_ms = 4;
+}
+
+// Who holds a GPU lease, and on which devices.
+message LeaseInfo {
+  optional string holder = 1;
+  repeated string devices = 2;
+}
+
+// A measured all-reduce over that link.
+message LinkReduction {
+  optional int32 width = 1;
+  optional double us = 2;
+}
+
+// What a load was predicted to need, and what the prediction was based on.
+message LoadEstimate {
+  // What the model itself was expected to hold.
+  optional int64 predicted = 1;
+  // Plus the batch surcharge: the figure the fit decision was made against.
+  optional int64 predicted_for_load = 2;
+  // Where the figure came from: metadata, calibration or probe. Read this first.
+  optional string source = 3;
+  optional int32 num_ctx = 4;
+  optional int32 num_gpu = 5;
+  optional int32 num_batch = 6;
+  optional bool metadata_complete = 7;
+  // UNSTABLE, and only weights and kv_cache are populated. It is always the METADATA split even
+  // when source says probe or calibration, so its terms are comparable with what load.complete
+  // measured but its total is not `predicted`.
+  optional MemoryBreakdown breakdown = 8;
+}
+
+// What a load's memory holds, split by kind.
+message MemoryBreakdown {
+  optional int64 weights = 1;
+  optional int64 kv_cache = 2;
+  int64 recurrent_state = 3;
+  optional int64 compute = 4;
+  int64 output = 5;
+  int64 projector = 6;
+  int64 other = 7;
+}
+
+// The model's own description, from its manifest.
+message ModelDetails {
+  optional string parent_model = 1;
+  optional string format = 2;
+  optional string family = 3;
+  repeated string families = 4;
+  optional string parameter_size = 5;
+  optional string quantization_level = 6;
+  int32 context_length = 7;
+  int32 embedding_length = 8;
+}
+
+// Which layers landed on which device. Absent unless the server was started with
+// OLLAMA_LAYER_PLACEMENT.
+message ModelPlacement {
+  optional int32 num_layers = 1;
+  repeated PlacementRange devices = 2;
+  repeated int32 swa_layers = 3;
+}
+
+// The ceiling the hardware puts on decode for this model, and what it was computed from.
+message ModelRoofline {
+  string unavailable = 1;
+  string basis = 2;
+  uint64 bytes_per_token = 3;
+  double ceiling_tokens_per_sec = 4;
+  uint64 kv_bytes_per_context_token = 5;
+  repeated RooflineDevice devices = 6;
+}
+
+// One device's share of the layers, as a contiguous range.
+message PlacementRange {
+  optional string device = 1;
+  string gpu_id = 2;
+  optional int32 first_layer = 3;
+  optional int32 last_layer = 4;
+  optional int32 layers = 5;
+}
+
+// One model's share of one device.
+message ProcessGPU {
+  optional string gpu_id = 1;
+  string runner = 2;
+  optional int64 size_vram = 3;
+  optional MemoryBreakdown memory = 4;
+}
+
+// One resident model, as /api/ps reports it.
+message ProcessModelResponse {
+  optional string name = 1;
+  bool busy = 2;
+  string state = 3;
+  optional string model = 4;
+  optional int64 size = 5;
+  optional string digest = 6;
+  ModelDetails details = 7;
+  optional google.protobuf.Timestamp expires_at = 8;
+  optional int64 size_vram = 9;
+  optional ModelRoofline roofline = 10;
+  optional ExpectedDecode expected_decode = 11;
+  optional int32 context_length = 12;
+  optional MemoryBreakdown memory = 13;
+  int64 weights_on_disk = 14;
+  optional ModelPlacement placement = 15;
+  // UNSTABLE. Absent means the runner could not be asked, which is NOT the same as idle.
+  optional RunnerActivity activity = 16;
+  // Per device. Absent means the model is on the host, not that the split is unknown.
+  repeated ProcessGPU gpus = 17;
+}
+
+// The /api/ps body, byte-identical to what that endpoint serves.
+message ProcessResponse {
+  repeated ProcessModelResponse models = 1;
+}
+
+// One device's measured bandwidth and per-layer cost.
+message ProfileDevice {
+  optional string gpu_id = 1;
+  string pci_id = 2;
+  optional uint64 bandwidth_bytes_per_sec = 3;
+  optional double token_overhead_ms = 4;
+  optional double layer_overhead_us = 5;
+  optional double fit_error_pct = 6;
+}
+
+// A measurement the profile could not take, and why.
+message ProfileFailure {
+  optional string what = 1;
+  repeated string pci_ids = 2;
+  optional string error = 3;
+}
+
+// One link's measured cost, as the profile saw it.
+message ProfileLink {
+  repeated string pci_ids = 1;
+  repeated LinkReduction reductions = 2;
+}
+
+// What the runner's prompt cache holds.
+message PromptCacheState {
+  optional int32 entries = 1;
+  optional int32 tokens = 2;
+  optional uint64 bytes = 3;
+  optional uint64 limit_bytes = 4;
+}
+
+// What the prompt cache did for this generation: what it saved, and what it cost.
+message PromptCacheSwap {
+  optional double ms = 1;
+  int32 saved_tokens = 2;
+  uint64 saved_bytes = 3;
+  optional bool restored = 4;
+  int32 evicted = 5;
+  uint64 evicted_bytes = 6;
+  bool too_large = 7;
+}
+
+// What the caller said the request was for. Advisory, and recorded only.
+message RequestHint {
+  string use = 1;
+  string session = 2;
+  string request = 3;
+  string after = 4;
+  bool synthetic = 5;
+}
+
+// The request's form -- not its content. Nothing here is derived from the prompt.
+message RequestShape {
+  optional string endpoint = 1;
+  optional string surface = 2;
+  optional bool stream = 3;
+  int32 messages = 4;
+  int32 images = 5;
+  int32 tools = 6;
+  bool format = 7;
+  string think = 8;
+  optional int32 num_ctx = 9;
+  optional int32 num_gpu = 10;
+  optional int32 num_predict = 11;
+  optional int64 keep_alive_s = 12;
+  string client = 13;
+}
+
+// One device's contribution to the roofline.
+message RooflineDevice {
+  optional string gpu_id = 1;
+  string pci_id = 2;
+  optional uint64 bytes_per_token = 3;
+  uint64 kv_bytes_per_context_token = 4;
+  optional uint64 memory_bandwidth_bytes_per_sec = 5;
+}
+
+// What the runner is doing right now.
+//
+// UNSTABLE: this is the live edge of the work and has changed several times. Generate from
+// it, but expect fields to be added.
+message RunnerActivity {
+  optional string phase = 1;
+  optional int32 slots = 2;
+  optional int32 slots_busy = 3;
+  int32 prompt_tokens = 4;
+  int32 prompt_tokens_done = 5;
+  int32 prompt_tokens_cached = 6;
+  int32 decoded = 7;
+  optional PromptCacheState prompt_cache = 8;
+}
+
+// Host memory and CPU, as the machine reports them.
+message SystemComputeInfo {
+  optional int32 cpu_cores = 1;
+  optional uint64 total_memory = 2;
+  optional uint64 free_memory = 3;
+  optional uint64 free_swap = 4;
+}
+
+// How many models are on disk and how many are resident.
+message SystemModelInfo {
+  optional string store = 1;
+  optional int32 count = 2;
+  optional uint64 filesystem_used = 3;
+  optional int32 running = 4;
+  optional uint64 vram_used = 5;
+}
+
+// A GPU the machine has and cannot use.
+//
+// On the hello frame rather than only on an edge, because the fault is almost always OLDER
+// than the connection: hardware does not wait for a subscriber. Transitions arrive later as
+// an `info` frame whose compute.unavailable_gpus has changed.
+message UnavailableGPU {
+  string pci_id = 1;
+  string name = 2;
+  string uuid = 3;
+  string last_name = 4;
+  optional google.protobuf.Timestamp last_seen = 5;
+  optional string reason = 6;
+  string detail = 7;
+  string recovery = 8;
+  optional GPUBusState bus = 9;
+}

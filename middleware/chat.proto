@@ -82,10 +82,25 @@ message End {
   optional uint32 cached_tokens = 4;
 }
 
+// Something in the stream that is not part of the completion. Open WebUI's own chat route
+// puts these in: `{"sources": [...]}` ahead of the first token for a retrieval or knowledge
+// hit, and whatever a filter function emits. ollama never sends one -- it has nothing to put
+// in it -- but the definition lives here so the two encoders of this format cannot disagree
+// about the wire.
+//
+// The JSON is carried verbatim rather than modelled. A client hands it to its caller without
+// interpreting it, and a shape modelled here would have to track Open WebUI's, which is not
+// this file's to define. It is also what keeps the frame total: a payload the encoder does
+// not recognise becomes one of these instead of being dropped.
+message Event {
+  string json = 1;
+}
+
 message Frame {
   oneof kind {
     Start start = 1;
     Delta delta = 2;
     End end = 3;
+    Event event = 4;
   }
 }

@@ -542,7 +542,7 @@ func ChatMiddleware() gin.HandlerFunc {
 
 		// Content negotiation, so this is the same endpoint and a client that asks for
 		// nothing gets exactly the SSE it got before.
-		wantsProto := req.Stream && acceptsProtoStream(c.Request.Header.Values("Accept"))
+		wantsProto := req.Stream && AcceptsProtoStream(c.Request.Header.Values("Accept"))
 		if wantsProto {
 			c.Header("Content-Type", protoStreamContentType)
 		}

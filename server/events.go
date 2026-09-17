@@ -184,25 +184,38 @@ func acceptsGzip(header string) bool {
 // the same model names, digests and device ids in frame after frame, and 13.3x of the 13.3x
 // measured comes from matching those against earlier frames. Compressing each frame
 // independently gets 1.9x.
+//
+// The same type carries the binary encoding, because the flushing is the same problem and
+// the gzip window is worth just as much there: protobuf repeats the values, not the names,
+// so the cross-frame matching deflate does is most of the win in both encodings.
 type eventEncoder struct {
-	enc  *json.Encoder
-	gz   *gzip.Writer
-	http http.Flusher
+	enc   *json.Encoder
+	w     io.Writer
+	proto bool
+	gz    *gzip.Writer
+	http  http.Flusher
 }
 
-func newEventEncoder(w io.Writer, flusher http.Flusher, compress bool) *eventEncoder {
-	e := &eventEncoder{http: flusher}
+func newEventEncoder(w io.Writer, flusher http.Flusher, compress, proto bool) *eventEncoder {
+	e := &eventEncoder{http: flusher, proto: proto}
 	if compress {
 		e.gz = gzip.NewWriter(w)
 		w = e.gz
 	}
-	e.enc = json.NewEncoder(w)
+	e.w = w
+	if !proto {
+		e.enc = json.NewEncoder(w)
+	}
 	return e
 }
 
 // Encode writes one frame and pushes it all the way out.
-func (e *eventEncoder) Encode(v any) error {
-	if err := e.enc.Encode(v); err != nil {
+func (e *eventEncoder) Encode(v api.EventFrame) error {
+	if e.proto {
+		if err := api.WriteEventFrameProto(e.w, v); err != nil {
+			return err
+		}
+	} else if err := e.enc.Encode(v); err != nil {
 		return err
 	}
 	if e.gz != nil {

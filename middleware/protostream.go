@@ -44,9 +44,12 @@ const (
 	protoStreamAccept      = "application/protobuf"
 )
 
-// acceptsProtoStream decides, from a request's Accept headers, whether to answer a stream
-// with protobuf instead of SSE. SSE is the default and the only thing a client that says
-// nothing can get.
+// AcceptsProtoStream decides, from a request's Accept headers, whether to answer a stream
+// with protobuf instead of the text encoding. It is exported because /api/events negotiates
+// the same way (server/routes.go) and two implementations of one contract is how the two
+// endpoints would start disagreeing about what `application/protobuf;q=0` means. Here the
+// text encoding is SSE; there it is NDJSON. The default, for a client that says nothing, is
+// always the text one.
 //
 // `strings.Contains(accept, "application/protobuf")` is not negotiation, and it was what
 // this used to do: it served protobuf to a client that wrote `application/protobuf;q=0`,
@@ -66,7 +69,7 @@ const (
 //
 // A media range whose q is malformed is dropped rather than guessed at, which resolves to
 // SSE for the protobuf side and cannot invent a preference on the SSE side.
-func acceptsProtoStream(values []string) bool {
+func AcceptsProtoStream(values []string) bool {
 	var proto, sse float64
 	sseSpecificity := -1
 	seenProto := false

@@ -47,8 +47,8 @@ func TestAcceptsProtoStream(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := acceptsProtoStream(tc.accept); got != tc.want {
-				t.Errorf("acceptsProtoStream(%q) = %v, want %v", tc.accept, got, tc.want)
+			if got := AcceptsProtoStream(tc.accept); got != tc.want {
+				t.Errorf("AcceptsProtoStream(%q) = %v, want %v", tc.accept, got, tc.want)
 			}
 		})
 	}

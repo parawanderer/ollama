@@ -2676,7 +2676,17 @@ func (s *Server) EventsHandler(c *gin.Context) {
 	events, unsubscribe := s.sched.events.Subscribe()
 	defer unsubscribe()
 
-	c.Header("Content-Type", "application/x-ndjson")
+	// Content negotiation, the same contract the chat stream uses (middleware.AcceptsProtoStream):
+	// a client that says nothing, or says */*, gets the NDJSON it always got. Binary protobuf
+	// is not here for the bytes -- it is 29 a frame against gzipped NDJSON -- but so a relay
+	// can pass one encoding end to end instead of decoding and re-encoding each frame, and so
+	// a phone decodes natively instead of parsing JSON. events.proto is the schema for both.
+	proto := middleware.AcceptsProtoStream(c.Request.Header.Values("Accept"))
+	if proto {
+		c.Header("Content-Type", api.EventFrameProtoContentType)
+	} else {
+		c.Header("Content-Type", "application/x-ndjson")
+	}
 	c.Header("Cache-Control", "no-store")
 	c.Header("X-Accel-Buffering", "no") // ask any nginx in the path not to buffer this
 
@@ -2693,10 +2703,11 @@ func (s *Server) EventsHandler(c *gin.Context) {
 		c.Header("Content-Encoding", "gzip")
 	}
 	// Vary regardless of the outcome -- a cache that saw the uncompressed answer must not
-	// serve it to a client that asked for gzip, or the reverse.
-	c.Header("Vary", "Accept-Encoding")
+	// serve it to a client that asked for gzip, or the reverse. Accept for the same reason,
+	// now that the body's shape depends on it too.
+	c.Header("Vary", "Accept-Encoding, Accept")
 
-	enc := newEventEncoder(c.Writer, c.Writer, compress)
+	enc := newEventEncoder(c.Writer, c.Writer, compress, proto)
 	defer enc.Close()
 
 	started := time.Now()

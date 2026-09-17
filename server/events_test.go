@@ -3,16 +3,22 @@ package server
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
+
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/ml"
 )
 
 func TestEventBusDeliversToEverySubscriber(t *testing.T) {
@@ -282,14 +288,19 @@ func TestAcceptsGzip(t *testing.T) {
 // do all decode, just not when they were written. So the assertion has to be that frame N is
 // readable BEFORE frame N+1 is written.
 func TestEventEncoderFlushesEachFrame(t *testing.T) {
-	for _, compress := range []bool{false, true} {
-		name := "plain"
-		if compress {
-			name = "gzip"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		compress, proto bool
+	}{
+		{"plain", false, false},
+		{"gzip", true, false},
+		{"proto", false, true},
+		{"proto gzip", true, true},
+	} {
+		compress := tc.compress
+		t.Run(tc.name, func(t *testing.T) {
 			var buf bytes.Buffer
-			enc := newEventEncoder(&buf, nil, compress)
+			enc := newEventEncoder(&buf, nil, compress, tc.proto)
 
 			for i := 1; i <= 3; i++ {
 				if err := enc.Encode(api.EventFrame{V: 1, Kind: "sample", Model: fmt.Sprint("m", i)}); err != nil {
@@ -297,7 +308,7 @@ func TestEventEncoderFlushesEachFrame(t *testing.T) {
 				}
 				// Read what a client would have received by now, without closing the
 				// stream -- closing is what a batch encoder would need to be readable.
-				got := decodeFrames(t, buf.Bytes(), compress)
+				got := decodeFramesAs(t, buf.Bytes(), compress, tc.proto)
 				if len(got) != i {
 					t.Fatalf("after writing %d frames the client can read %d; the encoder is "+
 						"buffering, so frames arrive late and in bursts", i, len(got))
@@ -325,7 +336,7 @@ func TestEventEncoderRoundTrips(t *testing.T) {
 
 	encode := func(compress bool) []byte {
 		var buf bytes.Buffer
-		enc := newEventEncoder(&buf, nil, compress)
+		enc := newEventEncoder(&buf, nil, compress, false)
 		for _, f := range frames {
 			if err := enc.Encode(f); err != nil {
 				t.Fatal(err)
@@ -354,6 +365,13 @@ func TestEventEncoderRoundTrips(t *testing.T) {
 // decodeFrames reads however many complete frames are present, without requiring the stream
 // to be finished. io.ErrUnexpectedEOF is the normal case mid-stream and not a failure.
 func decodeFrames(t *testing.T, b []byte, compressed bool) []api.EventFrame {
+	return decodeFramesAs(t, b, compressed, false)
+}
+
+// decodeFramesAs reads a stream in either encoding. The protobuf branch goes back through
+// the schema's own JSON mapping rather than a second Go decoder, so what it asserts on is
+// what a generated client would see, not what this package believes it wrote.
+func decodeFramesAs(t *testing.T, b []byte, compressed, proto bool) []api.EventFrame {
 	t.Helper()
 	var r io.Reader = bytes.NewReader(b)
 	if compressed {
@@ -368,6 +386,19 @@ func decodeFrames(t *testing.T, b []byte, compressed bool) []api.EventFrame {
 		r = zr
 	}
 	var out []api.EventFrame
+	if proto {
+		for {
+			body, err := api.ReadEventFrameProto(r)
+			if err != nil {
+				return out
+			}
+			f, err := api.UnmarshalEventFrameProto(body)
+			if err != nil {
+				t.Fatalf("decoding a frame through events.proto: %v", err)
+			}
+			out = append(out, f)
+		}
+	}
 	dec := json.NewDecoder(r)
 	for {
 		var f api.EventFrame
@@ -486,5 +517,89 @@ func TestCachedPromptTokensDistinguishesColdFromUnreported(t *testing.T) {
 	if cold == unreported {
 		t.Error("a cold prefill and an unreported figure encode identically; the field cannot " +
 			"tell a consumer which one it is looking at")
+	}
+}
+
+// The events stream negotiates its encoding the same way the chat stream does, and this is the
+// test that the negotiation is wired to the handler rather than merely correct: what it asserts
+// on is the response — its Content-Type, and whether the first frame decodes in that encoding.
+func TestEventsHandlerNegotiatesEncoding(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cases := []struct {
+		name   string
+		accept string
+		proto  bool
+	}{
+		{"no Accept stays on NDJSON", "", false},
+		{"anything stays on NDJSON", "*/*", false},
+		{"protobuf asked for", "application/protobuf", true},
+		{"protobuf preferred over NDJSON", "application/protobuf, application/x-ndjson;q=0.9", true},
+		{"an explicit refusal stays on NDJSON", "application/protobuf;q=0", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Enough scheduler for the hello frame: the bus, the backfill ring, and a
+			// discovery function, which the hello calls to report unusable GPUs.
+			s := &Server{sched: &Scheduler{
+				events:      newEventBus(),
+				ring:        newFrameRing(time.Minute),
+				getGpuFn:    func(context.Context, []ml.FilteredRunnerDiscovery) []ml.DeviceInfo { return nil },
+				deviceNames: newDeviceNames(nil),
+			}}
+
+			router := gin.New()
+			router.GET("/api/events", s.EventsHandler)
+			srv := httptest.NewServer(router)
+			defer srv.Close()
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/events", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.accept != "" {
+				req.Header.Set("Accept", tc.accept)
+			}
+			res, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer res.Body.Close()
+
+			want := "application/x-ndjson"
+			if tc.proto {
+				want = api.EventFrameProtoContentType
+			}
+			if got := res.Header.Get("Content-Type"); got != want {
+				t.Errorf("Content-Type = %q, want %q", got, want)
+			}
+			if got := res.Header.Get("Vary"); !strings.Contains(got, "Accept") {
+				t.Errorf("Vary = %q, must name Accept now that the body depends on it", got)
+			}
+
+			// The hello frame, read in the encoding that was negotiated. Reading it in the
+			// other one is what would fail if the header and the body disagreed.
+			var hello api.EventFrame
+			if tc.proto {
+				body, err := api.ReadEventFrameProto(res.Body)
+				if err != nil {
+					t.Fatalf("reading a protobuf frame: %v", err)
+				}
+				if hello, err = api.UnmarshalEventFrameProto(body); err != nil {
+					t.Fatalf("decoding it through events.proto: %v", err)
+				}
+			} else if err := json.NewDecoder(res.Body).Decode(&hello); err != nil {
+				t.Fatalf("reading an NDJSON frame: %v", err)
+			}
+			if hello.Kind != "hello" || hello.V != 1 {
+				t.Errorf("first frame = %+v, want the hello", hello)
+			}
+			if hello.Backfilled == nil {
+				t.Error("the hello must carry backfilled, including as 0")
+			}
+		})
 	}
 }

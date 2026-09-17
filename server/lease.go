@@ -128,6 +128,7 @@ func (s *Scheduler) vacate(l *lease) []string {
 			r.expireTimer = nil
 		}
 		r.sessionDuration = 0
+		r.unloadReason = api.UnloadLeased
 		if r.refCount == 0 && !r.leaseExpiring {
 			r.leaseExpiring = true
 			s.expiredCh <- r

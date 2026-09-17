@@ -2801,3 +2801,85 @@ func TestProbeUsesTheLoadedContextInsideTheRange(t *testing.T) {
 		}
 	}
 }
+
+// Every path that takes a runner down says why, and the reason reaches the unload frame.
+//
+// The two halves are tested separately because they fail separately. This is the plumbing:
+// the reason is set on the runner by whoever expires it, and processCompleted has to put it
+// on the event. The other half -- that no path forgets to set it -- is
+// TestEveryExpiryPathSaysWhy.
+func TestUnloadFrameCarriesItsReason(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), 5*time.Second)
+	defer done()
+
+	s := InitScheduler(ctx)
+	events, unsubscribe := s.events.Subscribe()
+	defer unsubscribe()
+
+	runner := &runnerRef{
+		llama:           &mockLlm{},
+		model:           &Model{Name: "m"},
+		modelKey:        "m",
+		numParallel:     1,
+		sessionDuration: 0,
+		unloadReason:    api.UnloadDisplaced,
+	}
+	s.loaded["m"] = runner
+
+	go s.processCompleted(ctx)
+	s.expiredCh <- runner
+
+	for {
+		select {
+		case ev := <-events:
+			if ev.Type != EventUnload {
+				continue
+			}
+			if ev.Reason != api.UnloadDisplaced {
+				t.Fatalf("the unload frame says reason %q, want %q", ev.Reason, api.UnloadDisplaced)
+			}
+			return
+		case <-ctx.Done():
+			t.Fatal("no unload event arrived")
+		}
+	}
+}
+
+// No path may take a runner down without saying why: the reason is what stops a panel
+// labelling a displacement as an idle timeout, which is the bug this came from. A ninth
+// path that forgets is invisible at runtime -- the frame simply has no reason -- so it is
+// checked here, against the source, the same way the event schema is checked against the
+// encoder.
+func TestEveryExpiryPathSaysWhy(t *testing.T) {
+	for _, file := range []string{"sched.go", "lease.go"} {
+		src, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(string(src), "\n")
+		for i, line := range lines {
+			if !strings.Contains(line, "expiredCh <-") {
+				continue
+			}
+			// Look back over the enclosing block for the assignment. 25 lines covers every
+			// current site with room; a site that needs more is a site worth restructuring.
+			said := false
+			for j := i; j >= 0 && j > i-25; j-- {
+				if strings.Contains(lines[j], "unloadReason = ") {
+					said = true
+					break
+				}
+				// A retry of an expiry already queued keeps the reason the first one set.
+				if strings.Contains(lines[j], "expired event with positive ref count") {
+					said = true
+					break
+				}
+			}
+			if !said {
+				t.Errorf("%s:%d expires a runner without setting unloadReason:\n  %s\n"+
+					"Every path must say why, or the unload frame claims nothing and a client "+
+					"has to guess between an idle timeout and a displacement.", file, i+1, strings.TrimSpace(line))
+			}
+		}
+	}
+}

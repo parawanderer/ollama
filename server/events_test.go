@@ -303,8 +303,8 @@ func TestEventEncoderFlushesEachFrame(t *testing.T) {
 			enc := newEventEncoder(&buf, nil, compress, tc.proto)
 
 			for i := 1; i <= 3; i++ {
-				if err := enc.Encode(api.EventFrame{V: 1, Kind: "sample", Model: fmt.Sprint("m", i)}); err != nil {
-					t.Fatalf("encode %d: %v", i, err)
+				if encodeErr, err := enc.Encode(api.EventFrame{V: 1, Kind: "sample", Model: fmt.Sprint("m", i)}); encodeErr != nil || err != nil {
+					t.Fatalf("encode %d: %v %v", i, encodeErr, err)
 				}
 				// Read what a client would have received by now, without closing the
 				// stream -- closing is what a batch encoder would need to be readable.
@@ -338,8 +338,8 @@ func TestEventEncoderRoundTrips(t *testing.T) {
 		var buf bytes.Buffer
 		enc := newEventEncoder(&buf, nil, compress, false)
 		for _, f := range frames {
-			if err := enc.Encode(f); err != nil {
-				t.Fatal(err)
+			if encodeErr, err := enc.Encode(f); encodeErr != nil || err != nil {
+				t.Fatal(encodeErr, err)
 			}
 		}
 		if err := enc.Close(); err != nil {
@@ -601,5 +601,113 @@ func TestEventsHandlerNegotiatesEncoding(t *testing.T) {
 				t.Error("the hello must carry backfilled, including as 0")
 			}
 		})
+	}
+}
+
+// A frame the encoder cannot produce must not take the connection down with it. It would be
+// the same frame on every reconnect, so every client would loop on it; and a silently skipped
+// frame is no better, because an edge that vanishes is indistinguishable from one that never
+// happened. So: skip, count, and let the count travel as dropped, which is what a client
+// already handles as "your record has a gap".
+//
+// The failure is injected, because the only thing that causes it in production is a frame the
+// schema does not declare, which the lockstep test turns into a build failure. A behaviour
+// that cannot be exercised is a behaviour nobody should trust.
+func TestEventEncoderSkipsAFrameItCannotEncode(t *testing.T) {
+	var buf bytes.Buffer
+	enc := newEventEncoder(&buf, nil, false, true)
+
+	failing := "sample"
+	enc.marshalProto = func(f api.EventFrame) ([]byte, error) {
+		if f.Kind == failing {
+			return nil, errors.New("a field the schema does not declare")
+		}
+		return marshalDelimitedProto(f)
+	}
+
+	encodeErr, err := enc.Encode(api.EventFrame{V: 1, Kind: "sample", Model: "m1"})
+	if encodeErr == nil {
+		t.Fatal("an unencodable frame reported no encode error")
+	}
+	if err != nil {
+		t.Fatalf("an unencodable frame must not be a connection error, got %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("%d bytes were written for a frame that could not be encoded", buf.Len())
+	}
+
+	// The stream carries on, which is the point.
+	encodeErr, err = enc.Encode(api.EventFrame{V: 1, Kind: "heartbeat"})
+	if encodeErr != nil || err != nil {
+		t.Fatalf("the next frame failed too: %v %v", encodeErr, err)
+	}
+	got := decodeFramesAs(t, buf.Bytes(), false, true)
+	if len(got) != 1 || got[0].Kind != "heartbeat" {
+		t.Errorf("after one skip the stream carries %+v, want just the heartbeat", got)
+	}
+}
+
+// Every frame says when it happened in wall clock time, not only where it sits in this
+// connection -- a relayed frame reaches a client that never saw the hello `t` is measured
+// from. A backfilled frame must carry the moment it HAPPENED, not the moment it was replayed,
+// which is the case a naive stamp-on-send gets wrong.
+func TestEventFramesCarryAnAbsoluteTime(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	s := &Server{sched: &Scheduler{
+		events:      newEventBus(),
+		ring:        newFrameRing(time.Hour),
+		getGpuFn:    func(context.Context, []ml.FilteredRunnerDiscovery) []ml.DeviceInfo { return nil },
+		deviceNames: newDeviceNames(nil),
+	}}
+
+	// An event from ten minutes ago, in the ring the hello replays from.
+	happened := time.Now().Add(-10 * time.Minute)
+	s.sched.ring.add(retainedFrame{at: happened, event: api.ModelEvent{
+		Type: EventUnload, Model: "m", At: happened, Reason: api.UnloadExpired,
+	}})
+
+	router := gin.New()
+	router.GET("/api/events", s.EventsHandler)
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/events?since=3600000", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	dec := json.NewDecoder(res.Body)
+	var hello, replayed api.EventFrame
+	if err := dec.Decode(&hello); err != nil {
+		t.Fatal(err)
+	}
+	if err := dec.Decode(&replayed); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UnixMilli()
+	if hello.AtMs < now-5000 || hello.AtMs > now+5000 {
+		t.Errorf("the hello says at_ms %d, which is not now (%d)", hello.AtMs, now)
+	}
+	if replayed.Kind != "unload" {
+		t.Fatalf("second frame is a %s, want the replayed unload", replayed.Kind)
+	}
+	if want := happened.UnixMilli(); replayed.AtMs != want {
+		t.Errorf("the replayed frame says at_ms %d, want %d — a backfilled frame must carry "+
+			"when it happened, not when it was replayed", replayed.AtMs, want)
+	}
+	if replayed.T >= 0 {
+		t.Errorf("a backfilled frame's t is %d; it must stay negative", replayed.T)
+	}
+	if replayed.Reason != api.UnloadExpired {
+		t.Errorf("the unload came back with reason %q, want %q", replayed.Reason, api.UnloadExpired)
 	}
 }

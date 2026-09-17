@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"compress/gzip"
 	"encoding/json"
 	"io"
@@ -194,10 +195,26 @@ type eventEncoder struct {
 	proto bool
 	gz    *gzip.Writer
 	http  http.Flusher
+
+	// marshalProto is a field so a test can make encoding fail. Nothing else can: the only
+	// way it fails in production is a frame the schema does not declare, which the lockstep
+	// test makes a build failure, and a behaviour that cannot be exercised is a behaviour
+	// nobody should trust.
+	marshalProto func(api.EventFrame) ([]byte, error)
+}
+
+// marshalDelimitedProto is one frame as the binary stream carries it: the message, with its
+// length in front.
+func marshalDelimitedProto(f api.EventFrame) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := api.WriteEventFrameProto(&buf, f); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 func newEventEncoder(w io.Writer, flusher http.Flusher, compress, proto bool) *eventEncoder {
-	e := &eventEncoder{http: flusher, proto: proto}
+	e := &eventEncoder{http: flusher, proto: proto, marshalProto: marshalDelimitedProto}
 	if compress {
 		e.gz = gzip.NewWriter(w)
 		w = e.gz
@@ -210,23 +227,35 @@ func newEventEncoder(w io.Writer, flusher http.Flusher, compress, proto bool) *e
 }
 
 // Encode writes one frame and pushes it all the way out.
-func (e *eventEncoder) Encode(v api.EventFrame) error {
+//
+// It separates the two ways this fails, because they need opposite responses. A frame that
+// cannot be ENCODED is this build's problem -- the schema fell behind the encoder, which
+// TestEventsProtoLockstep exists to prevent -- and taking the connection down for it would
+// be the worst available outcome: every client reconnects, hits the same frame, and loops.
+// A frame that cannot be WRITTEN means the client is gone, and there is nothing to do but
+// stop. So encodeErr is returned separately from the write error, and the caller skips the
+// frame in the first case and gives up in the second.
+func (e *eventEncoder) Encode(v api.EventFrame) (encodeErr error, err error) {
 	if e.proto {
-		if err := api.WriteEventFrameProto(e.w, v); err != nil {
-			return err
+		body, err := e.marshalProto(v)
+		if err != nil {
+			return err, nil
+		}
+		if _, err := e.w.Write(body); err != nil {
+			return nil, err
 		}
 	} else if err := e.enc.Encode(v); err != nil {
-		return err
+		return nil, err
 	}
 	if e.gz != nil {
 		if err := e.gz.Flush(); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if e.http != nil {
 		e.http.Flush()
 	}
-	return nil
+	return nil, nil
 }
 
 // Close finishes the gzip stream. Nothing to do for the uncompressed case.

@@ -1074,6 +1074,7 @@ func (s *Scheduler) processPending(ctx context.Context) {
 				// Trigger an expiration to unload once it's done
 				runnerToExpire.refMu.Lock()
 				slog.Debug("resetting model to expire immediately to make room", "runner", runnerToExpire, "refCount", runnerToExpire.refCount)
+				runnerToExpire.unloadReason = api.UnloadDisplaced
 				if runnerToExpire.expireTimer != nil {
 					runnerToExpire.expireTimer.Stop()
 					runnerToExpire.expireTimer = nil
@@ -1124,6 +1125,7 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 				s.publishEvent(api.ModelEvent{Type: EventBusyEnd, Model: runner.name})
 				if runner.sessionDuration <= 0 {
 					slog.Debug("runner with zero duration has gone idle, expiring to unload", "runner", runner)
+					runner.unloadReason = api.UnloadRequested
 					if runner.expireTimer != nil {
 						runner.expireTimer.Stop()
 						runner.expireTimer = nil
@@ -1135,6 +1137,7 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 						slog.Debug("timer expired, expiring to unload", "runner", runner)
 						runner.refMu.Lock()
 						defer runner.refMu.Unlock()
+						runner.unloadReason = api.UnloadExpired
 						if runner.expireTimer != nil {
 							runner.expireTimer.Stop()
 							runner.expireTimer = nil
@@ -1204,6 +1207,7 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 				if runner.model != nil {
 					name = runner.model.Name
 				}
+				reason := runner.unloadReason
 				runner.unload()
 				if runner.usage != nil {
 					runner.usage.unloaded.Store(true)
@@ -1213,7 +1217,7 @@ func (s *Scheduler) processCompleted(ctx context.Context) {
 				slog.Debug("runner terminated and removed from list, blocking for VRAM recovery", "runner", runner)
 				<-finished
 				runner.refMu.Unlock()
-				s.publishEvent(api.ModelEvent{Type: EventUnload, Model: name})
+				s.publishEvent(api.ModelEvent{Type: EventUnload, Model: name, Reason: reason})
 				slog.Debug("sending an unloaded event", "runner", runner)
 				s.unloadedCh <- struct{}{}
 			}
@@ -1797,6 +1801,7 @@ iGPUScan:
 			})
 			req.errCh <- err
 			slog.Debug("triggering expiration for failed load", "runner", runner)
+			runner.unloadReason = api.UnloadLoadFailed
 			s.expiredCh <- runner
 			return
 		}
@@ -2509,6 +2514,17 @@ type runnerRef struct {
 	refMu    sync.Mutex
 	refCount uint // prevent unloading if > 0
 
+	// unloadReason is why this runner is being taken down, set under refMu by whichever
+	// path expires it and reported on the unload frame. It lives on the runner rather than
+	// travelling with the expiry because the expiry channel carries the runner and nothing
+	// else, and because the retry path (an expiry arriving while refCount > 0) re-queues
+	// the same runner and must not lose why.
+	//
+	// Every path that expires a runner sets it. One that does not leaves the frame without
+	// a reason, which is the honest outcome: a client reading no reason knows it does not
+	// know, where a defaulted "expired" would be a claim.
+	unloadReason string
+
 	llama llm.LlamaServer
 	pid   int
 
@@ -2819,6 +2835,7 @@ func (s *Scheduler) evictAllAndWait(ctx context.Context, keepKey string) bool {
 	}
 	for _, runner := range runnersToExpire {
 		runner.refMu.Lock()
+		runner.unloadReason = api.UnloadOOMRetry
 		if runner.expireTimer != nil {
 			runner.expireTimer.Stop()
 			runner.expireTimer = nil
@@ -2862,6 +2879,7 @@ func (s *Scheduler) expireRunnersForRuntimeOOM(model *Model, err error) {
 	slog.Warn("runtime OOM detected; expiring loaded models to clear memory before next request", "model", schedulerModelKey(model), "error", err)
 	for _, runner := range runners {
 		runner.refMu.Lock()
+		runner.unloadReason = api.UnloadOOMRetry
 		if runner.expireTimer != nil {
 			runner.expireTimer.Stop()
 			runner.expireTimer = nil
@@ -2931,6 +2949,7 @@ func (s *Scheduler) expireRunner(model *Model) {
 	s.loadedMu.Unlock()
 	if ok {
 		runner.refMu.Lock()
+		runner.unloadReason = api.UnloadRequested
 		runner.expiresAt = time.Now()
 		if runner.expireTimer != nil {
 			runner.expireTimer.Stop()
@@ -2966,6 +2985,10 @@ type loadedModel struct {
 	expiresAt     time.Time
 	gpus          []ml.DeviceID
 	vramByGPU     map[ml.DeviceID]uint64
+
+	// memHost is the same split for whatever spilled to the host: empty on a model that
+	// fits, and the reason a spill is visible on /api/ps and not only at the load edge.
+	memHost api.MemoryBreakdown
 
 	// memVRAM splits sizeVRAM by what the memory holds, and memByGPU does the same per
 	// device. weightsOnDisk is the size of the files loaded from, which is not memory and
@@ -3163,7 +3186,7 @@ func (r *runnerRef) reportLocked() loadedModel {
 			lm.vramByGPU[dev] = r.llama.VRAMByGPU(dev)
 			lm.memByGPU[dev] = r.llama.MemoryBreakdownByGPU(dev)
 		}
-		lm.memVRAM, _ = r.llama.MemoryBreakdownTotals()
+		lm.memVRAM, lm.memHost = r.llama.MemoryBreakdownTotals()
 		lm.weightsOnDisk = r.llama.WeightsOnDisk()
 		lm.placement = r.llama.LayerPlacement()
 		lm.bandwidthByGPU = r.bandwidthByGPU

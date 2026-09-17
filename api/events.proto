@@ -70,8 +70,15 @@ syntax = "proto3";
 // stream distinguishes "empty" from "not reported" for a list today, so this loses no
 // meaning -- but do not build one on it.
 //
-// STABILITY. The envelope (v, kind, t, box, serverTime, retainedMs, backfilled, dropped)
-// and the lifecycle edges are settled; treat them as stable. Two areas still move, and are
+// FIELD NUMBERS ARE STABLE. A new field is appended with the next free number; no number is
+// ever reused or renumbered, so a client generated from an older copy of this file keeps
+// reading every field it knew. Where a field sits in the file is cosmetic.
+//
+// STABILITY. The envelope -- v (1), kind (2), t (3), at_ms (30), box (6), serverTime (5),
+// retainedMs (7), backfilled (8), dropped (29) -- and the lifecycle edges are settled;
+// treat them as stable. So is info (28), because a relay has to know whether a sample
+// carries one before it may coalesce it away: info is sent only when it CHANGED, so a
+// sample carrying one is never superseded by a later sample that does not. Two areas still move, and are
 // marked UNSTABLE where they are declared: LoadEstimate.breakdown and RunnerActivity, both
 // of which are the live edge of the placement work. `ps` and `info` mirror ollama's own
 // /api/ps and /api/info bodies, so they also move when ollama does; they are declared in
@@ -125,6 +132,12 @@ message EventFrame {
   optional string kind = 2;
   // Milliseconds since this connection's hello. Negative on backfilled frames.
   optional int64 t = 3;
+  // Wall clock, Unix milliseconds, on every frame including backfilled ones, where it is
+  // when the event happened and not when it was replayed. Use this to place a frame on a
+  // timeline -- it is the only field that means anything outside the connection that
+  // produced it, which is what a relayed frame needs. Use `t` to measure durations: it is
+  // monotonic and cannot step when the box's clock does.
+  optional int64 at_ms = 30;
   repeated UnavailableGPU unavailable_gpus = 4;
   optional google.protobuf.Timestamp serverTime = 5;
   // Identifies the machine, so a client can drop history from a different one. hello only.
@@ -383,6 +396,11 @@ message ProcessModelResponse {
   optional RunnerActivity activity = 16;
   // Per device. Absent means the model is on the host, not that the split is unknown.
   repeated ProcessGPU gpus = 17;
+  // The same split for whatever this model spilled to host memory, absent when it spilled
+  // nothing. On the row and not only on the load edge because a spill is a state that lasts
+  // as long as the model is resident: `size` minus `size_vram` says how much went to the
+  // host, and this says what did.
+  optional MemoryBreakdown memory_host = 18;
 }
 
 // The /api/ps body, byte-identical to what that endpoint serves.

@@ -2353,6 +2353,9 @@ func frameFromEvent(ev api.ModelEvent, started time.Time) api.EventFrame {
 		Estimate:        ev.Estimate,
 		Dropped:         ev.Dropped,
 		T:               ev.At.Sub(started).Milliseconds(),
+		// The event's own instant, not this one: a backfilled frame replayed ten minutes
+		// later must still say when it happened.
+		AtMs: ev.At.UnixMilli(),
 	}
 	// Bodies come from the event where it carried them -- a sample measured them at its
 	// own instant, and re-reading here would report a later moment under an earlier
@@ -2496,6 +2499,10 @@ func (s *Server) processResponse() *api.ProcessResponse {
 		if v.memVRAM.Total() > 0 {
 			breakdown := v.memVRAM
 			row.Memory = &breakdown
+		}
+		if v.memHost.Total() > 0 {
+			spilled := v.memHost
+			row.MemoryHost = &spilled
 		}
 		models = append(models, row)
 	}
@@ -2711,14 +2718,36 @@ func (s *Server) EventsHandler(c *gin.Context) {
 	defer enc.Close()
 
 	started := time.Now()
+	var unencodable uint64
 	emit := func(f api.EventFrame) bool {
 		f.V = 1
+		// Wall clock, on every frame, so a frame forwarded by a relay can be placed in
+		// time without the hello it was relative to. Frames built from an event carry the
+		// event's own instant and are left alone; these are the ones built here.
+		if f.AtMs == 0 {
+			f.AtMs = time.Now().UnixMilli()
+		}
 		if f.T == 0 && f.Kind != "hello" && f.PS == nil && f.Info == nil {
 			f.T = time.Since(started).Milliseconds()
 		}
 		// Encode flushes the compressor and the response, so a frame reaches the client as
 		// it is written rather than when a gzip block happens to fill.
-		return enc.Encode(f) == nil
+		//
+		// A frame this build cannot encode is skipped and counted rather than ending the
+		// stream: it would otherwise be the same frame on every reconnect, so every client
+		// would loop on it. Counting it into dropped is what keeps the skip honest -- the
+		// client sees that its record has a gap, which is the same thing a full buffer
+		// means and the same thing it has to do about it.
+		f.Dropped += unencodable
+		encodeErr, err := enc.Encode(f)
+		if encodeErr != nil {
+			unencodable++
+			slog.Error("a frame could not be encoded for this stream and was skipped; "+
+				"the schema has fallen behind the encoder",
+				"kind", f.Kind, "error", encodeErr, "skipped", unencodable)
+			return true
+		}
+		return err == nil
 	}
 
 	// ?since=<ms> asks for that much history before this connection opened. It is a

@@ -1147,6 +1147,16 @@ type ProcessModelResponse struct {
 	// and on a runner that reported no buffer sizes.
 	Memory *MemoryBreakdown `json:"memory,omitempty"`
 
+	// MemoryHost is the same split for whatever this model spilled to host memory, and is
+	// absent when it spilled nothing -- which is the common case and is why absence here
+	// means "no spill" rather than "not measured".
+	//
+	// It is on the row and not only on the load edge because a spill is a state, not a
+	// moment: it lasts as long as the model is resident, and a client that connected after
+	// the load had no way to see it. Size minus SizeVRAM already said how much went to the
+	// host; this says what did, which is what makes it actionable.
+	MemoryHost *MemoryBreakdown `json:"memory_host,omitempty"`
+
 	// WeightsOnDisk is the size of the files the model was loaded from -- the quantized
 	// blob plus any projector. Read against Memory.Weights it says what the load cost
 	// over the file itself; the two are close but never equal, because the device copy is
@@ -1992,12 +2002,43 @@ type SystemComputeInfo struct {
 // opened the connection, never an absolute stamp: the server's clock is not the viewer's,
 // and a client that has to decide whether to trust a remote clock will generally decide
 // not to.
+// Why a model was unloaded, on the unload frame's Reason. A client should treat an
+// unrecognised value, and an absent one, as "it was unloaded and the server did not say".
+//
+// These exist because unload is one frame for several different facts, and a panel that
+// guessed wrong told people their model had gone idle when another load had pushed it out.
+// evict is not the opposite of this: it is emitted only when a runtime out-of-memory forces
+// everything resident to be dropped for a retry, which is rare and is its own reason here.
+const (
+	UnloadExpired    = "expired"     // its keep-alive ran out
+	UnloadRequested  = "requested"   // asked for: keep_alive 0, or an explicit stop
+	UnloadDisplaced  = "displaced"   // another load needed the memory
+	UnloadLeased     = "leased"      // a job outside ollama took the GPUs
+	UnloadLoadFailed = "load-failed" // its own load failed and the runner was torn down
+	UnloadOOMRetry   = "oom-retry"   // a runtime OOM dropped everything resident
+)
+
 type EventFrame struct {
 	V    int    `json:"v"`
 	Kind string `json:"kind"`
 
 	// T is milliseconds since this connection's hello frame.
 	T int64 `json:"t"`
+
+	// AtMs is when this happened in wall clock time, Unix milliseconds. It is on every
+	// frame, including backfilled ones, where it is the moment the event happened rather
+	// than the moment it was replayed.
+	//
+	// T and AtMs answer different questions and a client needs both. T is measured against
+	// a monotonic clock, so it is the one to subtract: it cannot jump when the box's clock
+	// is stepped. But it means nothing outside the connection that produced it, which is
+	// the difficulty for a relay -- a phone reading frames forwarded by a connector never
+	// saw that connector's hello, so a verbatim frame could not be placed in time without
+	// shipping the hello beside it and hoping it was still retained. AtMs makes each frame
+	// self-contained, at the cost of being wall clock: it can step, and two boxes' stamps
+	// are only as comparable as their clocks. Place frames on a timeline with AtMs; measure
+	// durations with T.
+	AtMs int64 `json:"at_ms"`
 
 	// UnavailableGPUs appears on the hello frame, carrying any GPU the machine has that
 	// cannot be used. It is on hello and not only on an edge because the fault it reports
@@ -2094,8 +2135,11 @@ type EventFrame struct {
 	PS   *ProcessResponse `json:"ps,omitempty"`
 	Info *InfoResponse    `json:"info,omitempty"`
 
-	// Dropped is how many frames this subscriber lost to a full buffer, cumulative.
-	// Non-zero means its record has a gap, which must not be drawn as a flat line.
+	// Dropped is how many frames this subscriber did not receive, cumulative: almost always
+	// a full buffer, and on a build whose schema had fallen behind its encoder, a frame
+	// that could not be encoded in the negotiated encoding. Either way the meaning for a
+	// client is the same and is why the two are counted together -- its record has a gap,
+	// which must not be drawn as a flat line.
 	Dropped uint64 `json:"dropped,omitempty"`
 }
 

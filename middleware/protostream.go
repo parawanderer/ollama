@@ -19,6 +19,8 @@ package middleware
 import (
 	"encoding/binary"
 	"math"
+	"strconv"
+	"strings"
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/openai"
@@ -41,6 +43,85 @@ const (
 	protoStreamContentType = "application/protobuf; delimited=varint"
 	protoStreamAccept      = "application/protobuf"
 )
+
+// acceptsProtoStream decides, from a request's Accept headers, whether to answer a stream
+// with protobuf instead of SSE. SSE is the default and the only thing a client that says
+// nothing can get.
+//
+// `strings.Contains(accept, "application/protobuf")` is not negotiation, and it was what
+// this used to do: it served protobuf to a client that wrote `application/protobuf;q=0`,
+// which is an explicit refusal, and to one that ranked SSE above it. So the header is
+// parsed: protobuf is served only when the client names `application/protobuf` exactly
+// with q > 0 and does not rank `text/event-stream` above it.
+//
+// Two deliberate asymmetries:
+//
+//   - **A wildcard never selects protobuf.** `*/*` and `application/*` leave the stream on
+//     SSE, because every client that has never heard of this sends one of those, and an
+//     endpoint that changes shape on `Accept: */*` is a trap. Wildcards do count when
+//     scoring `text/event-stream`, per the ordinary most-specific-match rule, so a client
+//     that writes `text/event-stream, application/protobuf;q=0.1` gets SSE.
+//   - **A tie goes to protobuf.** Equal q means the client is indifferent, and it named
+//     protobuf explicitly to get here.
+//
+// A media range whose q is malformed is dropped rather than guessed at, which resolves to
+// SSE for the protobuf side and cannot invent a preference on the SSE side.
+func acceptsProtoStream(values []string) bool {
+	var proto, sse float64
+	sseSpecificity := -1
+	seenProto := false
+
+	for _, header := range values {
+		for _, r := range strings.Split(header, ",") {
+			r = strings.TrimSpace(r)
+			if r == "" {
+				continue
+			}
+			parts := strings.Split(r, ";")
+			mediaRange := strings.ToLower(strings.TrimSpace(parts[0]))
+			q := 1.0
+			malformed := false
+			for _, p := range parts[1:] {
+				name, value, ok := strings.Cut(p, "=")
+				if !ok || !strings.EqualFold(strings.TrimSpace(name), "q") {
+					continue // a media type parameter, or an accept extension
+				}
+				v, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+				if err != nil || v < 0 || v > 1 {
+					malformed = true
+					break
+				}
+				q = v
+			}
+			if malformed {
+				continue
+			}
+
+			// Specificity, so the most precise match decides, as in RFC 9110 12.5.1:
+			// an exact type beats a subtype wildcard beats */*.
+			switch mediaRange {
+			case protoStreamAccept:
+				if !seenProto || q > proto {
+					proto, seenProto = q, true
+				}
+			case "text/event-stream":
+				if sseSpecificity < 2 || (sseSpecificity == 2 && q > sse) {
+					sse, sseSpecificity = q, 2
+				}
+			case "text/*":
+				if sseSpecificity < 1 || (sseSpecificity == 1 && q > sse) {
+					sse, sseSpecificity = q, 1
+				}
+			case "*/*":
+				if sseSpecificity < 0 || (sseSpecificity == 0 && q > sse) {
+					sse, sseSpecificity = q, 0
+				}
+			}
+		}
+	}
+
+	return seenProto && proto > 0 && proto >= sse
+}
 
 // Field numbers from chat.proto. Changing one is a wire break, so they are written out
 // rather than derived from position.

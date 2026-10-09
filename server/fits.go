@@ -40,7 +40,9 @@ func (s *Server) FitsHandler(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "num_ctx must be a positive integer"})
 			return
 		}
-		requestOpts["num_ctx"] = n
+		// As a JSON number: the option parser takes what a request body decodes to, and an int
+		// is refused as "must be of type integer".
+		requestOpts["num_ctx"] = float64(n)
 	}
 
 	modelRef, err := parseAndValidateModelRef(raw)

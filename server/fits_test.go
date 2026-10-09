@@ -1,14 +1,21 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/format"
+	"github.com/ollama/ollama/fs/ggml"
 	"github.com/ollama/ollama/ml"
 )
 
@@ -186,5 +193,65 @@ func TestFitsAgreesWithLoad(t *testing.T) {
 			require.Positive(t, fit, "the sweep must cross the boundary")
 			require.Positive(t, evict, "the sweep must cross the boundary")
 		})
+	}
+}
+
+// Through the handler, query string and all. The scheduler-level tests above skipped this
+// layer, and the first live request with num_ctx failed: the option parser takes JSON numbers,
+// and the handler handed it a Go int.
+func TestFitsHandler(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+	ctx, done := context.WithTimeout(t.Context(), 5*time.Second)
+	defer done()
+
+	sched, _ := fitsTestScheduler(t, ctx, 20*format.GibiByte)
+	s := Server{sched: sched, defaultNumCtx: 4096}
+	_, digest := createBinFile(t, ggml.KV{
+		"general.architecture":          "llama",
+		"llama.block_count":             uint32(1),
+		"llama.context_length":          uint32(65536),
+		"llama.embedding_length":        uint32(4096),
+		"llama.attention.head_count":    uint32(32),
+		"llama.attention.head_count_kv": uint32(8),
+		"tokenizer.ggml.tokens":         []string{""},
+		"tokenizer.ggml.scores":         []float32{0},
+		"tokenizer.ggml.token_type":     []int32{0},
+	}, []*ggml.Tensor{
+		{Name: "token_embd.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "output.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+	})
+	if w := createRequest(t, s.CreateHandler, api.CreateRequest{Model: "fitme", Files: map[string]string{"file.gguf": digest}}); w.Code != http.StatusOK {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+
+	get := func(query string) (int, map[string]any) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/api/fits?"+query, nil)
+		s.FitsHandler(c)
+		var body map[string]any
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body), w.Body.String())
+		return w.Code, body
+	}
+
+	code, body := get("model=fitme&num_ctx=8192")
+	require.Equal(t, http.StatusOK, code, body)
+	require.Equal(t, true, body["fits"])
+	require.Equal(t, []any{}, body["displaces"])
+	require.EqualValues(t, 8192, body["num_ctx"])
+
+	code, body = get("model=fitme")
+	require.Equal(t, http.StatusOK, code, body)
+	require.EqualValues(t, 4096, body["num_ctx"], "absent num_ctx is the server's default grant")
+
+	for query, want := range map[string]int{
+		"":                        http.StatusBadRequest,
+		"model=fitme&num_ctx=abc": http.StatusBadRequest,
+		"model=fitme&num_ctx=0":   http.StatusBadRequest,
+		"model=missing":           http.StatusNotFound,
+	} {
+		code, body := get(query)
+		require.Equal(t, want, code, "%q: %v", query, body)
 	}
 }

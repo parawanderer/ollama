@@ -16,6 +16,7 @@ import (
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/format"
 	"github.com/ollama/ollama/fs/ggml"
+	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/ml"
 )
 
@@ -254,4 +255,64 @@ func TestFitsHandler(t *testing.T) {
 		code, body := get(query)
 		require.Equal(t, want, code, "%q: %v", query, body)
 	}
+}
+
+// A real load whose first placement is uncalibrated probes it and is placed again from the
+// measurement. The dry run cannot probe, so it borrows a calibrated placement's measurement
+// instead. Here the metadata estimate fits on neither card alone, so without the borrowing the
+// dry run spans both and evicts; the real load measures, moves to the card with room, and
+// evicts nothing. (gemma4:26b, live, 2026-10-09.)
+func TestFitsBorrowsTheMeasurementAProbeWouldTake(t *testing.T) {
+	ctx, done := context.WithTimeout(t.Context(), 5*time.Second)
+	defer done()
+
+	measured := uint64(100 * format.MebiByte)
+	newSched := func() (*Scheduler, ml.DeviceInfo, ml.DeviceInfo) {
+		s := InitScheduler(ctx)
+		s.waitForRecovery = 10 * time.Millisecond
+		g0 := ml.DeviceInfo{DeviceID: ml.DeviceID{ID: "0", Library: "Metal"}}
+		g0.TotalMemory, g0.FreeMemory = 24*format.GibiByte, 500*format.MebiByte
+		g1 := ml.DeviceInfo{DeviceID: ml.DeviceID{ID: "1", Library: "Metal"}}
+		g1.TotalMemory, g1.FreeMemory = 24*format.GibiByte, 600*format.MebiByte
+		s.getGpuFn = func(context.Context, []ml.FilteredRunnerDiscovery) []ml.DeviceInfo { return []ml.DeviceInfo{g0, g1} }
+		s.getSystemInfoFn = getSystemInfoFn
+		s.freeMemoryFn = func([]string) map[string]uint64 { return nil }
+		s.fitProbe = func(_ context.Context, _ []ml.DeviceInfo, _ string, _ *ggml.GGML, _, _ []string, _ api.Options, _ int, _ string, _ llm.LlamaServerConfig, numCtx int) (uint64, int, error) {
+			return measured, numCtx, nil
+		}
+		r := residentRunner("registry.ollama.ai/library/resident:latest", g0, 23*format.GibiByte, false, time.Minute)
+		s.loaded[r.modelKey] = r
+		return s, g0, g1
+	}
+
+	ask := func(withCalibration bool) (*api.FitsResponse, bool) {
+		s, _, g1 := newSched()
+		scenario := newScenarioRequestWithContext(t, ctx, "candidate", 0, nil, nil, 65536)
+		scenario.req.opts.NumCtx = 65536
+		scenario.req.opts.NumBatch = llamaServerGenerationBatchDefault
+		if withCalibration {
+			key := vramCalibrationKey(scenario.req, []ml.DeviceInfo{g1}, 1)
+			s.vramCalibration.Record(key, 8192, measured-format.MebiByte)
+			s.vramCalibration.Record(key, 131072, measured+format.MebiByte)
+		}
+		dry, err := s.fits(ctx, scenario.req.model, scenario.req.opts, false, false)
+		require.NoError(t, err)
+
+		s.newServerFn = scenario.newServer
+		gpus := s.getGpuFn(ctx, nil)
+		s.updateFreeSpace(gpus)
+		return dry, s.load(scenario.req, getSystemInfoFn(), gpus, true)
+	}
+
+	dry, needEvict := ask(true)
+	require.False(t, needEvict, "the real load measures, moves to card 1, and fits")
+	require.True(t, dry.Fits, "displaces=%v predicted=%d basis=%s gpus=%v", dry.Displaces, dry.Predicted, dry.Basis, dry.GPUIDs)
+	require.Equal(t, []string{"1"}, dry.GPUIDs)
+	require.Equal(t, "calibration", dry.Basis)
+
+	// With nothing measured to borrow, the dry run has only the metadata and stays
+	// conservative: it is allowed to be wrong toward "doesn't fit", and says why.
+	dry, _ = ask(false)
+	require.False(t, dry.Fits)
+	require.Equal(t, "metadata", dry.Basis)
 }

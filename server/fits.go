@@ -203,7 +203,13 @@ func (s *Scheduler) fits(ctx context.Context, m *Model, opts api.Options, numCtx
 // dryPlacement is load's placement and prediction with the probe left out: an invocation
 // is predicted from its calibration where it has one and from metadata where it does not.
 func (s *Scheduler) dryPlacement(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, f *ggml.GGML, completion bool, predictedCtx, numParallel int) (placed []ml.DeviceInfo, launchOpts api.Options, predictedForLoad uint64, basis string) {
-	predicted := predictLlamaServerVRAM(s.vramCalibration, vramCalibrationKey(req, gpus, numParallel), req, f, predictedCtx)
+	first := vramCalibrationKey(req, gpus, numParallel)
+	predicted := predictLlamaServerVRAM(s.vramCalibration, first, req, f, predictedCtx)
+	if s.vramCalibration.SampleCount(first) < 2 {
+		if borrowed, ok := s.borrowedEstimate(first, req, f, predictedCtx, len(gpus)); ok {
+			predicted = borrowed
+		}
+	}
 	placed, launchOpts, key, predicted, _ := settlePlacement(predicted,
 		func(estimate uint64) ([]ml.DeviceInfo, api.Options) {
 			return selectLlamaServerPlacement(systemInfo, gpus, estimate, req.opts)
@@ -214,6 +220,33 @@ func (s *Scheduler) dryPlacement(req *LlmRequest, systemInfo ml.SystemInfo, gpus
 		})
 	_, calibrated := s.vramCalibration.Predict(key, predictedCtx, 0, 0)
 	return placed, launchOpts, predicted + generationBatchSurchargeForCompletion(completion, launchOpts.NumBatch), predictionSource(calibrated, false)
+}
+
+// borrowedEstimate stands in for the probe a real load would take. A load whose first
+// placement is uncalibrated measures itself there and is placed again from the measurement,
+// which is how a model whose metadata estimate is far too high still lands on one card. A
+// question cannot probe, so it takes what an earlier load of the same model measured on a
+// placement that is calibrated -- any device count and batch -- as the estimate to place
+// from. The placement it settles on is then predicted from its own key as usual.
+//
+// Without it, gemma4:26b beside two resident models was answered "displaces gemma4:31b" from
+// a 131.5 GB metadata estimate across both cards, where the real load probes, measures about
+// 28 GB and fits on the card with room (2026-10-09).
+func (s *Scheduler) borrowedEstimate(first llm.CalibrationKey, req *LlmRequest, f *ggml.GGML, numCtx, maxGPUs int) (uint64, bool) {
+	var best uint64
+	for n := 1; n <= max(maxGPUs, 1); n++ {
+		for _, batch := range []int{llamaServerGenerationBatchLarge, llamaServerGenerationBatchMedium, llamaServerGenerationBatchDefault, llamaServerGenerationBatchConstrained} {
+			key := first
+			key.NumGPU, key.NumBatch = n, batch
+			if s.vramCalibration.SampleCount(key) < 2 {
+				continue
+			}
+			if p := predictLlamaServerVRAM(s.vramCalibration, key, req, f, numCtx); best == 0 || p < best {
+				best = p
+			}
+		}
+	}
+	return best, best > 0
 }
 
 // freeAfterEvicting is the device list as processPending would see it once the evicted

@@ -1814,6 +1814,8 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 	var tokenRepeat int
 	var finalResp CompletionResponse
 	var hasFinalResp bool
+	var finalTimings llamaServerTimings
+	var finalSwap *api.PromptCacheSwap
 
 	for scanner.Scan() {
 		select {
@@ -1870,11 +1872,13 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 					doneReason = DoneReasonLength
 				}
 
-				var swap *api.PromptCacheSwap
+				// gen.end is announced after the handler has seen this final response, not
+				// here: the handler's parser is what finds tool calls, and the last of them
+				// arrive with it. Announced here, every agent turn read as an answer.
+				finalTimings = lsResp.Timings
 				if attributeSwap {
-					swap = s.promptCache.take()
+					finalSwap = s.promptCache.take()
 				}
-				s.notifyGeneration(lsResp.Timings, swap, req.Meta)
 
 				finalResp = CompletionResponse{
 					Content:               lsResp.Content,
@@ -1911,6 +1915,8 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 		}
 
 		fn(finalResp)
+		req.Meta.Settle(finalResp.DoneReason == DoneReasonLength)
+		s.notifyGeneration(finalTimings, finalSwap, req.Meta)
 		return nil
 	}
 
@@ -2199,11 +2205,15 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 				if attributeSwap {
 					swap = s.promptCache.take()
 				}
-				s.notifyGeneration(lsResp.Timings, swap, req.Meta)
 				toolCalls, err := accumulatedToolCalls(toolCalls)
 				if err != nil {
 					return err
 				}
+				if len(toolCalls) > 0 {
+					req.Meta.NoteToolCalls()
+				}
+				req.Meta.Settle(doneReason == DoneReasonLength)
+				s.notifyGeneration(lsResp.Timings, swap, req.Meta)
 				resp.Message.ToolCalls = toolCalls
 				finalResp = resp
 				hasFinalResp = true

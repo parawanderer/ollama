@@ -2350,6 +2350,7 @@ func frameFromEvent(ev api.ModelEvent, started time.Time) api.EventFrame {
 		Hint:            ev.Hint,
 		PredictedDecode: ev.PredictedDecode,
 		Shape:           ev.Shape,
+		Finish:          ev.Finish,
 		Lease:           ev.Lease,
 		Estimate:        ev.Estimate,
 		Dropped:         ev.Dropped,
@@ -3386,8 +3387,11 @@ func (s *Server) ChatHandler(c *gin.Context) {
 
 			var parserErr error
 
+			// Kept so the callback can mark the generation as having emitted tool calls:
+			// only the parsers below know, and gen.end has to say so.
+			meta := chatMeta(c, req)
 			err := r.Completion(ctx, llm.CompletionRequest{
-				Meta:                       chatMeta(c, req),
+				Meta:                       meta,
 				Prompt:                     prompt,
 				Media:                      media,
 				Format:                     currentFormat,
@@ -3432,6 +3436,13 @@ func (s *Server) ChatHandler(c *gin.Context) {
 					Metrics:   metrics,
 					Logprobs:  toAPILogprobs(r.Logprobs),
 				}
+				// Deferred, so every branch below that hands on tool calls is covered,
+				// however it returns.
+				defer func() {
+					if len(res.Message.ToolCalls) > 0 {
+						meta.NoteToolCalls()
+					}
+				}()
 
 				if r.Done {
 					res.DoneReason = r.DoneReason.String()

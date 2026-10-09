@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -264,6 +265,59 @@ type LeaseInfo struct {
 type GenerationMeta struct {
 	Hint  *RequestHint
 	Shape *RequestShape
+
+	// toolCalls is set by the handler when the generation emitted a tool call, and finish
+	// once the engine has stopped. Neither is content: only the fact and the enum.
+	toolCalls atomic.Bool
+	finish    atomic.Value // string
+}
+
+// How a generation ended, on gen.end and in the generations table.
+//
+// The engine's own stop reason cannot say this alone: a model that emits tool calls stops
+// on its end token, so it reports "stop" exactly as a final answer does. Which of the two it
+// was is known only to the handler that parsed the output, so the handler marks it.
+const (
+	// FinishToolCalls: the generation emitted at least one tool call, so the caller still
+	// has work to do with this model (run the tools, or wait for someone to approve them).
+	// Takes precedence over the others.
+	FinishToolCalls = "tool_calls"
+	// FinishAnswer: the model stopped on its own with no tool call.
+	FinishAnswer = "answer"
+	// FinishLength: the generation hit its token limit.
+	FinishLength = "length"
+)
+
+// NoteToolCalls records that the generation emitted a tool call. Safe on a nil meta.
+func (m *GenerationMeta) NoteToolCalls() {
+	if m != nil {
+		m.toolCalls.Store(true)
+	}
+}
+
+// Settle records how the generation ended, once the engine has stopped and the handler has
+// seen the whole output. Safe on a nil meta.
+func (m *GenerationMeta) Settle(hitLimit bool) {
+	if m == nil {
+		return
+	}
+	switch {
+	case m.toolCalls.Load():
+		m.finish.Store(FinishToolCalls)
+	case hitLimit:
+		m.finish.Store(FinishLength)
+	default:
+		m.finish.Store(FinishAnswer)
+	}
+}
+
+// Finish is how the generation ended, or "" before Settle or on a nil meta.
+func (m *GenerationMeta) Finish() string {
+	if m == nil {
+		return ""
+	}
+	f, _ := m.finish.Load().(string)
+	return f
 }
 
 // hintLimits bound what a caller can put in a hint, since it is copied into every event.
@@ -2196,6 +2250,10 @@ type EventFrame struct {
 	// Shape is the request's form, on a gen.end frame. See RequestShape.
 	Shape *RequestShape `json:"shape,omitempty"`
 
+	// Finish is how the generation ended, on a gen.end frame: tool_calls, answer or
+	// length. See ModelEvent.
+	Finish string `json:"finish,omitempty"`
+
 	// Lease is who holds a GPU lease and on which devices, on lease.* frames.
 	Lease *LeaseInfo `json:"lease,omitempty"`
 
@@ -2342,6 +2400,12 @@ type ModelEvent struct {
 
 	// Shape is the request's form, on a gen.end event. See RequestShape.
 	Shape *RequestShape `json:"shape,omitempty"`
+
+	// Finish is how the generation ended, on a gen.end event: "tool_calls" when it emitted
+	// any tool call (the caller means to continue), "answer" when it stopped with none,
+	// "length" when it hit its token limit. Absent where the server cannot tell. A generation
+	// whose client disconnected has no gen.end at all, so there is no "closed".
+	Finish string `json:"finish,omitempty"`
 
 	// Lease is who holds a GPU lease and on which devices, on lease.* events.
 	Lease *LeaseInfo `json:"lease,omitempty"`

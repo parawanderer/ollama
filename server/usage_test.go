@@ -22,13 +22,16 @@ func TestUsageStoreRecordsGenerationsAndLoads(t *testing.T) {
 	}
 	cached := 4097
 	numCtx := 8192
+	meta := &api.GenerationMeta{
+		Hint:  &api.RequestHint{Use: "agent", Session: "wml-1", Synthetic: true},
+		Shape: &api.RequestShape{Endpoint: "chat", Surface: "openai", Stream: true, Messages: 3, Tools: 2, NumCtx: &numCtx, Client: "abc"},
+	}
+	meta.NoteToolCalls()
+	meta.Settle(false)
 	u.recordGeneration(usageGeneration{
 		At: time.Now(), Model: "m",
 		Timings: api.GenerationTimings{PromptTokens: 4098, PromptTokensCached: &cached, PromptMs: 3.4, EvalMs: 111.5, Decoded: 40},
-		Meta: &api.GenerationMeta{
-			Hint:  &api.RequestHint{Use: "agent", Session: "wml-1", Synthetic: true},
-			Shape: &api.RequestShape{Endpoint: "chat", Surface: "openai", Stream: true, Messages: 3, Tools: 2, NumCtx: &numCtx, Client: "abc"},
-		},
+		Meta:    meta,
 		Devices: "CUDA0", NumCtx: 8192, NumBatch: 512, Split: "none",
 	})
 	u.recordLoad(usageLoad{At: time.Now(), Model: "m", Estimate: &api.LoadEstimate{Predicted: 100, Source: "probe"}, SizeVRAM: 99})
@@ -39,14 +42,14 @@ func TestUsageStoreRecordsGenerationsAndLoads(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	var use, session, surface string
+	var use, session, surface, finish string
 	var tools, synthetic, reqCtx int
-	if err := db.QueryRow(`SELECT hint_use, hint_session, surface, tools, hint_synthetic, req_num_ctx FROM generations`).
-		Scan(&use, &session, &surface, &tools, &synthetic, &reqCtx); err != nil {
+	if err := db.QueryRow(`SELECT hint_use, hint_session, surface, tools, hint_synthetic, req_num_ctx, finish FROM generations`).
+		Scan(&use, &session, &surface, &tools, &synthetic, &reqCtx, &finish); err != nil {
 		t.Fatal(err)
 	}
-	if use != "agent" || session != "wml-1" || surface != "openai" || tools != 2 || synthetic != 1 || reqCtx != 8192 {
-		t.Errorf("generation row: use=%q session=%q surface=%q tools=%d synthetic=%d req_num_ctx=%d", use, session, surface, tools, synthetic, reqCtx)
+	if use != "agent" || session != "wml-1" || surface != "openai" || tools != 2 || synthetic != 1 || reqCtx != 8192 || finish != api.FinishToolCalls {
+		t.Errorf("generation row: use=%q session=%q surface=%q tools=%d synthetic=%d req_num_ctx=%d finish=%q", use, session, surface, tools, synthetic, reqCtx, finish)
 	}
 	var source string
 	var predicted, vram int64

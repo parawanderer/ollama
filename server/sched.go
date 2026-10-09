@@ -1581,7 +1581,7 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 					// made: from the state before this generation, the same figure the row stores.
 					ev := api.ModelEvent{Type: EventGenEnd, Model: modelName, Timings: &timings}
 					if meta != nil {
-						ev.Hint, ev.Shape = meta.Hint, meta.Shape
+						ev.Hint, ev.Shape, ev.Finish = meta.Hint, meta.Shape, meta.Finish()
 					}
 					ev.PredictedDecode = s.predictAndLearn(usage.key, in, timings, &row)
 					s.publishEvent(ev)

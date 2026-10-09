@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS generations (
 	devices TEXT, num_ctx INTEGER, num_batch INTEGER, split TEXT,
 	predicted_eval_ms_per_token REAL, predicted_basis TEXT,
 	corrected_eval_ms_per_token REAL, correction_samples INTEGER, contended INTEGER,
-	device_kinds TEXT
+	device_kinds TEXT, finish TEXT
 );
 CREATE INDEX IF NOT EXISTS generations_model_at ON generations(model, at_ms);
 CREATE INDEX IF NOT EXISTS generations_session_at ON generations(hint_session, at_ms);
@@ -105,6 +105,7 @@ var usageAddedColumns = []struct{ name, decl string }{
 	{"correction_samples", "INTEGER"},
 	{"contended", "INTEGER"},
 	{"device_kinds", "TEXT"},
+	{"finish", "TEXT"},
 }
 
 func (d *serverDB) recordGeneration(g usageGeneration) { d.enqueue(g) }
@@ -129,8 +130,8 @@ func insertGeneration(tx *sql.Tx, g usageGeneration) error {
 		endpoint, surface, stream, messages, images, tools, format, think,
 		req_num_ctx, req_num_gpu, req_num_predict, req_keep_alive_s, client,
 		devices, num_ctx, num_batch, split, predicted_eval_ms_per_token, predicted_basis,
-		corrected_eval_ms_per_token, correction_samples, contended, device_kinds
-	) VALUES (?,?,?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?)`,
+		corrected_eval_ms_per_token, correction_samples, contended, device_kinds, finish
+	) VALUES (?,?,?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,?, ?,?,?,?,?)`,
 		g.At.UnixMilli(), g.Model, g.Timings.PromptTokens, g.Timings.PromptTokensCached, g.Timings.PromptMs,
 		g.Timings.EvalMs, g.Timings.Decoded, swapMs,
 		nullIfEmpty(hint.Use), nullIfEmpty(hint.Session), nullIfEmpty(hint.Request), nullIfEmpty(hint.After), boolInt(hint.Synthetic),
@@ -138,7 +139,7 @@ func insertGeneration(tx *sql.Tx, g usageGeneration) error {
 		boolInt(shape.Format), nullIfEmpty(shape.Think),
 		shape.NumCtx, shape.NumGPU, shape.NumPredict, shape.KeepAliveS, nullIfEmpty(shape.Client),
 		nullIfEmpty(g.Devices), g.NumCtx, g.NumBatch, nullIfEmpty(g.Split), g.PredictedEvalMs, nullIfEmpty(g.PredictedBasis),
-		g.CorrectedEvalMs, g.CorrectionSamples, boolInt(g.Contended), nullIfEmpty(g.DeviceKinds))
+		g.CorrectedEvalMs, g.CorrectionSamples, boolInt(g.Contended), nullIfEmpty(g.DeviceKinds), nullIfEmpty(g.Meta.Finish()))
 	return err
 }
 

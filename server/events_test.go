@@ -175,6 +175,7 @@ func TestEventFrameCopiesEveryCommonField(t *testing.T) {
 		Hint:            &api.RequestHint{Use: "agent", Session: "chat-123"},
 		PredictedDecode: &api.DecodePrediction{MsPerToken: 14.3, OccupancyTokens: 200, Basis: "profile"},
 		Shape:           &api.RequestShape{Endpoint: "chat", Surface: "native", Messages: 2},
+		Finish:          api.FinishToolCalls,
 		Lease:           &api.LeaseInfo{Holder: "train.py", Devices: []string{"0000:03:00.0"}},
 		Placement: &api.ModelPlacement{
 			NumLayers: 4,

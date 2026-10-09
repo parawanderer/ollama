@@ -31,7 +31,7 @@ syntax = "proto3";
 //   busy.start     a model started working (transitions in and out of idle, not per request)
 //   busy.end       it went idle; this is also when its keep-alive deadline moves
 //   gen.start      one generation began
-//   gen.end        one generation finished; timings, shape, hint, predicted_decode
+//   gen.end        one generation finished; timings, shape, hint, predicted_decode, finish
 //   lease.start    a job outside ollama asked for the GPUs
 //   lease.granted  ollama has vacated them
 //   lease.end      the job finished
@@ -176,6 +176,11 @@ message EventFrame {
   // Frames this subscriber lost to a full buffer, cumulative. Non-zero means its record has a
   // gap, which must not be drawn as a flat line. Absent means none.
   uint64 dropped = 29;
+  // How the generation ended, on gen.end: "tool_calls" (it emitted any tool call, so the
+  // caller means to continue), "answer" (it stopped with none) or "length" (it hit its token
+  // limit). Absent where the server cannot tell. A generation whose client disconnected has
+  // no gen.end, so there is no "closed".
+  string finish = 31;
 }
 
 // The decode speed this model is expected to reach on this placement.

@@ -828,6 +828,19 @@ func TestGenerateChatRemote(t *testing.T) {
 	})
 }
 
+// requireFinish settles the meta the handler passed to the runner, as the runner does once
+// the engine stops, and checks what gen.end would say.
+func requireFinish(t *testing.T, meta *api.GenerationMeta, want string) {
+	t.Helper()
+	if meta == nil {
+		t.Fatal("the handler passed no meta, so gen.end cannot say how the generation ended")
+	}
+	meta.Settle(false)
+	if got := meta.Finish(); got != want {
+		t.Errorf("finish = %q, want %q", got, want)
+	}
+}
+
 func TestGenerateChat(t *testing.T) {
 	t.Setenv("OLLAMA_CONTEXT_LENGTH", "4096")
 	t.Setenv("OLLAMA_GO_TEMPLATE", "1")
@@ -1097,6 +1110,7 @@ func TestGenerateChat(t *testing.T) {
 		}
 
 		checkChatResponse(t, w.Body, "test", "Hi!")
+		requireFinish(t, mock.CompletionRequest.Meta, api.FinishAnswer)
 	})
 
 	w = createRequest(t, s.CreateHandler, api.CreateRequest{
@@ -1270,6 +1284,7 @@ func TestGenerateChat(t *testing.T) {
 		if diff := cmp.Diff(gotToolCall, expectedToolCall, argsComparer); diff != "" {
 			t.Errorf("tool call mismatch (-got +want):\n%s", diff)
 		}
+		requireFinish(t, mock.CompletionRequest.Meta, api.FinishToolCalls)
 	})
 
 	t.Run("messages with tools (streaming)", func(t *testing.T) {
@@ -1406,6 +1421,7 @@ func TestGenerateChat(t *testing.T) {
 		if diff := cmp.Diff(finalToolCall, expectedToolCall, argsComparer); diff != "" {
 			t.Errorf("final tool call mismatch (-got +want):\n%s", diff)
 		}
+		requireFinish(t, mock.CompletionRequest.Meta, api.FinishToolCalls)
 	})
 
 	t.Run("messages with tools and logprobs (streaming)", func(t *testing.T) {

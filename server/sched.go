@@ -884,7 +884,9 @@ func effectiveContext(numCtx, trainCtx int) int {
 	return numCtx
 }
 
-func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, sessionDuration *api.Duration, numCtxAuto bool, numBatchAuto bool, shift *bool) (chan *runnerRef, chan error) {
+// newLlmRequest builds the request the scheduler places, with the context floors every
+// load applies. The fit dry run builds its request here too, so it asks about the same load.
+func newLlmRequest(c context.Context, m *Model, opts api.Options, sessionDuration *api.Duration, numCtxAuto bool, numBatchAuto bool, shift *bool) *LlmRequest {
 	if opts.NumCtx < 4 {
 		opts.NumCtx = 4
 	}
@@ -899,7 +901,7 @@ func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, ses
 		contextShift = resolveContextShift(shift, m)
 	}
 
-	req := &LlmRequest{
+	return &LlmRequest{
 		ctx:             c,
 		model:           m,
 		opts:            opts,
@@ -911,6 +913,10 @@ func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, ses
 		contextShift:    contextShift,
 		shift:           shift,
 	}
+}
+
+func (s *Scheduler) getRunner(c context.Context, m *Model, opts api.Options, sessionDuration *api.Duration, numCtxAuto bool, numBatchAuto bool, shift *bool) (chan *runnerRef, chan error) {
+	req := newLlmRequest(c, m, opts, sessionDuration, numCtxAuto, numBatchAuto, shift)
 
 	key := schedulerModelKey(req.model)
 	s.loadedMu.Lock()
@@ -1255,18 +1261,8 @@ func (pending *LlmRequest) useLoadedRunner(runner *runnerRef, finished chan *Llm
 // load creates a new model based on req and loads it. If requireFull is true then the model must be loaded fully onto GPUs
 // (if any). Returns whether the scheduler needs to evict a model to make this one fit.
 func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, requireFull bool) bool {
-	numParallel := max(int(envconfig.NumParallel()), 1)
-	completion := req.model.CheckCapabilities(model.CapabilityCompletion) == nil
-
-	// Embedding models should always be loaded with parallel=1
-	if !completion {
-		numParallel = 1
-	}
-
-	// Some architectures are not safe with num_parallel > 1.
-	// ref: https://github.com/ollama/ollama/issues/4165
-	if slices.Contains([]string{"mllama", "qwen3vl", "qwen3vlmoe", "qwen35", "qwen35moe", "qwen3next", "lfm2", "lfm2moe", "nemotron_h", "nemotron_h_moe", "nemotron_h_omni"}, req.model.Config.ModelFamily) && numParallel != 1 {
-		numParallel = 1
+	numParallel, completion, unsafeParallel := loadParallelism(req)
+	if unsafeParallel {
 		slog.Warn("model architecture does not currently support parallel requests", "architecture", req.model.Config.ModelFamily)
 	}
 
@@ -1367,14 +1363,10 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 					return selectLlamaServerPlacement(systemInfo, gpus, estimate, req.opts)
 				},
 				func(placed []ml.DeviceInfo, opts api.Options, estimate uint64, decideOnly bool) (api.Options, llm.CalibrationKey, uint64, bool) {
-					availableForBatch, _, _ := availableMemoryForPlacement(systemInfo, placed, opts)
-					req.applyAutomaticGenerationBatch(completion, predictedCtx, estimate, availableForBatch, llm.LlamaServerFlashAttention(placed), placed)
-					opts.NumBatch = req.opts.NumBatch
-
 					// Now the invocation is fully determined, so this key describes the load
 					// that will actually run, and the measurement it produces is filed where
 					// the next prediction for the same invocation will look.
-					key := vramCalibrationKey(req, placed, numParallel)
+					opts, key := req.settleBatch(systemInfo, placed, opts, estimate, completion, predictedCtx, numParallel)
 
 					// A load with no GPU has no placement to decide and nothing a device
 					// probe can tell it. Probing anyway ran on the CPU, hit the 30 s probe
@@ -1477,9 +1469,8 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 			// llama-server auto-detects layers based on available VRAM, so if
 			// we predict it won't fit, evict before spawning.
 			if requireFull && !explicitPartialGPUOffload(launchOpts, f) && len(s.loaded) > 0 && len(loadGpus) > 0 {
-				freeMemory, gpuFreeMemory, systemLimited := availableMemoryForPlacement(systemInfo, loadGpus, launchOpts)
-				// Use 80% of free memory as threshold to leave headroom.
-				if predictedForLoad > freeMemory*80/100 {
+				fits, freeMemory, gpuFreeMemory, systemLimited := fitsInAvailableMemory(systemInfo, loadGpus, launchOpts, predictedForLoad)
+				if !fits {
 					slog.Info("llama-server model predicted to exceed available memory, evicting",
 						"predicted", format.HumanBytes2(predictedForLoad),
 						"predicted_num_ctx", predictedCtx,
@@ -1955,6 +1946,44 @@ func explicitPartialGPUOffload(opts api.Options, f *ggml.GGML) bool {
 
 func effectiveLlamaServerContext(numCtx int, f *ggml.GGML, numParallel int) int {
 	return effectiveModelContext(numCtx, f) * max(numParallel, 1)
+}
+
+// loadParallelism is how many sequences a load of this request will serve at once, whether
+// it is a completion model, and whether the architecture forced parallelism down to one.
+// Shared by load and the fit dry run, so both predict the same context.
+func loadParallelism(req *LlmRequest) (numParallel int, completion, unsafeParallel bool) {
+	numParallel = max(int(envconfig.NumParallel()), 1)
+	completion = req.model.CheckCapabilities(model.CapabilityCompletion) == nil
+
+	// Embedding models should always be loaded with parallel=1
+	if !completion {
+		numParallel = 1
+	}
+
+	// Some architectures are not safe with num_parallel > 1.
+	// ref: https://github.com/ollama/ollama/issues/4165
+	if slices.Contains([]string{"mllama", "qwen3vl", "qwen3vlmoe", "qwen35", "qwen35moe", "qwen3next", "lfm2", "lfm2moe", "nemotron_h", "nemotron_h_moe", "nemotron_h_omni"}, req.model.Config.ModelFamily) && numParallel != 1 {
+		numParallel = 1
+		unsafeParallel = true
+	}
+	return numParallel, completion, unsafeParallel
+}
+
+// settleBatch chooses the generation batch for a placement and returns the options and the
+// calibration key that describe the load that would run there. It rewrites req.opts.NumBatch.
+func (req *LlmRequest) settleBatch(systemInfo ml.SystemInfo, placed []ml.DeviceInfo, opts api.Options, estimate uint64, completion bool, predictedCtx, numParallel int) (api.Options, llm.CalibrationKey) {
+	availableForBatch, _, _ := availableMemoryForPlacement(systemInfo, placed, opts)
+	req.applyAutomaticGenerationBatch(completion, predictedCtx, estimate, availableForBatch, llm.LlamaServerFlashAttention(placed), placed)
+	opts.NumBatch = req.opts.NumBatch
+	return opts, vramCalibrationKey(req, placed, numParallel)
+}
+
+// fitsInAvailableMemory is the pre-flight rule a load beside resident models must pass, or
+// the scheduler evicts: the prediction within 80% of what the placement has free, the rest
+// left as headroom.
+func fitsInAvailableMemory(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, opts api.Options, predictedForLoad uint64) (fits bool, available, gpuFree uint64, systemLimited bool) {
+	available, gpuFree, systemLimited = availableMemoryForPlacement(systemInfo, gpus, opts)
+	return predictedForLoad <= available*80/100, available, gpuFree, systemLimited
 }
 
 const (
@@ -2979,6 +3008,16 @@ func (s *Scheduler) findRunnerToUnload() *runnerRef {
 	s.loadedMu.Unlock()
 	if len(runnerList) == 0 {
 		slog.Debug("no loaded runner to unload")
+		return nil
+	}
+	return pickRunnerToUnload(runnerList)
+}
+
+// pickRunnerToUnload is the eviction order: the idle runner with the shortest keep-alive, or
+// if none is idle, the one with the shortest keep-alive, which is then waited for. The fit
+// dry run walks the same order, so the models it names are the ones a load would take.
+func pickRunnerToUnload(runnerList []*runnerRef) *runnerRef {
+	if len(runnerList) == 0 {
 		return nil
 	}
 

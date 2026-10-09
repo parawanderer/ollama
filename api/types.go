@@ -965,6 +965,50 @@ func (t *ModelRecommendationThinking) Clone() *ModelRecommendationThinking {
 }
 
 // ProcessResponse is the response from [Client.Process].
+// FitsResponse is the reply of GET /api/fits: whether loading a model now would unload
+// anything resident, and if so what.
+//
+// It is a contract, not a view of the scheduler. Fits and Displaces are the answer; how they
+// are reached may change. The rest describes this answer's basis and may be absent.
+//
+// The answer is a snapshot. A request that arrives between the check and the load, or a
+// load already queued, can change it, so a scheduler built on it should treat a "yes" as
+// "nothing would be displaced as of now".
+type FitsResponse struct {
+	// Fits is true when loading the model now would not unload anything currently resident.
+	// A model already resident at compatible options fits, and is reused rather than loaded.
+	Fits bool `json:"fits"`
+
+	// Displaces names the resident models that would be unloaded to make room, in the order
+	// they would go, named as /api/ps names them. Empty, never absent, when Fits is true. A
+	// resident model asked about with options that force a reload (a different num_ctx, say)
+	// names itself.
+	Displaces []string `json:"displaces"`
+
+	// Resident is true when the model is already loaded at options a request would reuse.
+	Resident bool `json:"resident,omitempty"`
+
+	// NumCtx is the context per sequence the load would be given, or the resident runner
+	// has, as context_length on /api/ps. For a load it is the value asked for, clamped to
+	// what the model was trained on; the engine may round it up slightly.
+	NumCtx int `json:"num_ctx,omitempty"`
+
+	// GPUIDs are the devices the model would be placed on (or is on), as gpu_id on /api/ps.
+	// Empty for a load that would run on the CPU.
+	GPUIDs []string `json:"gpu_ids,omitempty"`
+
+	// Predicted is the memory the load is predicted to need on those devices, in bytes,
+	// including the generation batch: the figure the fit decision compares. Absent when
+	// Resident.
+	Predicted int64 `json:"predicted,omitempty"`
+
+	// Basis says what the answer rests on: "resident" (the model is loaded), "calibration"
+	// (measurements of earlier loads of this model on these devices) or "metadata" (an
+	// estimate from the file alone, which the load itself would replace by measuring first;
+	// the weakest of the three).
+	Basis string `json:"basis"`
+}
+
 type ProcessResponse struct {
 	Models []ProcessModelResponse `json:"models"`
 }

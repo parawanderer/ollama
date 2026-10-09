@@ -1556,9 +1556,16 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 				}
 				llama.SetOnGenerationDone(func(t api.GenerationTimings, meta *api.GenerationMeta) {
 					timings := t
+					// When the engine stopped, not now: gen.end is announced after the handler
+					// has taken the final response, which a slow client can delay. Both the
+					// row's time and the contention window are measured from the stop.
+					stoppedAt := meta.StoppedAt()
+					if stoppedAt.IsZero() {
+						stoppedAt = time.Now()
+					}
 					numCtx, numCtxTotal := runnerLlama.GrantedContext()
 					row := usageGeneration{
-						At: time.Now(), Model: modelName, Timings: timings, Meta: meta,
+						At: stoppedAt, Model: modelName, Timings: timings, Meta: meta,
 						Devices: devices, DeviceKinds: kinds, NumCtx: numCtx, NumBatch: numBatch, Split: split,
 					}
 					// The profile's prediction for this generation, recorded beside what it
@@ -1575,11 +1582,11 @@ func (s *Scheduler) load(req *LlmRequest, systemInfo ml.SystemInfo, gpus []ml.De
 					in.partlyOnCPU = total > vram
 					// Another runner on one of these cards working at the same time makes this
 					// a measurement of the contention, not of the model.
-					sinceMs := time.Now().UnixMilli() - int64(timings.PromptMs+timings.EvalMs)
+					sinceMs := stoppedAt.UnixMilli() - int64(timings.PromptMs+timings.EvalMs)
 					row.Contended = s.contended(usage, sinceMs)
 					// gen.end carries the prediction, so it is published once the prediction is
 					// made: from the state before this generation, the same figure the row stores.
-					ev := api.ModelEvent{Type: EventGenEnd, Model: modelName, Timings: &timings}
+					ev := api.ModelEvent{Type: EventGenEnd, Model: modelName, Timings: &timings, At: stoppedAt.UTC()}
 					if meta != nil {
 						ev.Hint, ev.Shape, ev.Finish = meta.Hint, meta.Shape, meta.Finish()
 					}

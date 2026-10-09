@@ -27,7 +27,7 @@ func TestUsageStoreRecordsGenerationsAndLoads(t *testing.T) {
 		Shape: &api.RequestShape{Endpoint: "chat", Surface: "openai", Stream: true, Messages: 3, Tools: 2, NumCtx: &numCtx, Client: "abc"},
 	}
 	meta.NoteToolCalls()
-	meta.Settle(false)
+	meta.Settle(false, time.Now())
 	u.recordGeneration(usageGeneration{
 		At: time.Now(), Model: "m",
 		Timings: api.GenerationTimings{PromptTokens: 4098, PromptTokensCached: &cached, PromptMs: 3.4, EvalMs: 111.5, Decoded: 40},

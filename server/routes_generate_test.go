@@ -835,7 +835,7 @@ func requireFinish(t *testing.T, meta *api.GenerationMeta, want string) {
 	if meta == nil {
 		t.Fatal("the handler passed no meta, so gen.end cannot say how the generation ended")
 	}
-	meta.Settle(false)
+	meta.Settle(false, time.Now())
 	if got := meta.Finish(); got != want {
 		t.Errorf("finish = %q, want %q", got, want)
 	}

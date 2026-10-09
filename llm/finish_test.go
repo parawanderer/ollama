@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sync/semaphore"
 
@@ -111,5 +112,37 @@ func TestChatFinishFromAccumulatedToolCalls(t *testing.T) {
 				t.Fatalf("gen.end finish = %q, want [%q]", got, tc.want)
 			}
 		})
+	}
+}
+
+// gen.end is announced after the handler has taken the final response, and the handler's
+// channel is unbuffered, so a slow client holds the runner there. The generation must still
+// be timed from when the engine stopped: timed from the announcement, its row and its
+// contention window shift later by however long the client took.
+func TestCompletionTimesTheGenerationFromTheEngineStop(t *testing.T) {
+	runner := finishTestRunner(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, `data: {"content":"hi","stop":true,"stop_type":"eos","timings":{"prompt_n":1,"prompt_ms":1,"predicted_n":1,"predicted_ms":1}}`)
+	})
+	var stopped, announced time.Time
+	runner.SetOnGenerationDone(func(_ api.GenerationTimings, m *api.GenerationMeta) {
+		stopped, announced = m.StoppedAt(), time.Now()
+	})
+
+	const slowClient = 200 * time.Millisecond
+	opts := api.DefaultOptions()
+	start := time.Now()
+	err := runner.Completion(t.Context(), CompletionRequest{Prompt: "p", Options: &opts, Meta: &api.GenerationMeta{}}, func(r CompletionResponse) {
+		if r.Done {
+			time.Sleep(slowClient)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopped.IsZero() || stopped.Before(start) {
+		t.Fatalf("stopped = %v, want a time during the request", stopped)
+	}
+	if lag := announced.Sub(stopped); lag < slowClient {
+		t.Fatalf("stop time is %v before the announcement, want at least the %v the client took: it was taken after the handler", lag, slowClient)
 	}
 }

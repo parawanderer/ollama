@@ -270,6 +270,7 @@ type GenerationMeta struct {
 	// once the engine has stopped. Neither is content: only the fact and the enum.
 	toolCalls atomic.Bool
 	finish    atomic.Value // string
+	stoppedAt atomic.Value // time.Time
 }
 
 // How a generation ended, on gen.end and in the generations table.
@@ -296,11 +297,17 @@ func (m *GenerationMeta) NoteToolCalls() {
 }
 
 // Settle records how the generation ended, once the engine has stopped and the handler has
-// seen the whole output. Safe on a nil meta.
-func (m *GenerationMeta) Settle(hitLimit bool) {
+// seen the whole output, and when the engine stopped. Safe on a nil meta.
+//
+// The stop time is taken by the caller when the engine says it stopped, not here: Settle
+// runs after the handler has taken the final response, and the handler's channel is
+// unbuffered, so a slow client can hold it there. Timing the generation from Settle would
+// shift it later by however long that write took.
+func (m *GenerationMeta) Settle(hitLimit bool, stoppedAt time.Time) {
 	if m == nil {
 		return
 	}
+	m.stoppedAt.Store(stoppedAt)
 	switch {
 	case m.toolCalls.Load():
 		m.finish.Store(FinishToolCalls)
@@ -309,6 +316,16 @@ func (m *GenerationMeta) Settle(hitLimit bool) {
 	default:
 		m.finish.Store(FinishAnswer)
 	}
+}
+
+// StoppedAt is when the engine stopped generating, or the zero time before Settle or on a
+// nil meta.
+func (m *GenerationMeta) StoppedAt() time.Time {
+	if m == nil {
+		return time.Time{}
+	}
+	t, _ := m.stoppedAt.Load().(time.Time)
+	return t
 }
 
 // Finish is how the generation ended, or "" before Settle or on a nil meta.

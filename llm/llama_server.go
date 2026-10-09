@@ -1816,6 +1816,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 	var hasFinalResp bool
 	var finalTimings llamaServerTimings
 	var finalSwap *api.PromptCacheSwap
+	var finalStoppedAt time.Time
 
 	for scanner.Scan() {
 		select {
@@ -1876,6 +1877,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 				// here: the handler's parser is what finds tool calls, and the last of them
 				// arrive with it. Announced here, every agent turn read as an answer.
 				finalTimings = lsResp.Timings
+				finalStoppedAt = time.Now()
 				if attributeSwap {
 					finalSwap = s.promptCache.take()
 				}
@@ -1915,7 +1917,7 @@ func (s *llamaServerRunner) Completion(ctx context.Context, req CompletionReques
 		}
 
 		fn(finalResp)
-		req.Meta.Settle(finalResp.DoneReason == DoneReasonLength)
+		req.Meta.Settle(finalResp.DoneReason == DoneReasonLength, finalStoppedAt)
 		s.notifyGeneration(finalTimings, finalSwap, req.Meta)
 		return nil
 	}
@@ -2212,7 +2214,7 @@ func (s *llamaServerRunner) Chat(ctx context.Context, req ChatRequest, fn func(C
 				if len(toolCalls) > 0 {
 					req.Meta.NoteToolCalls()
 				}
-				req.Meta.Settle(doneReason == DoneReasonLength)
+				req.Meta.Settle(doneReason == DoneReasonLength, time.Now())
 				s.notifyGeneration(lsResp.Timings, swap, req.Meta)
 				resp.Message.ToolCalls = toolCalls
 				finalResp = resp

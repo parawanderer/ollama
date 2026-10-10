@@ -48,6 +48,7 @@ import (
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/model/parsers"
 	"github.com/ollama/ollama/model/renderers"
+	"github.com/ollama/ollama/power"
 	"github.com/ollama/ollama/template"
 	"github.com/ollama/ollama/thinking"
 	"github.com/ollama/ollama/tools"
@@ -104,6 +105,7 @@ type Server struct {
 	defaultNumCtx int
 	requestLogger *inferenceRequestLogger
 	modelCaches   *modelCaches
+	power         *power.Sources
 }
 
 func init() {
@@ -2017,6 +2019,7 @@ func Serve(ln net.Listener) error {
 	schedCtx, schedDone := context.WithCancel(ctx)
 	sched := InitScheduler(schedCtx)
 	s.sched = sched
+	s.power = startPowerSources(schedCtx)
 	// The scheduler owns the sampler but not the wire types, so the server supplies the
 	// bodies it embeds. Injected rather than reached for, so the sampler stays testable
 	// without an HTTP layer.
@@ -2966,8 +2969,48 @@ func (s *Server) infoResponse() *api.InfoResponse {
 			UnavailableGPUs: unavailableGPUs(devices, s.sched.deviceNames),
 			Topology:        gpuTopology(devices),
 			Profile:         s.sched.profiler.report(devices),
+			PowerSources:    powerSources(s.power.Latest()),
 		},
 	}
+}
+
+// startPowerSources starts the configured power sources. Unset, it tries the CPU's counter
+// quietly, because most machines will not have made it readable and that is not a fault.
+func startPowerSources(ctx context.Context) *power.Sources {
+	spec, implicit := envconfig.PowerSources(), false
+	if spec == "" {
+		spec, implicit = "rapl", true
+	}
+	srcs, err := power.Parse(spec)
+	switch {
+	case err != nil && implicit:
+		slog.Debug("CPU power not readable; set OLLAMA_POWER_SOURCES to configure", "error", err)
+	case err != nil:
+		slog.Warn("some power sources were left out", "error", err)
+	}
+	srcs.Run(ctx)
+	return srcs
+}
+
+func powerSources(samples []power.Sample) []api.PowerSource {
+	if len(samples) == 0 {
+		return nil
+	}
+	out := make([]api.PowerSource, len(samples))
+	for i, p := range samples {
+		out[i] = api.PowerSource{
+			Provider:     p.Provider,
+			Name:         p.Name,
+			Scope:        string(p.Scope),
+			PowerMW:      p.PowerMW,
+			EnergyMJ:     p.EnergyMJ,
+			EnergyWrapMJ: p.EnergyWrapMJ,
+			SourceTime:   p.SourceTime,
+			AtMS:         p.AtMS,
+			Error:        p.Error,
+		}
+	}
+	return out
 }
 
 // gpuTopology converts the discovered topology to its wire form.

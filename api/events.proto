@@ -108,6 +108,7 @@ message ComputeInfo {
   repeated UnavailableGPU unavailable_gpus = 3;
   optional GPUTopology topology = 4;
   optional BoxProfile profile = 5;
+  repeated PowerSource power_sources = 6;
 }
 
 // The box profile's prediction for this generation's decode, made before it ran.
@@ -266,6 +267,24 @@ message GPUTopology {
   string detail = 2;
   repeated string gpus = 3;
   repeated GPULink links = 4;
+}
+
+// The latest reading of one power source outside the GPUs: the CPU package, a metering
+// plug. provider and scope say what it is and how much of the machine it covers, so a
+// reading of part of the box is never taken for the whole of it. Every figure is optional.
+// energy_mj is a cumulative counter: integrate differences of it, treating a decrease as a
+// wrap (at energy_wrap_mj) or a reset at the source. Place a reading by at_ms (when ollama
+// read it); source_time is the source's own clock, verbatim.
+message PowerSource {
+  optional string provider = 1;
+  optional string scope = 2;
+  optional int64 power_mw = 3;
+  optional int64 energy_mj = 4;
+  optional int64 energy_wrap_mj = 5;
+  string source_time = 6;
+  optional int64 at_ms = 7;
+  string error = 8;
+  string name = 9;
 }
 
 // A device's power, in milliwatts, as the driver reports it. Board power, not the machine's.

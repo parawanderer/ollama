@@ -2604,6 +2604,37 @@ type ComputeInfo struct {
 
 	// Profile is this machine's decode speed as ollama measured it. Absent with no GPU.
 	Profile *BoxProfile `json:"profile,omitempty"`
+
+	// PowerSources are the power readings from outside the GPUs -- the CPU package, a
+	// metering plug -- one per configured source. Each names its provider and its scope, so
+	// a reading of part of the machine is never taken for the whole of it. Absent when no
+	// source is configured or readable. GPU board power is on each GPU instead.
+	PowerSources []PowerSource `json:"power_sources,omitempty"`
+}
+
+// PowerSource is the latest reading of one power source. Every figure is optional: absent
+// means not reported, never zero.
+type PowerSource struct {
+	// Provider is the configured kind: "rapl", "tasmota", "shelly", ...
+	Provider string `json:"provider"`
+	// Name is the label the source was configured with, to tell apart two of one kind.
+	Name string `json:"name,omitempty"`
+	// Scope is how much of the machine it measures: "wall", "system", "cpu" or "gpu".
+	Scope string `json:"scope"`
+	// PowerMW is the draw in milliwatts; for a counter (rapl), averaged since the last read.
+	PowerMW *int64 `json:"power_mw,omitempty"`
+	// EnergyMJ is the source's cumulative energy counter in millijoules. Integrating it is
+	// exact where integrating PowerMW is not. It can wrap (EnergyWrapMJ) or be reset at the
+	// source, so take differences and treat a decrease as a wrap or a reset.
+	EnergyMJ *int64 `json:"energy_mj,omitempty"`
+	// EnergyWrapMJ is where EnergyMJ wraps to zero, for a counter that does.
+	EnergyWrapMJ *int64 `json:"energy_wrap_mj,omitempty"`
+	// SourceTime is the source's own timestamp, verbatim and unparsed.
+	SourceTime string `json:"source_time,omitempty"`
+	// AtMS is when ollama read it, in Unix milliseconds. Use this, not SourceTime, to place it.
+	AtMS int64 `json:"at_ms"`
+	// Error is why the latest read failed; the figures are then absent.
+	Error string `json:"error,omitempty"`
 }
 
 // BoxProfile is the machine's decode speed, measured by timing a model ollama writes itself:

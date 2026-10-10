@@ -90,6 +90,10 @@ type DeviceInfo struct {
 	// the driver cannot report them.
 	Utilization *DeviceUtilization `json:"utilization,omitempty"`
 
+	// Power is the device's live power draw and limit, refreshed with free memory, or nil
+	// when the driver cannot report them.
+	Power *DevicePower `json:"power,omitempty"`
+
 	// FreeMemory is the amount of memory currently available on the device for loading models
 	FreeMemory uint64 `json:"free_memory,omitempty"`
 
@@ -764,6 +768,16 @@ type TopologyLink struct {
 
 	// Reason explains an "unknown" pair, or anything else a client should not infer.
 	Reason string
+}
+
+// DevicePower is a device's live power figures, as its driver reports them.
+type DevicePower struct {
+	// DrawMilliwatts is the board's power draw as the driver reads it. Pointers for the same
+	// reason as DeviceUtilization: each figure is read separately and either can be missing.
+	DrawMilliwatts *int
+	// LimitMilliwatts is the limit the driver is enforcing now, which can sit below the
+	// card's default when someone has lowered it.
+	LimitMilliwatts *int
 }
 
 // DeviceUtilization is how busy a device is, as its driver averages it.

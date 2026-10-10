@@ -429,6 +429,7 @@ func (s *Scheduler) refreshFreeMemory() bool {
 	// Read at the same moment and from the same held-open session, so the two figures on a
 	// device describe one instant and the read costs nothing extra to open.
 	util := discover.UtilizationByPCI(ids)
+	power := discover.PowerByPCI(ids)
 
 	s.deviceCacheMu.Lock()
 	defer s.deviceCacheMu.Unlock()
@@ -447,6 +448,11 @@ func (s *Scheduler) refreshFreeMemory() bool {
 			s.deviceCache[i].Utilization = &u
 		} else {
 			s.deviceCache[i].Utilization = nil
+		}
+		if p, ok := power[s.deviceCache[i].PCIID]; ok {
+			s.deviceCache[i].Power = &p
+		} else {
+			s.deviceCache[i].Power = nil
 		}
 	}
 	s.deviceCacheAt = time.Now()

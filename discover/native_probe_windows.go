@@ -471,3 +471,4 @@ func byteCString(data []byte) string {
 func FreeMemoryByPCI([]string) map[string]uint64 { return nil }
 
 func UtilizationByPCI([]string) map[string]ml.DeviceUtilization { return nil }
+func PowerByPCI([]string) map[string]ml.DevicePower             { return nil }

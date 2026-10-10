@@ -825,6 +825,10 @@ type nvmlLiveSession struct {
 	handleFn unsafe.Pointer
 	// utilFn is optional: a driver without it still reports free memory.
 	utilFn unsafe.Pointer
+	// powerFn and limitFn are optional too: nvmlDeviceGetPowerUsage and
+	// nvmlDeviceGetEnforcedPowerLimit, both milliwatts.
+	powerFn unsafe.Pointer
+	limitFn unsafe.Pointer
 
 	mu      sync.Mutex
 	handles map[string]unsafe.Pointer
@@ -856,10 +860,14 @@ func liveMemorySession() *nvmlLiveSession {
 		}
 
 		utilFn, _ := dlsym(nvml, "nvmlDeviceGetUtilizationRates")
+		powerFn, _ := dlsym(nvml, "nvmlDeviceGetPowerUsage")
+		limitFn, _ := dlsym(nvml, "nvmlDeviceGetEnforcedPowerLimit")
 		liveMemorySessionValue = &nvmlLiveSession{
 			memoryFn: memoryFn,
 			handleFn: handleFn,
 			utilFn:   utilFn,
+			powerFn:  powerFn,
+			limitFn:  limitFn,
 			handles:  make(map[string]unsafe.Pointer),
 		}
 	})
@@ -1337,6 +1345,47 @@ func nvidiaTopology(pciIDs []string) *ml.Topology {
 	})
 	t.Status, t.Detail = topologyStatus(t.Links)
 	return t
+}
+
+// PowerByPCI reads each device's power draw and enforced limit from the held-open NVML
+// session, beside the free-memory and utilization reads. NVIDIA only: amdgpu's hwmon has a
+// power reading, but nothing here has been checked against a discrete AMD card, so AMD is
+// left out rather than guessed at. Each figure is kept or dropped on its own, and a device
+// that answers neither is left out, so a missing figure always means "not read".
+//
+// A faulted card answers NOT_SUPPORTED to the draw (measured 2026-09-11, see device_health.go),
+// so a missing draw is not a fault signal on its own either.
+func PowerByPCI(pciIDs []string) map[string]ml.DevicePower {
+	session := liveMemorySession()
+	if session == nil || (session.powerFn == nil && session.limitFn == nil) {
+		return nil
+	}
+	out := make(map[string]ml.DevicePower, len(pciIDs))
+	read := func(fn unsafe.Pointer, h unsafe.Pointer) *int {
+		if fn == nil {
+			return nil
+		}
+		var v C.uint
+		if C.ollama_call_nvml_device_get_uint(fn, h, &v) != 0 {
+			return nil
+		}
+		mw := int(v)
+		return &mw
+	}
+	for _, pci := range pciIDs {
+		if pci == "" {
+			continue
+		}
+		handle, ok := session.handle(pci)
+		if !ok {
+			continue
+		}
+		p := ml.DevicePower{DrawMilliwatts: read(session.powerFn, handle), LimitMilliwatts: read(session.limitFn, handle)}
+		if p.DrawMilliwatts != nil || p.LimitMilliwatts != nil {
+			out[pci] = p
+		}
+	}
+	return out
 }
 
 // UtilizationByPCI reads each device's busy figures from the held-open NVML session -- a

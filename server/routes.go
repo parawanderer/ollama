@@ -2915,6 +2915,12 @@ func (s *Server) infoResponse() *api.InfoResponse {
 				MemoryPercent: dev.Utilization.MemoryPercent,
 			}
 		}
+		if dev.Power != nil {
+			gpus[i].Power = &api.GPUPower{
+				DrawMW:  dev.Power.DrawMilliwatts,
+				LimitMW: dev.Power.LimitMilliwatts,
+			}
+		}
 	}
 
 	ms, _ := manifest.Manifests(true)

@@ -2562,6 +2562,11 @@ type GPUInfo struct {
 	// a 0 always means idle, never "could not look".
 	Utilization *GPUUtilization `json:"utilization,omitempty"`
 
+	// Power is the card's power draw and the limit the driver enforces, live, read with
+	// Utilization. Absent when unreadable (today: anything but NVIDIA). Board power only:
+	// it is not the machine's draw.
+	Power *GPUPower `json:"power,omitempty"`
+
 	// FreeMemory is the amount of video memory on the GPU available for loading new models
 	FreeMemory uint64 `json:"free_memory"`
 
@@ -2713,6 +2718,12 @@ type GPULink struct {
 
 	// Reason explains an "unknown" pair, or a link a client should not over-read.
 	Reason string `json:"reason,omitempty"`
+}
+
+// GPUPower is a card's live power figures, in milliwatts. Each is independently optional.
+type GPUPower struct {
+	DrawMW  *int `json:"draw_mw,omitempty"`
+	LimitMW *int `json:"limit_mw,omitempty"`
 }
 
 // GPUUtilization is a card's busy share. Each figure is independently optional: an AMD

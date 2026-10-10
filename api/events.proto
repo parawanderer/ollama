@@ -228,6 +228,7 @@ message GPUInfo {
   string compute = 17;
   string driver = 18;
   optional string runner = 19;
+  optional GPUPower power = 20;
 }
 
 // One link between two GPUs.
@@ -265,6 +266,12 @@ message GPUTopology {
   string detail = 2;
   repeated string gpus = 3;
   repeated GPULink links = 4;
+}
+
+// A device's power, in milliwatts, as the driver reports it. Board power, not the machine's.
+message GPUPower {
+  optional int32 draw_mw = 1;
+  optional int32 limit_mw = 2;
 }
 
 // A device's utilization, as the driver reports it.

@@ -311,6 +311,32 @@ var GpuOverhead = Uint64("OLLAMA_GPU_OVERHEAD", 0)
 // it tries "rapl" and says nothing if the CPU's counter is not readable. See power/README.md.
 var PowerSources = String("OLLAMA_POWER_SOURCES")
 
+// redactPowerSources hides the passwords in a power source list, for display: AsMap feeds
+// the "server config" log line, and a plug's address carries its password
+// (box=tasmota@http://admin:secret@host). Found 2026-10-15, when that line put a live plug
+// password into the container's log.
+func redactPowerSources(spec string) string {
+	entries := strings.Split(spec, ",")
+	for i, entry := range entries {
+		head, arg, ok := strings.Cut(entry, "@")
+		if !ok || !strings.Contains(arg, "://") {
+			continue
+		}
+		if u, err := url.Parse(strings.TrimSpace(arg)); err == nil {
+			if _, has := u.User.Password(); has {
+				entries[i] = head + "@" + u.Redacted()
+			}
+			continue
+		}
+		// Unparseable: hide everything between the scheme and the last @.
+		scheme, rest, _ := strings.Cut(arg, "://")
+		if at := strings.LastIndex(rest, "@"); at >= 0 {
+			entries[i] = head + "@" + scheme + "://xxxxx" + rest[at:]
+		}
+	}
+	return strings.Join(entries, ",")
+}
+
 // PowerIntervals overrides how often power sources are read, as label=duration or
 // kind=duration separated by commas ("box=500ms,rapl=100ms"). See power/README.md.
 var PowerIntervals = String("OLLAMA_POWER_INTERVALS")
@@ -357,7 +383,7 @@ func AsMap() map[string]EnvVar {
 		"OLLAMA_CACHE_RAM":              {"OLLAMA_CACHE_RAM", CacheRAM(), "Host-RAM prompt cache per loaded model, in MiB; -1 no limit, 0 off (default: llama-server's, 8192)"},
 		"OLLAMA_GPU_OVERHEAD":           {"OLLAMA_GPU_OVERHEAD", GpuOverhead(), "Reserve a portion of VRAM per GPU (bytes)"},
 		"OLLAMA_POWER_INTERVALS":        {"OLLAMA_POWER_INTERVALS", PowerIntervals(), "Read interval per power source label or kind, e.g. box=200ms,rapl=100ms (minimum 50ms)"},
-		"OLLAMA_POWER_SOURCES":          {"OLLAMA_POWER_SOURCES", PowerSources(), "Power sources beside the GPUs, e.g. rapl,tasmota@http://plug (default: rapl when readable)"},
+		"OLLAMA_POWER_SOURCES":          {"OLLAMA_POWER_SOURCES", redactPowerSources(PowerSources()), "Power sources beside the GPUs, e.g. rapl,tasmota@http://plug (default: rapl when readable)"},
 		"OLLAMA_SINGLE_GPU_FIT_PERCENT": {"OLLAMA_SINGLE_GPU_FIT_PERCENT", SingleGPUFitPercent(), "Max % of one GPU's free VRAM a model may use and still be packed onto a single GPU (default 80)"},
 		"OLLAMA_NO_ARCH_ESTIMATE":       {"OLLAMA_NO_ARCH_ESTIMATE", NoArchEstimate(), "Drop per-architecture KV arithmetic from the VRAM prior and measure instead (test switch)"},
 		"OLLAMA_LAYER_PLACEMENT":        {"OLLAMA_LAYER_PLACEMENT", LayerPlacement(), "Report per-layer device placement and sliding-window layers (costs ~1 log line per tensor)"},

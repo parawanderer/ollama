@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -435,5 +436,21 @@ func TestNoCloud(t *testing.T) {
 				t.Errorf("NoCloudSource() = %q, want %q", got, tt.wantSource)
 			}
 		})
+	}
+}
+
+func TestPowerSourcesRedacted(t *testing.T) {
+	t.Setenv("OLLAMA_POWER_SOURCES", "rapl@/host/powercap, box=tasmota@http://admin:s3cr3t:x@10.0.0.5,shelly@http://10.0.0.6,odd=tasmota@http://admin:s3cr3t@ho st")
+	got := Values()["OLLAMA_POWER_SOURCES"]
+	if strings.Contains(got, "s3cr3t") {
+		t.Fatalf("password shown: %s", got)
+	}
+	for _, want := range []string{"rapl@/host/powercap", "box=tasmota@http://admin:xxxxx@10.0.0.5", "shelly@http://10.0.0.6", "@ho st"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("%q missing from %s", want, got)
+		}
+	}
+	if PowerSources() != Var("OLLAMA_POWER_SOURCES") {
+		t.Fatal("the value ollama uses must stay unredacted")
 	}
 }

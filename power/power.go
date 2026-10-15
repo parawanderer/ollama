@@ -43,7 +43,9 @@ type Reading struct {
 	PowerMW *int64
 	// EnergyMJ is the source's cumulative energy counter in millijoules. It only grows,
 	// except where it wraps (EnergyWrapMJ) or the source resets it (a plug's own reset).
-	// Integrating this is exact; integrating PowerMW samples is an approximation.
+	// Integrating its differences is exact only when it is fine-grained against the read
+	// interval: RAPL's moves in microjoules, a Tasmota plug's in 3.6 kJ (0.001 kWh) steps,
+	// which at a read a second is 0 or a spike. For such a source integrate PowerMW.
 	EnergyMJ *int64
 	// EnergyWrapMJ is the value at which EnergyMJ wraps to zero, for a counter that does.
 	EnergyWrapMJ *int64
@@ -56,7 +58,8 @@ type Reading struct {
 type Provider interface {
 	// Scope is how much of the machine this provider measures.
 	Scope() Scope
-	// Interval is how often to read it. Reads are made on a goroutine of their own, so a
+	// Interval is how often to read it by default; OLLAMA_POWER_INTERVALS overrides it
+	// per source (see SetIntervals). Reads are made on a goroutine of their own, so a
 	// slow source never delays a sample; the sample carries the latest reading and its time.
 	Interval() time.Duration
 	// Read takes one reading. It must not change anything on the source.
@@ -99,6 +102,8 @@ type source struct {
 	kind string
 	name string
 	p    Provider
+	// every overrides p.Interval() when set (OLLAMA_POWER_INTERVALS).
+	every time.Duration
 
 	mu     sync.Mutex
 	latest Sample
@@ -148,6 +153,70 @@ func Parse(spec string) (*Sources, error) {
 	return s, nil
 }
 
+// MinInterval is the shortest read interval SetIntervals accepts. A plug is a small
+// microcontroller answering HTTP, and asking it faster than this buys nothing.
+const MinInterval = 50 * time.Millisecond
+
+// SetIntervals overrides how often sources are read: comma-separated entries of
+// key=duration, for example "box=200ms,rapl=100ms". The key is a source's label or, for
+// every source of that kind without its own entry, its kind. Durations are Go durations
+// and must be at least MinInterval. Bad or unmatched entries are reported and skipped;
+// the rest apply. Call it before Run.
+func (s *Sources) SetIntervals(spec string) error {
+	byName, byKind := map[string]time.Duration{}, map[string]time.Duration{}
+	var errs []string
+	for _, entry := range strings.Split(spec, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		key, val, ok := strings.Cut(entry, "=")
+		key = strings.TrimSpace(key)
+		d, err := time.ParseDuration(strings.TrimSpace(val))
+		switch {
+		case !ok || key == "":
+			errs = append(errs, fmt.Sprintf("%q: want label=duration or kind=duration", entry))
+			continue
+		case err != nil:
+			errs = append(errs, fmt.Sprintf("%s: %v", key, err))
+			continue
+		case d < MinInterval:
+			errs = append(errs, fmt.Sprintf("%s: %v is below the minimum of %v", key, d, MinInterval))
+			continue
+		}
+		matched := false
+		for _, src := range s.list {
+			if src.name == key {
+				byName[key], matched = d, true
+			}
+			if src.kind == key {
+				byKind[key], matched = d, true
+			}
+		}
+		if !matched {
+			errs = append(errs, fmt.Sprintf("%s: no configured source has this label or kind", key))
+		}
+	}
+	for _, src := range s.list {
+		if d, ok := byName[src.name]; ok && src.name != "" {
+			src.every = d
+		} else if d, ok := byKind[src.kind]; ok {
+			src.every = d
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("power intervals: %s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+func (src *source) interval() time.Duration {
+	if src.every > 0 {
+		return src.every
+	}
+	return src.p.Interval()
+}
+
 func known() []string {
 	var k []string
 	for name := range factories {
@@ -165,7 +234,7 @@ func (s *Sources) Run(ctx context.Context) {
 }
 
 func (src *source) run(ctx context.Context) {
-	t := time.NewTicker(src.p.Interval())
+	t := time.NewTicker(src.interval())
 	defer t.Stop()
 	for {
 		src.readOnce(ctx)
@@ -178,7 +247,7 @@ func (src *source) run(ctx context.Context) {
 }
 
 func (src *source) readOnce(ctx context.Context) {
-	rctx, cancel := context.WithTimeout(ctx, max(src.p.Interval(), 2*time.Second))
+	rctx, cancel := context.WithTimeout(ctx, max(src.interval(), 2*time.Second))
 	defer cancel()
 	r, err := src.p.Read(rctx)
 	now := time.Now().UnixMilli()

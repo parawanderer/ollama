@@ -2988,6 +2988,9 @@ func startPowerSources(ctx context.Context) *power.Sources {
 	case err != nil:
 		slog.Warn("some power sources were left out", "error", err)
 	}
+	if err := srcs.SetIntervals(envconfig.PowerIntervals()); err != nil {
+		slog.Warn("some power intervals were not applied", "error", err)
+	}
 	srcs.Run(ctx)
 	return srcs
 }

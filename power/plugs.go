@@ -82,8 +82,12 @@ func newTasmota(arg string) (Provider, error) {
 	return &tasmota{base: u}, nil
 }
 
-func (t *tasmota) Scope() Scope            { return ScopeWall }
-func (t *tasmota) Interval() time.Duration { return time.Second }
+func (t *tasmota) Scope() Scope { return ScopeWall }
+
+// Interval is 200 ms because that is how often Tasmota recomputes Power (measured on a
+// Nous A1T, Tasmota 14.5.0: the value changes every 200 ms). Reading it once a second kept
+// one value in five, a snapshot rather than an average.
+func (t *tasmota) Interval() time.Duration { return 200 * time.Millisecond }
 
 func (t *tasmota) statusURL(n int) string {
 	q := url.Values{}

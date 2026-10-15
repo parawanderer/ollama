@@ -216,6 +216,41 @@ func TestParse(t *testing.T) {
 	}
 }
 
+func TestSetIntervals(t *testing.T) {
+	s, err := Parse("rapl@/nonexistent,box=tasmota@http://plug1.lan,monitor=tasmota@http://plug2.lan")
+	_ = err // rapl may fail to open here; the plugs are what is tested
+	var box, monitor *source
+	for _, src := range s.list {
+		switch src.name {
+		case "box":
+			box = src
+		case "monitor":
+			monitor = src
+		}
+	}
+	if box.interval() != 200*time.Millisecond {
+		t.Fatalf("tasmota default %v, want 200ms", box.interval())
+	}
+	err = s.SetIntervals("tasmota=1s, box=300ms, nosuch=1s, monitor=10ms, box2=fast")
+	if err == nil {
+		t.Fatal("an unmatched key, a too-short and an unparsable duration must be reported")
+	}
+	for _, want := range []string{"nosuch", "below the minimum", "box2"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	if box.interval() != 300*time.Millisecond {
+		t.Errorf("a label must win over its kind: box %v, want 300ms", box.interval())
+	}
+	if monitor.interval() != time.Second {
+		t.Errorf("a rejected label entry must leave the kind's: monitor %v, want 1s", monitor.interval())
+	}
+	if err := s.SetIntervals(""); err != nil {
+		t.Errorf("empty spec: %v", err)
+	}
+}
+
 func TestFailedReadClearsFigures(t *testing.T) {
 	ok := true
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

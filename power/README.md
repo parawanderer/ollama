@@ -18,9 +18,11 @@ Every figure is optional; absent means not reported, never zero. A source whose 
 failed carries `error` and no figures. `at_ms` is when ollama read it; `source_time` is the
 source's own clock, verbatim, which may be in any timezone.
 
-`energy_mj` is a cumulative counter. Integrating it (differences between samples) is exact;
-integrating `power_mw` samples is an approximation. It can wrap (at `energy_wrap_mj`, if
-given) or be reset at the source, so treat a decrease as one of those.
+`energy_mj` is a cumulative counter. It can wrap (at `energy_wrap_mj`, if given) or be reset
+at the source, so treat a decrease as one of those. Integrating its differences is exact only
+when it is fine-grained against the read interval. RAPL's is (microjoules). **A Tasmota
+plug's is not**: it moves in 0.001 kWh (3.6 kJ) steps, so between two reads it shows 0 or a
+spike. For a plug, integrate `power_mw` instead.
 
 ## Configuring
 
@@ -37,7 +39,7 @@ The label is optional and appears as `name`; give one when two sources share a k
 | kind | scope | argument | read every |
 |---|---|---|---|
 | `rapl` | cpu | powercap directory (default: tries `/sys/class/powercap`, then `/host/powercap`) | 250 ms |
-| `tasmota` | wall | `http://[user:password@]host`; reads `Status 10` (falls back to `Status 8`) | 1 s |
+| `tasmota` | wall | `http://[user:password@]host`; reads `Status 10` (falls back to `Status 8`) | 200 ms |
 | `shelly` | wall | `http://host`, Gen2/Gen3 `Switch.GetStatus?id=0`; no password support (Shelly uses digest auth) | 1 s |
 
 **The plug providers only read.** A metering plug switches its socket, and it may be feeding
@@ -56,6 +58,26 @@ docker run ... -v /sys/devices/virtual/powercap:/host/powercap:ro -e OLLAMA_POWE
 
 AMD exposes only `package-0` and `core`; there is no DRAM domain. Only the package is reported,
 since `core` is part of it.
+
+### How often each source is read
+
+The last column above is the default. `OLLAMA_POWER_INTERVALS` overrides it, per source, as
+comma-separated `key=duration` entries, where the key is a source's label or its kind (a
+label wins over its kind) and the duration is Go's (`200ms`, `1s`). The minimum is 50 ms.
+
+```
+OLLAMA_POWER_INTERVALS=box=500ms,rapl=100ms
+```
+
+A bad or unmatched entry is logged and skipped; the others still apply.
+
+The defaults match how often each source has a new value. Measured on one machine, idle:
+RAPL's counter moves about every 1 ms, so a read averages everything since the last one.
+A Tasmota plug (Nous A1T, Tasmota 14.5.0) recomputes `Power` every 200 ms, and `Current` and
+`Voltage` only about every 1.6 s. Reading a plug faster than it updates only repeats values,
+and reading it slower keeps a snapshot rather than an average. A sample on `/api/events`
+carries each source's latest reading, so what a consumer sees is also bounded by the sample
+rate: every 250 ms while the server is busy, every 15 s when it is idle.
 
 ## Writing a provider
 

@@ -311,6 +311,10 @@ var GpuOverhead = Uint64("OLLAMA_GPU_OVERHEAD", 0)
 // it tries "rapl" and says nothing if the CPU's counter is not readable. See power/README.md.
 var PowerSources = String("OLLAMA_POWER_SOURCES")
 
+// PowerIntervals overrides how often power sources are read, as label=duration or
+// kind=duration separated by commas ("box=500ms,rapl=100ms"). See power/README.md.
+var PowerIntervals = String("OLLAMA_POWER_INTERVALS")
+
 // SingleGPUFitPercent is the maximum percentage of a single GPU's available VRAM a model
 // may be predicted to use and still be packed onto that one GPU instead of spread across
 // several. Lower leaves more headroom; higher packs tighter. Default 80.
@@ -352,6 +356,7 @@ func AsMap() map[string]EnvVar {
 		"OLLAMA_KV_CACHE_TYPE":          {"OLLAMA_KV_CACHE_TYPE", KvCacheType(), "Quantization type for the K/V cache (default: f16)"},
 		"OLLAMA_CACHE_RAM":              {"OLLAMA_CACHE_RAM", CacheRAM(), "Host-RAM prompt cache per loaded model, in MiB; -1 no limit, 0 off (default: llama-server's, 8192)"},
 		"OLLAMA_GPU_OVERHEAD":           {"OLLAMA_GPU_OVERHEAD", GpuOverhead(), "Reserve a portion of VRAM per GPU (bytes)"},
+		"OLLAMA_POWER_INTERVALS":        {"OLLAMA_POWER_INTERVALS", PowerIntervals(), "Read interval per power source label or kind, e.g. box=200ms,rapl=100ms (minimum 50ms)"},
 		"OLLAMA_POWER_SOURCES":          {"OLLAMA_POWER_SOURCES", PowerSources(), "Power sources beside the GPUs, e.g. rapl,tasmota@http://plug (default: rapl when readable)"},
 		"OLLAMA_SINGLE_GPU_FIT_PERCENT": {"OLLAMA_SINGLE_GPU_FIT_PERCENT", SingleGPUFitPercent(), "Max % of one GPU's free VRAM a model may use and still be packed onto a single GPU (default 80)"},
 		"OLLAMA_NO_ARCH_ESTIMATE":       {"OLLAMA_NO_ARCH_ESTIMATE", NoArchEstimate(), "Drop per-architecture KV arithmetic from the VRAM prior and measure instead (test switch)"},
